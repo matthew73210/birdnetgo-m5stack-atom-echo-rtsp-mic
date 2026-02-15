@@ -8,7 +8,7 @@ A high-quality RTSP audio streaming server for ESP32, specifically configured fo
 - **Board**: M5Stack Atom Echo (ESP32-PICO-D4)
 - **Microphone**: SPM1423 PDM MEMS microphone (built-in)
 - **Speaker**: Built-in I2S speaker (not used in this application)
-- **Button**: Single programmable button (built-in, currently unused)
+- **Button**: Single programmable button (built-in)
 - **LED**: RGB LED (built-in, WS2812C)
 
 ### Technical Specifications
@@ -276,7 +276,7 @@ This project is adapted from an ESP32 RTSP microphone implementation originally 
 - 16-bit sample format (vs 32-bit I2S)
 - Optimized default settings for PDM operation
 - M5Atom library integration for button and LED
-- Visual feedback via RGB LED (Yellow→Green→Purple→Red status)
+- Visual feedback via RGB LED
 
 ## License
 
@@ -295,6 +295,6 @@ For issues specific to:
 
 ## Acknowledgments
 
-- Original RTSP microphone implementation by @Sukecz
+- Original RTSP microphone implementation
 - M5Stack for the Atom Echo hardware
 - BirdNET-Go community

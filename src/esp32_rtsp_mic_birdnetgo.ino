@@ -4,10 +4,31 @@
 #include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <math.h>
+#include <M5Atom.h>
 #include "WebUI.h"
 
+// ================== DUAL-CORE AUDIO ARCHITECTURE ==================
+// FreeRTOS queue with buffer pool for inter-core communication
+// Core 1: I2S capture (producer) -> Queue -> Core 0: Processing + Streaming (consumer)
+// PDM microphone outputs 16-bit samples directly
+
+#define AUDIO_QUEUE_LENGTH 8  // Number of audio buffers in pool
+
+struct AudioBuffer {
+    int16_t* data;
+    uint16_t sampleCount;
+};
+
+// Buffer pool - pre-allocated buffers passed between cores
+AudioBuffer audioBufferPool[AUDIO_QUEUE_LENGTH];
+QueueHandle_t audioFreeQueue = NULL;  // Buffers available for capture
+QueueHandle_t audioFullQueue = NULL;  // Buffers ready for processing
+TaskHandle_t audioCaptureTaskHandle = NULL;
+volatile bool audioTaskRunning = false;
+uint16_t audioBufferSize = 0;  // Samples per buffer
+
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "2.0.0-dual-core"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 
@@ -18,7 +39,7 @@ const char* FW_VERSION_STR = FW_VERSION;
 // #define OTA_PASSWORD "1234"  // Optional: change or leave undefined
 
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
-#define DEFAULT_SAMPLE_RATE 48000
+#define DEFAULT_SAMPLE_RATE 16000  // M5Stack Atom Echo: 16kHz for PDM microphone
 #define DEFAULT_GAIN_FACTOR 1.2f
 #define DEFAULT_BUFFER_SIZE 1024   // Stable streaming profile by default
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
@@ -33,10 +54,11 @@ const char* FW_VERSION_STR = FW_VERSION;
 #define OVERHEAT_MAX_LIMIT_C 95
 #define OVERHEAT_LIMIT_STEP_C 5
 
-// -- Pins (Updated for M5Stack STAMP S3 2.54mm)
-#define I2S_BCLK_PIN    5   // Bit Clock (SCK on ICS-43434)
-#define I2S_LRCLK_PIN   7   // Word Select (WS on ICS-43434)
-#define I2S_DOUT_PIN    9   // Serial Data (SD on ICS-43434)
+// -- Pins (M5Stack Atom Echo with SPM1423 PDM Microphone)
+#define I2S_BCLK_PIN    19  // Bit Clock
+#define I2S_LRCLK_PIN   33  // Word Select / Left-Right Clock
+#define I2S_DATA_IN_PIN 23  // Microphone Data In
+#define I2S_DATA_OUT_PIN 22 // Speaker Data Out (not used for mic-only)
 
 // -- Servers
 WiFiServer rtspServer(8554);
@@ -54,8 +76,7 @@ unsigned long lastRTSPActivity = 0;
 uint8_t rtspParseBuffer[1024];
 int rtspParseBufferPos = 0;
 //
-int32_t* i2s_32bit_buffer = nullptr;
-int16_t* i2s_16bit_buffer = nullptr;
+int16_t* i2s_16bit_buffer = nullptr;  // 16-bit samples for PDM microphone
 
 // -- Global state
 unsigned long audioPacketsSent = 0;
@@ -66,7 +87,10 @@ bool rtspServerEnabled = true;
 uint32_t currentSampleRate = DEFAULT_SAMPLE_RATE;
 float currentGainFactor = DEFAULT_GAIN_FACTOR;
 uint16_t currentBufferSize = DEFAULT_BUFFER_SIZE;
-uint8_t i2sShiftBits = 12;  // (1) compile-time default respected on first boot
+// PDM microphones (like SPM1423 on Atom Echo) output decimated samples
+// The hardware PDM decimation produces samples already close to correct range
+// Typical range: 0-3 for PDM vs 11-13 for I2S microphones
+uint8_t i2sShiftBits = 0;  // Default for PDM microphone on M5Stack Atom Echo
 
 // -- Audio metering / clipping diagnostics
 uint16_t lastPeakAbs16 = 0;       // last block peak absolute value (0..32767)
@@ -130,7 +154,7 @@ uint32_t resetIntervalHours = 24; // Default 24 hours
 // -- Configurable thresholds
 uint32_t minAcceptableRate = 50;        // Minimum acceptable packet rate (restart below this)
 uint32_t performanceCheckInterval = 15; // Check interval in minutes
-uint8_t cpuFrequencyMhz = 160;          // CPU frequency (default 160 MHz)
+uint8_t cpuFrequencyMhz = 240;          // CPU frequency (default 240 MHz for ESP32-PICO-D4)
 
 // -- WiFi TX power (configurable)
 float wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
@@ -418,7 +442,7 @@ void loadAudioSettings() {
     minAcceptableRate = audioPrefs.getUInt("minRate", 50);
     performanceCheckInterval = audioPrefs.getUInt("checkInterval", 15);
     autoThresholdEnabled = audioPrefs.getBool("thrAuto", true);
-    cpuFrequencyMhz = audioPrefs.getUChar("cpuFreq", 160);
+    cpuFrequencyMhz = audioPrefs.getUChar("cpuFreq", 240);
     wifiTxPowerDbm = audioPrefs.getFloat("wifiTxDbm", DEFAULT_WIFI_TX_DBM);
     highpassEnabled = audioPrefs.getBool("hpEnable", DEFAULT_HPF_ENABLED);
     highpassCutoffHz = (uint16_t)audioPrefs.getUInt("hpCutoff", DEFAULT_HPF_CUTOFF_HZ);
@@ -510,7 +534,7 @@ void resetToDefaultSettings() {
     currentSampleRate = DEFAULT_SAMPLE_RATE;
     currentGainFactor = DEFAULT_GAIN_FACTOR;
     currentBufferSize = DEFAULT_BUFFER_SIZE;
-    i2sShiftBits = 12;  // compile-time default respected
+    i2sShiftBits = 0;  // Default for PDM microphone on M5Stack Atom Echo
 
     autoRecoveryEnabled = true;
     autoThresholdEnabled = true;
@@ -518,7 +542,7 @@ void resetToDefaultSettings() {
     resetIntervalHours = 24;
     minAcceptableRate = computeRecommendedMinRate();
     performanceCheckInterval = 15;
-    cpuFrequencyMhz = 160;
+    cpuFrequencyMhz = 240;
     wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
     highpassEnabled = DEFAULT_HPF_ENABLED;
     highpassCutoffHz = DEFAULT_HPF_CUTOFF_HZ;
@@ -546,22 +570,30 @@ void restartI2S() {
     simplePrintln("Restarting I2S with new parameters...");
     isStreaming = false;
 
-    if (i2s_32bit_buffer) { free(i2s_32bit_buffer); i2s_32bit_buffer = nullptr; }
+    // Stop audio capture task on Core 1
+    stopAudioCaptureTask();
+
+    // Free old buffers
     if (i2s_16bit_buffer) { free(i2s_16bit_buffer); i2s_16bit_buffer = nullptr; }
 
-    i2s_32bit_buffer = (int32_t*)malloc(currentBufferSize * sizeof(int32_t));
+    // Allocate new buffers with new size (16-bit for PDM)
     i2s_16bit_buffer = (int16_t*)malloc(currentBufferSize * sizeof(int16_t));
-    if (!i2s_32bit_buffer || !i2s_16bit_buffer) {
+    if (!i2s_16bit_buffer) {
         simplePrintln("FATAL: Memory allocation failed after parameter change!");
         ESP.restart();
     }
 
+    // Restart I2S driver
     setup_i2s_driver();
+
+    // Restart audio capture task on Core 1
+    startAudioCaptureTask();
+
     // Refresh HPF with current parameters
     updateHighpassCoeffs();
     maxPacketRate = 0;
     minPacketRate = 0xFFFFFFFF;
-    simplePrintln("I2S restarted successfully");
+    simplePrintln("I2S and audio task restarted successfully");
 }
 
 // Minimal print helpers: Serial + buffered for Web UI
@@ -574,6 +606,162 @@ void simplePrintln(String message) {
     webui_pushLog(message);
 }
 
+// ================== CORE 1: AUDIO CAPTURE TASK ==================
+// This task runs on Core 1 with high priority and ONLY captures audio
+// It uses buffer pool to pass data to Core 0
+void audioCaptureTask(void* parameter) {
+    simplePrintln("Audio capture task started on Core 1");
+    audioTaskRunning = true;
+
+    size_t bytesRead = 0;
+    uint32_t consecutiveErrors = 0;
+    const uint32_t MAX_ERRORS = 10;
+    uint32_t captureCount = 0;
+    uint32_t noBufferCount = 0;
+
+    while (audioTaskRunning) {
+        // Get a free buffer from the pool
+        AudioBuffer* audioBuffer = NULL;
+        if (xQueueReceive(audioFreeQueue, &audioBuffer, 0) != pdTRUE) {
+            // No free buffers - Core 0 isn't keeping up
+            noBufferCount++;
+            if (noBufferCount == 1 || noBufferCount % 1000 == 0) {
+                Serial.printf("[Core1] No free buffers! Count: %d\n", noBufferCount);
+            }
+            vTaskDelay(pdMS_TO_TICKS(1));  // Brief delay before retry
+            continue;
+        }
+
+        // Read from I2S directly into the buffer
+        esp_err_t result = i2s_read(I2S_NUM_0, audioBuffer->data,
+                                    audioBufferSize * sizeof(int16_t),
+                                    &bytesRead, portMAX_DELAY);
+
+        if (result == ESP_OK && bytesRead > 0) {
+            consecutiveErrors = 0;
+            audioBuffer->sampleCount = bytesRead / sizeof(int16_t);
+            captureCount++;
+
+            // Send filled buffer to Core 0
+            xQueueSend(audioFullQueue, &audioBuffer, portMAX_DELAY);
+
+            // Debug: Log every 100 captures
+            if (captureCount % 100 == 0) {
+                Serial.printf("[Core1] Captured %d buffers, free: %d, full: %d\n",
+                    captureCount, uxQueueMessagesWaiting(audioFreeQueue),
+                    uxQueueMessagesWaiting(audioFullQueue));
+            }
+        } else {
+            // I2S error - return buffer to free queue
+            xQueueSend(audioFreeQueue, &audioBuffer, 0);
+
+            consecutiveErrors++;
+            Serial.printf("[Core1] I2S read error: %d (consecutive: %d)\n", result, consecutiveErrors);
+            if (consecutiveErrors >= MAX_ERRORS) {
+                simplePrintln("Audio capture: too many I2S errors, restarting task");
+                vTaskDelay(pdMS_TO_TICKS(100));
+                consecutiveErrors = 0;
+            }
+        }
+
+        taskYIELD();
+    }
+
+    simplePrintln("Audio capture task stopped");
+    vTaskDelete(NULL);
+}
+
+// Start audio capture task on Core 1
+void startAudioCaptureTask() {
+    if (audioCaptureTaskHandle != NULL) {
+        simplePrintln("Audio task already running");
+        return;
+    }
+
+    // Set buffer size for the capture task
+    audioBufferSize = currentBufferSize;
+
+    // Create queues if they don't exist
+    if (audioFreeQueue == NULL) {
+        audioFreeQueue = xQueueCreate(AUDIO_QUEUE_LENGTH, sizeof(AudioBuffer*));
+        if (audioFreeQueue == NULL) {
+            simplePrintln("FATAL: Failed to create free queue!");
+            return;
+        }
+    }
+
+    if (audioFullQueue == NULL) {
+        audioFullQueue = xQueueCreate(AUDIO_QUEUE_LENGTH, sizeof(AudioBuffer*));
+        if (audioFullQueue == NULL) {
+            simplePrintln("FATAL: Failed to create full queue!");
+            return;
+        }
+    }
+
+    // Allocate buffer pool
+    for (int i = 0; i < AUDIO_QUEUE_LENGTH; i++) {
+        audioBufferPool[i].data = (int16_t*)malloc(audioBufferSize * sizeof(int16_t));
+        if (!audioBufferPool[i].data) {
+            simplePrintln("FATAL: Failed to allocate buffer pool!");
+            return;
+        }
+        audioBufferPool[i].sampleCount = 0;
+
+        // Add to free queue
+        AudioBuffer* bufPtr = &audioBufferPool[i];
+        xQueueSend(audioFreeQueue, &bufPtr, 0);
+    }
+
+    simplePrintln("Buffer pool created (8 buffers)");
+
+    // Create task pinned to Core 1 with elevated priority
+    // Priority 10 = above normal (1) but below critical system tasks
+    BaseType_t result = xTaskCreatePinnedToCore(
+        audioCaptureTask,           // Task function
+        "AudioCapture",             // Name
+        4096,                       // Stack size (bytes)
+        NULL,                       // Parameters
+        10,                         // Priority (elevated but not aggressive)
+        &audioCaptureTaskHandle,    // Task handle
+        1                           // Core 1 (PRO_CPU)
+    );
+
+    if (result != pdPASS) {
+        simplePrintln("FATAL: Failed to create audio capture task!");
+    } else {
+        simplePrintln("Audio capture task created on Core 1 (priority 10)");
+    }
+}
+
+// Stop audio capture task
+void stopAudioCaptureTask() {
+    if (audioCaptureTaskHandle != NULL) {
+        audioTaskRunning = false;
+        vTaskDelay(pdMS_TO_TICKS(100));  // Give task time to clean up
+        audioCaptureTaskHandle = NULL;
+
+        // Delete the queues
+        if (audioFreeQueue != NULL) {
+            vQueueDelete(audioFreeQueue);
+            audioFreeQueue = NULL;
+        }
+        if (audioFullQueue != NULL) {
+            vQueueDelete(audioFullQueue);
+            audioFullQueue = NULL;
+        }
+
+        // Free buffer pool
+        for (int i = 0; i < AUDIO_QUEUE_LENGTH; i++) {
+            if (audioBufferPool[i].data) {
+                free(audioBufferPool[i].data);
+                audioBufferPool[i].data = NULL;
+            }
+        }
+
+        simplePrintln("Audio capture task stopped, buffer pool freed");
+    }
+}
+
 // OTA setup
 void setupOTA() {
     ArduinoOTA.setHostname("ESP32-RTSP-Mic");
@@ -583,42 +771,63 @@ void setupOTA() {
     ArduinoOTA.begin();
 }
 
-// I2S setup
+// I2S setup for M5Stack Atom Echo (PDM microphone mode)
 void setup_i2s_driver() {
     i2s_driver_uninstall(I2S_NUM_0);
 
-    uint16_t dma_buf_len = (currentBufferSize > 512) ? 512 : currentBufferSize;
+    // DMA buffer configuration - smaller for lower latency with 16kHz
+    uint16_t dma_buf_len = 60;  // Match M5Atom Echo example
 
     i2s_config_t i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        // PDM mode required for SPM1423 microphone on Atom Echo
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
         .sample_rate = currentSampleRate,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,  // Match original demo exactly
+        .channel_format = I2S_CHANNEL_FMT_ALL_RIGHT,    // ALL_RIGHT like original demo
+#if ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 1, 0)
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+#else
+        .communication_format = I2S_COMM_FORMAT_I2S,
+#endif
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8,
+        .dma_buf_count = 6,     // Match M5Atom Echo example
         .dma_buf_len = dma_buf_len,
+        .use_apll = false,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0
     };
 
     i2s_pin_config_t pin_config = {
+#if (ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 3, 0))
+        .mck_io_num = I2S_PIN_NO_CHANGE,
+#endif
         .bck_io_num = I2S_BCLK_PIN,
         .ws_io_num = I2S_LRCLK_PIN,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = I2S_DOUT_PIN
+        .data_out_num = I2S_DATA_OUT_PIN,
+        .data_in_num = I2S_DATA_IN_PIN
     };
 
     i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
     i2s_set_pin(I2S_NUM_0, &pin_config);
+    i2s_set_clk(I2S_NUM_0, currentSampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
 
-    // (5) log i2sShiftBits for easier debugging
-    simplePrintln("I2S ready: " + String(currentSampleRate) + "Hz, gain " +
+    simplePrintln("I2S ready (PDM mode): " + String(currentSampleRate) + "Hz, gain " +
                   String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
                   ", shiftBits " + String(i2sShiftBits));
 }
 
 static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len) {
     size_t off = 0;
+    unsigned long startTime = millis();
+    const unsigned long WRITE_TIMEOUT_MS = 30;  // 30ms timeout - fast failover
+
     while (off < len) {
+        // Check timeout to prevent blocking forever
+        if (millis() - startTime > WRITE_TIMEOUT_MS) {
+            Serial.println("[Core0] Write timeout - dropping frame");
+            return false;
+        }
+
         int w = client.write(data + off, len - off);
         if (w <= 0) return false;
         off += (size_t)w;
@@ -674,51 +883,89 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
     audioPacketsSent++;
 }
 
-// Audio streaming
+// Audio streaming - TEMPORARILY READING DIRECTLY FROM I2S FOR PDM DEBUGGING
 void streamAudio(WiFiClient &client) {
     if (!isStreaming || !client.connected()) return;
 
-    size_t bytesRead = 0;
-    esp_err_t result = i2s_read(I2S_NUM_0, i2s_32bit_buffer,
-                                currentBufferSize * sizeof(int32_t),
-                                &bytesRead, 50 / portTICK_PERIOD_MS);
+    static uint32_t streamCount = 0;
+    static uint32_t emptyCount = 0;
+    static uint32_t returnCount = 0;
 
-    if (result == ESP_OK && bytesRead > 0) {
-        int samplesRead = bytesRead / sizeof(int32_t);
-
-        // If HPF params changed dynamically, recompute
-        if (highpassEnabled && (hpfConfigSampleRate != currentSampleRate || hpfConfigCutoff != highpassCutoffHz)) {
-            updateHighpassCoeffs();
+    // Receive from full queue (Core 1 → Core 0 transfer)
+    // 30ms timeout balances responsiveness with web UI performance
+    AudioBuffer* audioBuffer = NULL;
+    if (xQueueReceive(audioFullQueue, &audioBuffer, pdMS_TO_TICKS(30)) != pdTRUE) {
+        // No data available - Core 1 hasn't captured anything yet
+        // The 30ms timeout already gave other tasks time to run
+        emptyCount++;
+        if (emptyCount % 100 == 0) {
+            Serial.printf("[Core0] Queue empty %d times\n", emptyCount);
         }
+        return;
+    }
 
-        bool clipped = false;
-        float peakAbs = 0.0f;
-        for (int i = 0; i < samplesRead; i++) {
-            float sample = (float)(i2s_32bit_buffer[i] >> i2sShiftBits);
-            if (highpassEnabled) sample = hpf.process(sample);
-            float amplified = sample * currentGainFactor;
-            float aabs = fabsf(amplified);
-            if (aabs > peakAbs) peakAbs = aabs;
-            if (aabs > 32767.0f) clipped = true;
-            if (amplified > 32767.0f) amplified = 32767.0f;
-            if (amplified < -32768.0f) amplified = -32768.0f;
-            i2s_16bit_buffer[i] = (int16_t)amplified;
+    uint16_t samplesRead = audioBuffer->sampleCount;
+    int16_t* captureData = audioBuffer->data;
+
+    streamCount++;
+
+    // Debug: Monitor queue health
+    if (streamCount % 100 == 0) {
+        Serial.printf("[Core0] Streamed %d, free: %d, full: %d, peak: %d\n",
+            streamCount, uxQueueMessagesWaiting(audioFreeQueue),
+            uxQueueMessagesWaiting(audioFullQueue), lastPeakAbs16);
+    }
+
+    // If HPF params changed dynamically, recompute
+    if (highpassEnabled && (hpfConfigSampleRate != currentSampleRate || hpfConfigCutoff != highpassCutoffHz)) {
+        updateHighpassCoeffs();
+    }
+
+    bool clipped = false;
+    float peakAbs = 0.0f;
+
+    // Process audio - read from captureData, write to i2s_16bit_buffer
+    for (int i = 0; i < samplesRead; i++) {
+        // PDM 16-bit mode: samples are already in the right range, just apply shift if needed
+        float sample = (float)(captureData[i] >> i2sShiftBits);
+
+        if (highpassEnabled) sample = hpf.process(sample);
+
+        float amplified = sample * currentGainFactor;
+        float aabs = fabsf(amplified);
+        if (aabs > peakAbs) peakAbs = aabs;
+        if (aabs > 32767.0f) clipped = true;
+
+        // Clamp to 16-bit range
+        if (amplified > 32767.0f) amplified = 32767.0f;
+        if (amplified < -32768.0f) amplified = -32768.0f;
+        i2s_16bit_buffer[i] = (int16_t)amplified;
+    }
+
+    // Update metering after processing the block
+    if (peakAbs > 32767.0f) peakAbs = 32767.0f;
+    lastPeakAbs16 = (uint16_t)peakAbs;
+    audioClippedLastBlock = clipped;
+    if (clipped) audioClipCount++;
+
+    // Update peak hold for a short window (~3 s) to match UI polling cadence
+    if (lastPeakAbs16 > peakHoldAbs16) {
+        peakHoldAbs16 = lastPeakAbs16;
+        peakHoldUntilMs = millis() + 3000UL;
+    } else if (peakHoldAbs16 > 0 && millis() > peakHoldUntilMs) {
+        peakHoldAbs16 = 0;
+    }
+
+    sendRTPPacket(client, i2s_16bit_buffer, samplesRead);
+
+    // Return buffer to free queue for reuse by Core 1
+    if (xQueueSend(audioFreeQueue, &audioBuffer, portMAX_DELAY) == pdTRUE) {
+        returnCount++;
+        if (returnCount % 100 == 0) {
+            Serial.printf("[Core0] Returned %d buffers to free queue\n", returnCount);
         }
-        // Update metering after processing the block
-        if (peakAbs > 32767.0f) peakAbs = 32767.0f;
-        lastPeakAbs16 = (uint16_t)peakAbs;
-        audioClippedLastBlock = clipped;
-        if (clipped) audioClipCount++;
-
-        // Update peak hold for a short window (~3 s) to match UI polling cadence
-        if (lastPeakAbs16 > peakHoldAbs16) {
-            peakHoldAbs16 = lastPeakAbs16;
-            peakHoldUntilMs = millis() + 3000UL;
-        } else if (peakHoldAbs16 > 0 && millis() > peakHoldUntilMs) {
-            peakHoldAbs16 = 0;
-        }
-
-        sendRTPPacket(client, i2s_16bit_buffer, samplesRead);
+    } else {
+        Serial.printf("[Core0] CRITICAL: Failed to return buffer %p to free queue!\n", audioBuffer);
     }
 }
 
@@ -777,6 +1024,12 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         lastStatsReset = millis();
         lastRtspPlayMs = millis();
         rtspPlayCount++;
+
+        // Start audio capture task when streaming begins
+        startAudioCaptureTask();
+
+        // Set LED to purple when streaming
+        M5.dis.drawpix(0, CRGB(128, 0, 128));
         simplePrintln("STREAMING STARTED");
 
     } else if (request.startsWith("TEARDOWN")) {
@@ -784,6 +1037,12 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         client.print("CSeq: " + cseq + "\r\n");
         client.print("Session: " + rtspSessionId + "\r\n\r\n");
         isStreaming = false;
+
+        // Stop audio capture task when streaming ends
+        stopAudioCaptureTask();
+
+        // Set LED back to green when streaming stops
+        M5.dis.drawpix(0, CRGB(0, 128, 0));
         simplePrintln("STREAMING STOPPED");
     } else if (request.startsWith("GET_PARAMETER")) {
         // Many RTSP clients send GET_PARAMETER as keep-alive.
@@ -829,12 +1088,16 @@ void processRTSP(WiFiClient &client) {
 // Web UI is a separate module (WebUI.*)
 
 void setup() {
+    // Initialize M5Atom (for button and LED, serial enabled)
+    M5.begin(true, false, true);
+
     Serial.begin(115200);
     delay(500);
-    log_i("=== ESP32 RTSP Mic Starting ===");
-    log_i("Board: M5Stack STAMP S3");
     Serial.println("\n\n=== ESP32 RTSP Mic Starting ===");
-    Serial.println("Board: M5Stack STAMP S3");
+    Serial.println("Board: M5Stack Atom Echo");
+
+    // Set LED to indicate startup
+    M5.dis.drawpix(0, CRGB(128, 128, 0));  // Yellow for startup
 
     // (4) seed for random(): combination of time and unique MAC
     randomSeed((uint32_t)micros() ^ (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF));
@@ -857,11 +1120,10 @@ void setup() {
     loadAudioSettings();
     Serial.println("Settings loaded");
 
-    // Allocate buffers with current size
+    // Allocate buffers with current size (16-bit for PDM)
     Serial.println("Allocating buffers...");
-    i2s_32bit_buffer = (int32_t*)malloc(currentBufferSize * sizeof(int32_t));
     i2s_16bit_buffer = (int16_t*)malloc(currentBufferSize * sizeof(int16_t));
-    if (!i2s_32bit_buffer || !i2s_16bit_buffer) {
+    if (!i2s_16bit_buffer) {
         simplePrintln("FATAL: Memory allocation failed!");
         ESP.restart();
     }
@@ -891,6 +1153,9 @@ void setup() {
     Serial.println("Setting up I2S driver...");
     setup_i2s_driver();
     Serial.println("I2S driver ready");
+
+    // Audio queue and capture task will be created when RTSP streaming begins (on PLAY command)
+    Serial.println("Dual-core audio ready (queue and task will start on RTSP PLAY)");
 
     Serial.println("Updating highpass coefficients...");
     updateHighpassCoeffs();
@@ -938,13 +1203,20 @@ void setup() {
     if (!overheatLatched) {
         simplePrintln("RTSP server ready on port 8554");
         simplePrintln("RTSP URL: rtsp://" + WiFi.localIP().toString() + ":8554/audio");
+        // Set LED to green when ready
+        M5.dis.drawpix(0, CRGB(0, 128, 0));
     } else {
         simplePrintln("RTSP server paused due to thermal latch. Clear via Web UI before resuming streaming.");
+        // Set LED to red when latched
+        M5.dis.drawpix(0, CRGB(128, 0, 0));
     }
     simplePrintln("Web UI: http://" + WiFi.localIP().toString() + "/");
 }
 
 void loop() {
+    // Update M5Atom (for button and LED handling)
+    M5.update();
+
     ArduinoOTA.handle();
 
     webui_handleClient();
@@ -976,7 +1248,13 @@ void loop() {
     if (rtspServerEnabled) {
         if (rtspClient && !rtspClient.connected()) {
             rtspClient.stop();
-            isStreaming = false;
+            if (isStreaming) {
+                isStreaming = false;
+                // Stop audio capture task when client disconnects
+                stopAudioCaptureTask();
+            }
+            // Set LED back to green when client disconnects
+            M5.dis.drawpix(0, CRGB(0, 128, 0));
             simplePrintln("RTSP client disconnected");
         }
 
@@ -989,6 +1267,13 @@ void loop() {
         }
 
         if (!rtspClient || !rtspClient.connected()) {
+            // Ensure audio task is stopped before accepting new client
+            if (isStreaming) {
+                isStreaming = false;
+                stopAudioCaptureTask();
+                M5.dis.drawpix(0, CRGB(0, 128, 0));  // Green - ready
+            }
+
             WiFiClient newClient = rtspServer.available();
             if (newClient) {
                 rtspClient = newClient;
@@ -1014,6 +1299,12 @@ void loop() {
         if (rtspClient && rtspClient.connected()) {
             rtspClient.stop();
             isStreaming = false;
+            // Set LED to red if latched, otherwise green
+            if (overheatLatched) {
+                M5.dis.drawpix(0, CRGB(128, 0, 0));
+            } else {
+                M5.dis.drawpix(0, CRGB(0, 128, 0));
+            }
         }
     }
     // Handle deferred reboot/reset safely here
