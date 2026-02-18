@@ -8,27 +8,17 @@
 #include "WebUI.h"
 
 // ================== DUAL-CORE AUDIO ARCHITECTURE ==================
-// FreeRTOS queue with buffer pool for inter-core communication
-// Core 1: I2S capture (producer) -> Queue -> Core 0: Processing + Streaming (consumer)
+// Core 1: Complete audio pipeline (I2S → process → RTP → WiFi)
+// Core 0: Web UI, diagnostics, RTSP protocol, client management
 // PDM microphone outputs 16-bit samples directly
 
-#define AUDIO_QUEUE_LENGTH 8  // Number of audio buffers in pool
-
-struct AudioBuffer {
-    int16_t* data;
-    uint16_t sampleCount;
-};
-
-// Buffer pool - pre-allocated buffers passed between cores
-AudioBuffer audioBufferPool[AUDIO_QUEUE_LENGTH];
-QueueHandle_t audioFreeQueue = NULL;  // Buffers available for capture
-QueueHandle_t audioFullQueue = NULL;  // Buffers ready for processing
+// Pointer handoff: Core 0 sets on PLAY, Core 1 uses for streaming, clears on failure
+WiFiClient* volatile streamClient = NULL;
 TaskHandle_t audioCaptureTaskHandle = NULL;
 volatile bool audioTaskRunning = false;
-uint16_t audioBufferSize = 0;  // Samples per buffer
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "2.0.0-dual-core"
+#define FW_VERSION "2.1.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 
@@ -40,12 +30,12 @@ const char* FW_VERSION_STR = FW_VERSION;
 
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
 #define DEFAULT_SAMPLE_RATE 16000  // M5Stack Atom Echo: 16kHz for PDM microphone
-#define DEFAULT_GAIN_FACTOR 1.2f
-#define DEFAULT_BUFFER_SIZE 1024   // Stable streaming profile by default
+#define DEFAULT_GAIN_FACTOR 3.0f
+#define DEFAULT_BUFFER_SIZE 1024   // 64ms @ 16kHz - good balance for BirdNET-Go
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
 // High-pass filter defaults (to remove low-frequency rumble)
 #define DEFAULT_HPF_ENABLED true
-#define DEFAULT_HPF_CUTOFF_HZ 500
+#define DEFAULT_HPF_CUTOFF_HZ 300
 
 // Thermal protection defaults
 #define DEFAULT_OVERHEAT_PROTECTION true
@@ -75,11 +65,11 @@ unsigned long lastRTSPActivity = 0;
 // -- Buffers
 uint8_t rtspParseBuffer[1024];
 int rtspParseBufferPos = 0;
-//
-int16_t* i2s_16bit_buffer = nullptr;  // 16-bit samples for PDM microphone
+// Note: Audio buffers now allocated by Core 1 task
 
 // -- Global state
 unsigned long audioPacketsSent = 0;
+unsigned long audioPacketsDropped = 0;  // Track dropped frames
 unsigned long lastStatsReset = 0;
 bool rtspServerEnabled = true;
 
@@ -345,12 +335,12 @@ void checkTemperature() {
         if (!overheatLockoutActive && temp >= overheatShutdownC) {
             overheatLockoutActive = true;
             recordOverheatTrip(temp);
-            // Disable streaming until user restarts manually
+            // Signal Core 1 to stop, then disable streaming
+            isStreaming = false;
+            streamClient = NULL;
+            stopAudioCaptureTask();
             if (rtspClient && rtspClient.connected()) {
                 rtspClient.stop();
-            }
-            if (isStreaming) {
-                isStreaming = false;
             }
             rtspServerEnabled = false;
             rtspServer.stop();
@@ -434,8 +424,8 @@ void loadAudioSettings() {
     currentSampleRate = audioPrefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
     currentGainFactor = audioPrefs.getFloat("gainFactor", DEFAULT_GAIN_FACTOR);
     currentBufferSize = audioPrefs.getUShort("bufferSize", DEFAULT_BUFFER_SIZE);
-    // (1) respect compile-time default 12 on first boot
-    i2sShiftBits = audioPrefs.getUChar("shiftBits", i2sShiftBits);
+    // i2sShiftBits is ALWAYS 0 for PDM microphones - not configurable
+    i2sShiftBits = 0;
     autoRecoveryEnabled = audioPrefs.getBool("autoRecovery", true);
     scheduledResetEnabled = audioPrefs.getBool("schedReset", false);
     resetIntervalHours = audioPrefs.getUInt("resetHours", 24);
@@ -568,32 +558,32 @@ void resetToDefaultSettings() {
 // Restart I2S with new parameters
 void restartI2S() {
     simplePrintln("Restarting I2S with new parameters...");
+    bool wasStreaming = isStreaming;
+
+    // Signal Core 1 to stop before touching anything
     isStreaming = false;
+    streamClient = NULL;
 
-    // Stop audio capture task on Core 1
+    // Stop audio pipeline task on Core 1
     stopAudioCaptureTask();
-
-    // Free old buffers
-    if (i2s_16bit_buffer) { free(i2s_16bit_buffer); i2s_16bit_buffer = nullptr; }
-
-    // Allocate new buffers with new size (16-bit for PDM)
-    i2s_16bit_buffer = (int16_t*)malloc(currentBufferSize * sizeof(int16_t));
-    if (!i2s_16bit_buffer) {
-        simplePrintln("FATAL: Memory allocation failed after parameter change!");
-        ESP.restart();
-    }
 
     // Restart I2S driver
     setup_i2s_driver();
-
-    // Restart audio capture task on Core 1
-    startAudioCaptureTask();
 
     // Refresh HPF with current parameters
     updateHighpassCoeffs();
     maxPacketRate = 0;
     minPacketRate = 0xFFFFFFFF;
-    simplePrintln("I2S and audio task restarted successfully");
+
+    // If we were streaming, restart the pipeline with the existing client
+    if (wasStreaming && rtspClient && rtspClient.connected()) {
+        streamClient = &rtspClient;
+        isStreaming = true;
+        startAudioCaptureTask();
+        simplePrintln("I2S restarted, streaming resumed");
+    } else {
+        simplePrintln("I2S restarted");
+    }
 }
 
 // Minimal print helpers: Serial + buffered for Web UI
@@ -606,159 +596,166 @@ void simplePrintln(String message) {
     webui_pushLog(message);
 }
 
-// ================== CORE 1: AUDIO CAPTURE TASK ==================
-// This task runs on Core 1 with high priority and ONLY captures audio
-// It uses buffer pool to pass data to Core 0
+// ================== CORE 1: FULL AUDIO PIPELINE ==================
+// This task runs on Core 1 and handles the complete audio pipeline:
+// I2S capture → processing → RTP packet formation → WiFi transmission
+// Uses streamClient pointer (set by Core 0 on PLAY, cleared here on failure)
 void audioCaptureTask(void* parameter) {
-    simplePrintln("Audio capture task started on Core 1");
+    simplePrintln("[Core1] Audio pipeline task started");
     audioTaskRunning = true;
 
     size_t bytesRead = 0;
     uint32_t consecutiveErrors = 0;
     const uint32_t MAX_ERRORS = 10;
-    uint32_t captureCount = 0;
-    uint32_t noBufferCount = 0;
+    uint32_t packetCount = 0;
+
+    // Allocate audio buffer for this task
+    int16_t* captureBuffer = (int16_t*)malloc(currentBufferSize * sizeof(int16_t));
+    int16_t* outputBuffer = (int16_t*)malloc(currentBufferSize * sizeof(int16_t));
+
+    if (!captureBuffer || !outputBuffer) {
+        simplePrintln("[Core1] FATAL: Failed to allocate audio buffers!");
+        audioTaskRunning = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // High-pass filter state (local to this core)
+    Biquad localHpf = hpf;  // Copy initial coefficients
+    uint32_t localHpfConfigSampleRate = hpfConfigSampleRate;
+    uint16_t localHpfConfigCutoff = hpfConfigCutoff;
+
+    uint32_t i2sErrors = 0;
+    unsigned long lastStatsLog = millis();
 
     while (audioTaskRunning) {
-        // Get a free buffer from the pool
-        AudioBuffer* audioBuffer = NULL;
-        if (xQueueReceive(audioFreeQueue, &audioBuffer, 0) != pdTRUE) {
-            // No free buffers - Core 0 isn't keeping up
-            noBufferCount++;
-            if (noBufferCount == 1 || noBufferCount % 1000 == 0) {
-                Serial.printf("[Core1] No free buffers! Count: %d\n", noBufferCount);
-            }
-            vTaskDelay(pdMS_TO_TICKS(1));  // Brief delay before retry
+        // Only process audio when streaming and we have a client
+        if (!isStreaming || !streamClient) {
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
-        // Read from I2S directly into the buffer
-        esp_err_t result = i2s_read(I2S_NUM_0, audioBuffer->data,
-                                    audioBufferSize * sizeof(int16_t),
+        // Local copy of client pointer (set once by Core 0, stable during streaming)
+        WiFiClient* client = streamClient;
+
+        // Periodic health stats (every 30 seconds)
+        if (millis() - lastStatsLog > 30000) {
+            Serial.printf("[Core1] Stats: Sent=%u, I2S_errs=%u, Clipping=%lu\n",
+                         packetCount, i2sErrors, audioClipCount);
+            lastStatsLog = millis();
+        }
+
+        // Read from I2S
+        esp_err_t result = i2s_read(I2S_NUM_0, captureBuffer,
+                                    currentBufferSize * sizeof(int16_t),
                                     &bytesRead, portMAX_DELAY);
 
-        if (result == ESP_OK && bytesRead > 0) {
-            consecutiveErrors = 0;
-            audioBuffer->sampleCount = bytesRead / sizeof(int16_t);
-            captureCount++;
-
-            // Send filled buffer to Core 0
-            xQueueSend(audioFullQueue, &audioBuffer, portMAX_DELAY);
-
-            // Debug: Log every 100 captures
-            if (captureCount % 100 == 0) {
-                Serial.printf("[Core1] Captured %d buffers, free: %d, full: %d\n",
-                    captureCount, uxQueueMessagesWaiting(audioFreeQueue),
-                    uxQueueMessagesWaiting(audioFullQueue));
-            }
-        } else {
-            // I2S error - return buffer to free queue
-            xQueueSend(audioFreeQueue, &audioBuffer, 0);
-
+        if (result != ESP_OK || bytesRead == 0) {
             consecutiveErrors++;
-            Serial.printf("[Core1] I2S read error: %d (consecutive: %d)\n", result, consecutiveErrors);
+            i2sErrors++;
             if (consecutiveErrors >= MAX_ERRORS) {
-                simplePrintln("Audio capture: too many I2S errors, restarting task");
+                simplePrintln("[Core1] Too many I2S errors, pausing");
                 vTaskDelay(pdMS_TO_TICKS(100));
                 consecutiveErrors = 0;
             }
+            continue;
         }
+
+        consecutiveErrors = 0;
+        uint16_t samplesRead = bytesRead / sizeof(int16_t);
+
+        // Update HPF coefficients if they changed
+        if (highpassEnabled && (localHpfConfigSampleRate != currentSampleRate ||
+                                localHpfConfigCutoff != highpassCutoffHz)) {
+            localHpf = hpf;  // Copy updated coefficients from main
+            localHpfConfigSampleRate = currentSampleRate;
+            localHpfConfigCutoff = highpassCutoffHz;
+        }
+
+        // Process audio: gain, HPF, clipping detection
+        bool clipped = false;
+        float peakAbs = 0.0f;
+
+        for (int i = 0; i < samplesRead; i++) {
+            float sample = (float)(captureBuffer[i] >> i2sShiftBits);
+
+            if (highpassEnabled) {
+                sample = localHpf.process(sample);
+            }
+
+            float amplified = sample * currentGainFactor;
+            float aabs = fabsf(amplified);
+            if (aabs > peakAbs) peakAbs = aabs;
+            if (aabs > 32767.0f) clipped = true;
+
+            if (amplified > 32767.0f) amplified = 32767.0f;
+            if (amplified < -32768.0f) amplified = -32768.0f;
+            outputBuffer[i] = (int16_t)amplified;
+        }
+
+        // Update metering
+        if (peakAbs > 32767.0f) peakAbs = 32767.0f;
+        lastPeakAbs16 = (uint16_t)peakAbs;
+        audioClippedLastBlock = clipped;
+        if (clipped) {
+            audioClipCount++;
+            static unsigned long lastClipLog = 0;
+            if (millis() - lastClipLog > 5000) {
+                Serial.printf("[Core1] Clipping! Peak: %u, count: %lu\n",
+                             lastPeakAbs16, audioClipCount);
+                lastClipLog = millis();
+            }
+        }
+
+        if (lastPeakAbs16 > peakHoldAbs16) {
+            peakHoldAbs16 = lastPeakAbs16;
+            peakHoldUntilMs = millis() + 3000UL;
+        } else if (peakHoldAbs16 > 0 && millis() > peakHoldUntilMs) {
+            peakHoldAbs16 = 0;
+        }
+
+        // Send RTP packet directly via streamClient (no mutex needed)
+        sendRTPPacket(*client, outputBuffer, samplesRead);
+        packetCount++;
 
         taskYIELD();
     }
 
-    simplePrintln("Audio capture task stopped");
+    free(captureBuffer);
+    free(outputBuffer);
+    simplePrintln("[Core1] Audio pipeline task stopped");
     vTaskDelete(NULL);
 }
 
-// Start audio capture task on Core 1
+// Start audio pipeline task on Core 1
 void startAudioCaptureTask() {
     if (audioCaptureTaskHandle != NULL) {
-        simplePrintln("Audio task already running");
+        simplePrintln("[Core1] Audio task already running");
         return;
     }
 
-    // Set buffer size for the capture task
-    audioBufferSize = currentBufferSize;
-
-    // Create queues if they don't exist
-    if (audioFreeQueue == NULL) {
-        audioFreeQueue = xQueueCreate(AUDIO_QUEUE_LENGTH, sizeof(AudioBuffer*));
-        if (audioFreeQueue == NULL) {
-            simplePrintln("FATAL: Failed to create free queue!");
-            return;
-        }
-    }
-
-    if (audioFullQueue == NULL) {
-        audioFullQueue = xQueueCreate(AUDIO_QUEUE_LENGTH, sizeof(AudioBuffer*));
-        if (audioFullQueue == NULL) {
-            simplePrintln("FATAL: Failed to create full queue!");
-            return;
-        }
-    }
-
-    // Allocate buffer pool
-    for (int i = 0; i < AUDIO_QUEUE_LENGTH; i++) {
-        audioBufferPool[i].data = (int16_t*)malloc(audioBufferSize * sizeof(int16_t));
-        if (!audioBufferPool[i].data) {
-            simplePrintln("FATAL: Failed to allocate buffer pool!");
-            return;
-        }
-        audioBufferPool[i].sampleCount = 0;
-
-        // Add to free queue
-        AudioBuffer* bufPtr = &audioBufferPool[i];
-        xQueueSend(audioFreeQueue, &bufPtr, 0);
-    }
-
-    simplePrintln("Buffer pool created (8 buffers)");
-
-    // Create task pinned to Core 1 with elevated priority
-    // Priority 10 = above normal (1) but below critical system tasks
     BaseType_t result = xTaskCreatePinnedToCore(
         audioCaptureTask,           // Task function
-        "AudioCapture",             // Name
-        4096,                       // Stack size (bytes)
+        "AudioPipeline",            // Name
+        8192,                       // Stack size
         NULL,                       // Parameters
-        10,                         // Priority (elevated but not aggressive)
+        10,                         // Priority (elevated)
         &audioCaptureTaskHandle,    // Task handle
         1                           // Core 1 (PRO_CPU)
     );
 
     if (result != pdPASS) {
-        simplePrintln("FATAL: Failed to create audio capture task!");
-    } else {
-        simplePrintln("Audio capture task created on Core 1 (priority 10)");
+        simplePrintln("[Core1] FATAL: Failed to create audio pipeline task!");
     }
 }
 
-// Stop audio capture task
+// Stop audio pipeline task
 void stopAudioCaptureTask() {
     if (audioCaptureTaskHandle != NULL) {
         audioTaskRunning = false;
         vTaskDelay(pdMS_TO_TICKS(100));  // Give task time to clean up
         audioCaptureTaskHandle = NULL;
-
-        // Delete the queues
-        if (audioFreeQueue != NULL) {
-            vQueueDelete(audioFreeQueue);
-            audioFreeQueue = NULL;
-        }
-        if (audioFullQueue != NULL) {
-            vQueueDelete(audioFullQueue);
-            audioFullQueue = NULL;
-        }
-
-        // Free buffer pool
-        for (int i = 0; i < AUDIO_QUEUE_LENGTH; i++) {
-            if (audioBufferPool[i].data) {
-                free(audioBufferPool[i].data);
-                audioBufferPool[i].data = NULL;
-            }
-        }
-
-        simplePrintln("Audio capture task stopped, buffer pool freed");
+        // Task prints its own "stopped" message — don't duplicate here
     }
 }
 
@@ -819,12 +816,12 @@ void setup_i2s_driver() {
 static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len) {
     size_t off = 0;
     unsigned long startTime = millis();
-    const unsigned long WRITE_TIMEOUT_MS = 30;  // 30ms timeout - fast failover
+    const unsigned long WRITE_TIMEOUT_MS = 50;  // 50ms timeout - balance between responsiveness and stability
 
     while (off < len) {
-        // Check timeout to prevent blocking forever
+        // Check timeout to prevent blocking Core 1
         if (millis() - startTime > WRITE_TIMEOUT_MS) {
-            Serial.println("[Core0] Write timeout - dropping frame");
+            // Drop frame if WiFi is too slow (normal with poor signal)
             return false;
         }
 
@@ -836,7 +833,12 @@ static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len) {
 }
 
 void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
-    if (!client.connected()) return;
+    if (!client.connected()) {
+        // Client disconnected — signal Core 0
+        isStreaming = false;
+        streamClient = NULL;
+        return;
+    }
 
     const uint16_t payloadSize = (uint16_t)(numSamples * (int)sizeof(int16_t));
     const uint16_t packetSize = (uint16_t)(12 + payloadSize);
@@ -852,7 +854,6 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
     uint8_t header[12];
     header[0] = 0x80;      // V=2, P=0, X=0, CC=0
     header[1] = 96;        // M=0, PT=96 (dynamic)
-    // (3) safe byte-wise filling (no unaligned writes)
     header[2] = (uint8_t)((rtpSequence >> 8) & 0xFF);
     header[3] = (uint8_t)(rtpSequence & 0xFF);
     header[4] = (uint8_t)((rtpTimestamp >> 24) & 0xFF);
@@ -867,107 +868,31 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
     // Host->network: per-sample byte-swap (16bit PCM L16 big-endian)
     for (int i = 0; i < numSamples; ++i) {
         uint16_t s = (uint16_t)audioData[i];
-        s = (uint16_t)((s << 8) | (s >> 8)); // htons without dependency
+        s = (uint16_t)((s << 8) | (s >> 8));
         audioData[i] = (int16_t)s;
     }
 
-    if (!writeAll(client, inter, sizeof(inter)) ||
-        !writeAll(client, header, sizeof(header)) ||
-        !writeAll(client, (uint8_t*)audioData, payloadSize)) {
-        isStreaming = false;
-        return;
-    }
+    bool success = writeAll(client, inter, sizeof(inter)) &&
+                   writeAll(client, header, sizeof(header)) &&
+                   writeAll(client, (uint8_t*)audioData, payloadSize);
 
-    rtpSequence++;
-    rtpTimestamp += (uint32_t)numSamples;
-    audioPacketsSent++;
-}
-
-// Audio streaming - TEMPORARILY READING DIRECTLY FROM I2S FOR PDM DEBUGGING
-void streamAudio(WiFiClient &client) {
-    if (!isStreaming || !client.connected()) return;
-
-    static uint32_t streamCount = 0;
-    static uint32_t emptyCount = 0;
-    static uint32_t returnCount = 0;
-
-    // Receive from full queue (Core 1 → Core 0 transfer)
-    // 30ms timeout balances responsiveness with web UI performance
-    AudioBuffer* audioBuffer = NULL;
-    if (xQueueReceive(audioFullQueue, &audioBuffer, pdMS_TO_TICKS(30)) != pdTRUE) {
-        // No data available - Core 1 hasn't captured anything yet
-        // The 30ms timeout already gave other tasks time to run
-        emptyCount++;
-        if (emptyCount % 100 == 0) {
-            Serial.printf("[Core0] Queue empty %d times\n", emptyCount);
-        }
-        return;
-    }
-
-    uint16_t samplesRead = audioBuffer->sampleCount;
-    int16_t* captureData = audioBuffer->data;
-
-    streamCount++;
-
-    // Debug: Monitor queue health
-    if (streamCount % 100 == 0) {
-        Serial.printf("[Core0] Streamed %d, free: %d, full: %d, peak: %d\n",
-            streamCount, uxQueueMessagesWaiting(audioFreeQueue),
-            uxQueueMessagesWaiting(audioFullQueue), lastPeakAbs16);
-    }
-
-    // If HPF params changed dynamically, recompute
-    if (highpassEnabled && (hpfConfigSampleRate != currentSampleRate || hpfConfigCutoff != highpassCutoffHz)) {
-        updateHighpassCoeffs();
-    }
-
-    bool clipped = false;
-    float peakAbs = 0.0f;
-
-    // Process audio - read from captureData, write to i2s_16bit_buffer
-    for (int i = 0; i < samplesRead; i++) {
-        // PDM 16-bit mode: samples are already in the right range, just apply shift if needed
-        float sample = (float)(captureData[i] >> i2sShiftBits);
-
-        if (highpassEnabled) sample = hpf.process(sample);
-
-        float amplified = sample * currentGainFactor;
-        float aabs = fabsf(amplified);
-        if (aabs > peakAbs) peakAbs = aabs;
-        if (aabs > 32767.0f) clipped = true;
-
-        // Clamp to 16-bit range
-        if (amplified > 32767.0f) amplified = 32767.0f;
-        if (amplified < -32768.0f) amplified = -32768.0f;
-        i2s_16bit_buffer[i] = (int16_t)amplified;
-    }
-
-    // Update metering after processing the block
-    if (peakAbs > 32767.0f) peakAbs = 32767.0f;
-    lastPeakAbs16 = (uint16_t)peakAbs;
-    audioClippedLastBlock = clipped;
-    if (clipped) audioClipCount++;
-
-    // Update peak hold for a short window (~3 s) to match UI polling cadence
-    if (lastPeakAbs16 > peakHoldAbs16) {
-        peakHoldAbs16 = lastPeakAbs16;
-        peakHoldUntilMs = millis() + 3000UL;
-    } else if (peakHoldAbs16 > 0 && millis() > peakHoldUntilMs) {
-        peakHoldAbs16 = 0;
-    }
-
-    sendRTPPacket(client, i2s_16bit_buffer, samplesRead);
-
-    // Return buffer to free queue for reuse by Core 1
-    if (xQueueSend(audioFreeQueue, &audioBuffer, portMAX_DELAY) == pdTRUE) {
-        returnCount++;
-        if (returnCount % 100 == 0) {
-            Serial.printf("[Core0] Returned %d buffers to free queue\n", returnCount);
-        }
+    if (success) {
+        rtpSequence++;
+        rtpTimestamp += (uint32_t)numSamples;
+        audioPacketsSent++;
     } else {
-        Serial.printf("[Core0] CRITICAL: Failed to return buffer %p to free queue!\n", audioBuffer);
+        // Write failed — client disconnected or too slow
+        audioPacketsDropped++;
+        // Signal Core 0 to clean up
+        isStreaming = false;
+        streamClient = NULL;
     }
 }
+
+// ================== CORE 0: NO AUDIO STREAMING ==================
+// Audio streaming is now handled entirely on Core 1
+// Core 0 only manages client connections and RTSP protocol
+// (streamAudio function removed - handled by Core 1 audioCaptureTask)
 
 // RTSP handling
 void handleRTSPCommand(WiFiClient &client, String request) {
@@ -1012,23 +937,27 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         client.print("Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n");
 
     } else if (request.startsWith("PLAY")) {
+        // Send PLAY response FIRST (still on Core 0, Core 1 not started yet)
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
         client.print("Session: " + rtspSessionId + "\r\n");
         client.print("Range: npt=0.000-\r\n\r\n");
 
-        isStreaming = true;
         rtpSequence = 0;
         rtpTimestamp = 0;
         audioPacketsSent = 0;
+        audioPacketsDropped = 0;
         lastStatsReset = millis();
         lastRtspPlayMs = millis();
         rtspPlayCount++;
 
-        // Start audio capture task when streaming begins
+        // Hand off client to Core 1 via pointer
+        streamClient = &rtspClient;
+        isStreaming = true;
+
+        // Start audio capture task
         startAudioCaptureTask();
 
-        // Set LED to purple when streaming
         M5.dis.drawpix(0, CRGB(128, 0, 128));
         simplePrintln("STREAMING STARTED");
 
@@ -1036,12 +965,12 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
         client.print("Session: " + rtspSessionId + "\r\n\r\n");
-        isStreaming = false;
 
-        // Stop audio capture task when streaming ends
+        // Signal Core 1 to stop, then clean up
+        isStreaming = false;
+        streamClient = NULL;
         stopAudioCaptureTask();
 
-        // Set LED back to green when streaming stops
         M5.dis.drawpix(0, CRGB(0, 128, 0));
         simplePrintln("STREAMING STOPPED");
     } else if (request.startsWith("GET_PARAMETER")) {
@@ -1051,24 +980,31 @@ void handleRTSPCommand(WiFiClient &client, String request) {
     }
 }
 
-// RTSP processing
+// RTSP processing (runs on Core 0, only called when !isStreaming — no contention)
 void processRTSP(WiFiClient &client) {
     if (!client.connected()) return;
 
     if (client.available()) {
         int available = client.available();
+        int spaceLeft = sizeof(rtspParseBuffer) - rtspParseBufferPos - 1;
 
-        if (rtspParseBufferPos + available >= (int)sizeof(rtspParseBuffer)) {
-            available = sizeof(rtspParseBuffer) - rtspParseBufferPos - 1;
-            if (available <= 0) {
-                simplePrintln("RTSP buffer overflow - resetting");
-                rtspParseBufferPos = 0;
-                return;
+        if (available > spaceLeft) {
+            available = spaceLeft;
+        }
+
+        if (available <= 0) {
+            static unsigned long lastOverflowWarning = 0;
+            if (millis() - lastOverflowWarning > 5000) {
+                simplePrintln("RTSP buffer full - resetting");
+                lastOverflowWarning = millis();
             }
+            rtspParseBufferPos = 0;
+            return;
         }
 
         client.read(rtspParseBuffer + rtspParseBufferPos, available);
         rtspParseBufferPos += available;
+        rtspParseBuffer[rtspParseBufferPos] = '\0';
 
         char* endOfHeader = strstr((char*)rtspParseBuffer, "\r\n\r\n");
         if (endOfHeader != nullptr) {
@@ -1078,8 +1014,11 @@ void processRTSP(WiFiClient &client) {
             handleRTSPCommand(client, request);
 
             int headerLen = (endOfHeader - (char*)rtspParseBuffer) + 4;
-            memmove(rtspParseBuffer, rtspParseBuffer + headerLen, rtspParseBufferPos - headerLen);
-            rtspParseBufferPos -= headerLen;
+            int remaining = rtspParseBufferPos - headerLen;
+            if (remaining > 0) {
+                memmove(rtspParseBuffer, rtspParseBuffer + headerLen, remaining);
+            }
+            rtspParseBufferPos = remaining;
         }
     }
 }
@@ -1120,14 +1059,8 @@ void setup() {
     loadAudioSettings();
     Serial.println("Settings loaded");
 
-    // Allocate buffers with current size (16-bit for PDM)
-    Serial.println("Allocating buffers...");
-    i2s_16bit_buffer = (int16_t*)malloc(currentBufferSize * sizeof(int16_t));
-    if (!i2s_16bit_buffer) {
-        simplePrintln("FATAL: Memory allocation failed!");
-        ESP.restart();
-    }
-    Serial.println("Buffers allocated");
+    // Note: Audio buffers now allocated by Core 1 task (not in main)
+    Serial.println("Audio buffers will be allocated by Core 1 pipeline task");
 
     // WiFi optimization for stable streaming
     Serial.println("Initializing WiFi...");
@@ -1154,8 +1087,8 @@ void setup() {
     setup_i2s_driver();
     Serial.println("I2S driver ready");
 
-    // Audio queue and capture task will be created when RTSP streaming begins (on PLAY command)
-    Serial.println("Dual-core audio ready (queue and task will start on RTSP PLAY)");
+    // Audio pipeline task will be created when RTSP streaming begins (on PLAY command)
+    Serial.println("Dual-core audio ready (Core 1 pipeline will start on RTSP PLAY)");
 
     Serial.println("Updating highpass coefficients...");
     updateHighpassCoeffs();
@@ -1244,67 +1177,52 @@ void loop() {
 
     checkScheduledReset();
 
-    // RTSP client management
+    // RTSP client management (Core 0) — clear phase separation, no mutex
     if (rtspServerEnabled) {
-        if (rtspClient && !rtspClient.connected()) {
+        // Phase: detect disconnect (Core 1 cleared streamClient)
+        if (isStreaming && streamClient == NULL) {
+            // Core 1 detected write failure — clean up
+            isStreaming = false;
+            stopAudioCaptureTask();
             rtspClient.stop();
-            if (isStreaming) {
-                isStreaming = false;
-                // Stop audio capture task when client disconnects
-                stopAudioCaptureTask();
-            }
-            // Set LED back to green when client disconnects
             M5.dis.drawpix(0, CRGB(0, 128, 0));
             simplePrintln("RTSP client disconnected");
         }
 
-        // Timeout for RTSP clients (30 seconds of inactivity)
-        if (rtspClient && rtspClient.connected() && !isStreaming) {
-            if (millis() - lastRTSPActivity > 30000) {
-                rtspClient.stop();
-                simplePrintln("RTSP client timeout - disconnected");
+        // Phase: accept new client (only when not streaming)
+        if (!isStreaming) {
+            if (!rtspClient || !rtspClient.connected()) {
+                WiFiClient newClient = rtspServer.available();
+                if (newClient) {
+                    rtspClient = newClient;
+                    rtspClient.setNoDelay(true);
+                    rtspParseBufferPos = 0;
+                    lastRTSPActivity = millis();
+                    lastRtspClientConnectMs = millis();
+                    rtspConnectCount++;
+                    simplePrintln("New RTSP client connected");
+                }
             }
-        }
 
-        if (!rtspClient || !rtspClient.connected()) {
-            // Ensure audio task is stopped before accepting new client
-            if (isStreaming) {
-                isStreaming = false;
-                stopAudioCaptureTask();
-                M5.dis.drawpix(0, CRGB(0, 128, 0));  // Green - ready
-            }
-
-            WiFiClient newClient = rtspServer.available();
-            if (newClient) {
-                rtspClient = newClient;
-                rtspClient.setNoDelay(true);
-                rtspParseBufferPos = 0;
-                lastRTSPActivity = millis();
-                lastRtspClientConnectMs = millis();
-                rtspConnectCount++;
-                simplePrintln("New RTSP client connected from: " + rtspClient.remoteIP().toString());
-            }
-        }
-
-        if (rtspClient && rtspClient.connected()) {
-            if (rtspClient.available()) {
-                lastRTSPActivity = millis();
-            }
-            processRTSP(rtspClient);
-            if (isStreaming) {
-                streamAudio(rtspClient);
+            // Phase: RTSP negotiation (only when not streaming)
+            if (rtspClient && rtspClient.connected()) {
+                processRTSP(rtspClient);
             }
         }
     } else {
-        if (rtspClient && rtspClient.connected()) {
-            rtspClient.stop();
+        // RTSP server disabled (overheat lockout)
+        if (isStreaming) {
             isStreaming = false;
-            // Set LED to red if latched, otherwise green
-            if (overheatLatched) {
-                M5.dis.drawpix(0, CRGB(128, 0, 0));
-            } else {
-                M5.dis.drawpix(0, CRGB(0, 128, 0));
-            }
+            streamClient = NULL;
+            stopAudioCaptureTask();
+        }
+        if (rtspClient) {
+            rtspClient.stop();
+        }
+        if (overheatLatched) {
+            M5.dis.drawpix(0, CRGB(128, 0, 0));
+        } else {
+            M5.dis.drawpix(0, CRGB(0, 128, 0));
         }
     }
     // Handle deferred reboot/reset safely here

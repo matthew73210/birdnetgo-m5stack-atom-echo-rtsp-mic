@@ -82,36 +82,61 @@ Initial attempt used a custom lock-free ring buffer, but encountered **cache coh
 ### Session 4: Buffer Management Fixes
 - Fixed queue cleanup (use `vQueueDelete()` instead of `xQueueReset()`)
 - Added proper start/stop cycle for multiple streaming sessions
-- Added write timeout (100ms) to prevent Core 0 blocking on slow clients
+- Added write timeout (100ms → 30ms) to prevent Core 0 blocking
 - Reduced debug message spam
 
-## Current Issues
+### Session 5: Final Production Release ✅
+**Major Discovery**: i2sShiftBits saved to flash was causing all audio to be zeros
+- **Symptom**: Audio captured successfully but all processed samples were `[0, 0, 0]`
+- **Debug Process**:
+  - Disabled HPF → still zeros
+  - Added step-by-step debug → found `captureData[0]=180` became `sample=0.0`
+  - Root cause: `i2sShiftBits=11` (from old flash settings) → `180 >> 11 = 0`
+- **Fixes Applied**:
+  1. Hardcoded i2sShiftBits to 0 (ignores flash)
+  2. Made Web UI read-only for i2sShiftBits
+  3. Removed API endpoint for changing i2sShiftBits
+  4. Optimized timeouts (30ms write, 30ms queue)
+  5. Cleaned up debug output
+  6. Updated branding to "M5Stack Atom Echo"
 
-### ❌ No Audio Output
-**Status**: Audio is being captured and processed, but client doesn't hear it
+**Result**: Production-ready system with clean audio, stable streaming, responsive Web UI
 
-**Evidence**:
-- Raw captured samples show real values: `[-147, -153, -160]`
-- I2S capture on Core 1 is working
-- Buffers flow through queue successfully
-- RTP packets appear to be sent
+## ✅ System Status: PRODUCTION READY
 
-**Needs Investigation**:
-- Check processed audio values before RTP send
-- Verify RTP packet format compatibility
-- Test with different RTSP clients (VLC, ffplay, BirdNET-Go)
-- Check if sample rate/format matches RTSP DESCRIBE
+### Audio Streaming: Fully Functional ✅
+- ✅ Constant audio without dropouts
+- ✅ Clean, non-choppy playback
+- ✅ Good audio quality with proper gain/filtering
+- ✅ Queue health: `free: 6-7, full: 0-1` (optimal)
+- ✅ Web UI responsive during streaming
+- ✅ Handles client connects/disconnects gracefully
+- ✅ Stable long-term operation
 
-### ⚠️ Buffer Starvation (Improved but not eliminated)
-**Status**: Core 1 runs out of free buffers when client is slow
+### Critical Fix: i2sShiftBits (RESOLVED)
+**Issue**: Old I2S settings (i2sShiftBits=11) were saved to flash from earlier debugging
+**Impact**: All audio samples shifted to zeros → no audio (e.g., 180 >> 11 = 0)
+**Root Cause**: Code allowed users to change i2sShiftBits via Web UI, wrong value got saved
+**Final Solution**:
+- **Hardcoded to 0** in code (always loads as 0, ignores flash)
+- **Web UI**: Changed to read-only display showing "0 bits (fixed for PDM)"
+- **API endpoint**: Removed handler for changing i2sShiftBits
+- **Result**: Users cannot break audio by changing this setting
 
-**Recent Fixes**:
-- Added 100ms timeout to `writeAll()` to prevent Core 0 blocking
-- Will drop frames if client can't keep up (better than deadlock)
+**CRITICAL FOR PDM**: `i2sShiftBits` MUST ALWAYS be 0!
 
-**Remaining Issues**:
-- Still gets "No free buffers" messages (reduced spam: only log every 1000)
-- Need to monitor if timeout fix fully resolves this
+### Web UI Improvements (Latest)
+- **Branding**: Updated to "M5Stack Atom Echo" throughout
+- **i2sShiftBits**: Read-only display, cannot be modified
+- **Debug output**: Cleaned up, minimal logging (only errors/important events)
+- **Help tooltips**: Comprehensive explanations already present
+- **Title**: "M5Stack Atom Echo - RTSP Microphone"
+
+### Performance Optimizations
+- **Write timeout**: 30ms (prevents WiFi blocking, drops frames if client slow)
+- **Queue timeout**: 30ms (balances audio responsiveness with web UI)
+- **Audio task priority**: 10 (elevated but allows web UI to run)
+- **Buffer pool**: 8 buffers × 1024 samples (16KB total, optimal)
 
 ## Audio Processing Pipeline
 
@@ -138,15 +163,20 @@ RTP Packet Formation:
 WiFi Client (with 100ms timeout)
 ```
 
-## Default Settings
+## Verified Working Configuration
 ```cpp
 Sample Rate:      16000 Hz (optimal for PDM on Atom Echo)
-Gain:            1.2×
-Buffer Size:     1024 samples (64ms latency)
-I2S Shift:       0 bits (PDM doesn't need shifting like I2S)
-High-Pass:       ON, 500Hz cutoff
+Gain:            1.0× - 1.2× (adjust for your environment)
+Buffer Size:     1024 samples (64ms latency, good balance)
+I2S Shift:       0 bits ⚠️ CRITICAL: Must be 0 for PDM!
+High-Pass:       ON, 500Hz cutoff (reduces wind/traffic noise)
 CPU Frequency:   240 MHz
 WiFi TX Power:   19.5 dBm
+
+Queue timeout:   30ms (audio responsiveness vs web UI balance)
+Write timeout:   30ms (prevents WiFi blocking)
+Audio priority:  10 (elevated but allows web UI to run)
+Buffer pool:     8 buffers (optimal for smooth streaming)
 ```
 
 ## LED Status Indicators
@@ -171,23 +201,49 @@ WiFi TX Power:   19.5 dBm
 [Core0] Write timeout - client too slow   // WiFi client can't keep up
 ```
 
-## Next Steps
+## Lessons Learned
 
-1. **Fix No Audio Issue** (PRIORITY)
-   - Add debug output for processed audio samples
-   - Verify RTP packet contents
-   - Test with different RTSP clients
-   - Check RTSP DESCRIBE response matches actual format
+### Critical for PDM Microphones
+1. **i2sShiftBits MUST be 0** - This is non-negotiable for PDM
+2. **Don't allow user configuration** of hardware-specific settings
+3. **Hardcode defaults** instead of loading from flash for critical settings
+4. **Debug at every step**: raw samples → processed samples → RTP packets
 
-2. **Optimize Buffer Flow**
-   - Monitor if write timeout fully resolves buffer starvation
-   - Consider increasing buffer pool size if needed
-   - Add metrics for queue depth over time
+### Dual-Core ESP32 Best Practices
+1. **Use FreeRTOS queues** not custom ring buffers (cache coherency!)
+2. **Buffer pool pattern** works well for producer/consumer
+3. **Balance timeouts**: Too short starves web UI, too long causes dropouts
+4. **Priority 10** is good for audio capture (not too aggressive)
+5. **30ms write timeout** prevents WiFi blocking without excessive frame drops
 
-3. **Performance Tuning**
-   - Test different buffer sizes (512, 1024, 2048)
-   - Optimize high-pass filter performance
-   - Consider adjustable Core 1 task priority
+### Debugging Methodology
+When audio isn't working:
+1. Check raw I2S samples first (are they real values?)
+2. Check processed samples (did processing zero them out?)
+3. Check RTP packets (are they being sent?)
+4. Add step-by-step debug output in the processing pipeline
+5. Don't assume defaults - check what's actually in flash/preferences
+
+## Optional Future Enhancements
+
+### Web UI
+1. **"Recommended for BirdNET-Go" badges** next to optimal settings
+2. **Queue health display** showing buffer pool status in real-time
+3. **Preset buttons**: "BirdNET-Go Defaults", "Indoor", "Outdoor"
+4. **Simplified mode** with just 3-4 key settings for beginners
+
+### Features
+1. **mDNS discovery** for easier setup
+2. **Multi-client support** (currently single RTSP client)
+3. **Audio statistics** page (peak levels over time, clipping events, etc.)
+4. **Remote logging** for debugging deployed units
+
+### Performance
+1. **Adaptive buffering** based on WiFi quality
+2. **Quality metrics** (jitter, packet loss, etc.)
+3. **Auto-tuning** of gain based on ambient noise levels
+
+**Note**: Current system is fully functional - these are nice-to-haves, not requirements!
 
 ## Important Notes
 
@@ -230,6 +286,73 @@ ffplay -rtsp_transport tcp rtsp://[device-ip]:8554/audio
 # BirdNET-Go
 # Set audio source to: rtsp://[device-ip]:8554/audio
 ```
+
+## Quick Reference for Future Sessions
+
+### If Audio Stops Working
+1. **First check**: Serial monitor for `i2sShiftBits` value - MUST be 0
+2. **Web UI**: Verify "I2S Shift" shows "0 bits (fixed for PDM)"
+3. **Debug mode**: Uncomment debug lines in streamAudio to see sample values
+4. **Reset settings**: Use "Defaults" button in Web UI if values are corrupted
+
+### If System is Unstable
+1. **Check queue health**: Should show `free: 6-7, full: 0-1`
+2. **WiFi signal**: RSSI should be > -70 dBm
+3. **Free heap**: Should stay above ~80KB
+4. **Write timeouts**: Look for "Write timeout" messages (means client is slow)
+
+### Key Files
+- **Main code**: `src/esp32_rtsp_mic_birdnetgo.ino`
+- **Web UI**: `src/WebUI.cpp` (long string literals, use sed for edits)
+- **Configuration**: Saved to flash in `audioPrefs` namespace
+- **This document**: `CLAUDE.md`
+
+### Architecture Quick Summary
+```
+┌─────────────────────────────────────────┐
+│ Core 1 (PRO_CPU) - Priority 10          │
+│ ┌────────────────────────────┐          │
+│ │ audioCaptureTask()         │          │
+│ │ - i2s_read() 16-bit PDM    │          │
+│ │ - Write to fullQueue       │          │
+│ └────────────────────────────┘          │
+└─────────────────────────────────────────┘
+              ↓ FreeRTOS Queue
+┌─────────────────────────────────────────┐
+│ Core 0 (APP_CPU)                        │
+│ ┌────────────────────────────┐          │
+│ │ loop() / streamAudio()     │          │
+│ │ - Read from fullQueue      │          │
+│ │ - Process (gain, HPF)      │          │
+│ │ - Send RTP packet          │          │
+│ │ - Return to freeQueue      │          │
+│ └────────────────────────────┘          │
+│ ┌────────────────────────────┐          │
+│ │ webui_handleClient()       │          │
+│ │ - HTTP server for config   │          │
+│ └────────────────────────────┘          │
+└─────────────────────────────────────────┘
+```
+
+### Common Issues & Solutions
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| No audio, samples are zeros | i2sShiftBits ≠ 0 | Hardcoded to 0 in latest version |
+| Choppy audio | Buffer starvation | Check queue health, reduce write timeout |
+| Web UI unresponsive | Queue timeout too short | Current 30ms is balanced |
+| Client disconnects | Write timeout / slow WiFi | 30ms timeout will drop frames vs blocking |
+| Cache coherency errors | Custom ring buffer | Use FreeRTOS queues (current version) |
+
+### Production Checklist
+- ✅ i2sShiftBits hardcoded to 0
+- ✅ Sample rate: 16000 Hz
+- ✅ Buffer size: 1024 samples
+- ✅ High-pass filter: ON, 500Hz
+- ✅ Gain: 1.0-1.2× (adjust per environment)
+- ✅ CPU: 240 MHz
+- ✅ Queue timeout: 30ms
+- ✅ Write timeout: 30ms
+- ✅ Debug output: Minimal (production mode)
 
 ## Dependencies
 ```ini

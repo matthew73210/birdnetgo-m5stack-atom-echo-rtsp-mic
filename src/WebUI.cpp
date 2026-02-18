@@ -128,7 +128,7 @@ static String htmlIndex() {
     h += F(
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>ESP32 RTSP Mic for BirdNET-Go</title>"
+        "<title>M5Stack Atom Echo - RTSP Microphone</title>"
         "<style>:root{--bg:#0b1020;--fg:#e7ebf2;--muted:#9aa3b2;--card:#121a2e;--border:#1b2745;--acc:#4ea1f3;--acc2:#36d399;--warn:#f59e0b;--bad:#ef4444}"
         "body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:linear-gradient(180deg,#0b1020 0%,#0f1530 100%);color:var(--fg)}"
         ".page{max-width:1000px;margin:0 auto;padding:16px}"
@@ -151,7 +151,7 @@ static String htmlIndex() {
         "</style></head><body>"
         "<div id='ovr' class='overlay'><div class='box' id='ovr_msg'>Restarting…</div></div>"
         "<div class='page'>"
-        "<div class='card'><div class='hero'><div><div class='brand'><div class='title' id='t_title'>ESP32 RTSP Mic for BirdNET-Go</div><span class='badge' id='fwv'></span></div><div class='subtitle'>URL: <a id='rtsp' class='mono' href='rtsp://");
+        "<div class='card'><div class='hero'><div><div class='brand'><div class='title' id='t_title'>M5Stack Atom Echo</div><span class='badge' id='fwv'></span></div><div class='subtitle'>URL: <a id='rtsp' class='mono' href='rtsp://");
     h += ip;
     h += F(
         ":8554/audio' target='_blank'>rtsp://");
@@ -229,7 +229,7 @@ static String htmlIndex() {
 
         "<div id='advsec'>"
         "<div class='card'><h2 id='t_advanced_settings'>Advanced Settings</h2><table>"
-        "<tr><td class='k'><span id='t_shift'>I2S Shift</span><span class='help' id='h_shift'>?</span></td><td class='v'><div class='field'><input id='in_shift' type='number' step='1' min='0' max='24'><span class='unit'>bits</span><button id='btn_shift_set' onclick=\"setv('shift',in_shift.value)\">Set</button></div></td></tr>"
+        "<tr><td class='k'><span id='t_shift'>I2S Shift</span><span class='help' id='h_shift'>?</span></td><td class='v'><span id=.val_shift. class=.val.>0</span> bits <span style=.color:#888;font-size:0.9em.>(fixed for PDM)</span></td></tr>"
         "<tr id='row_shift_hint' style='display:none'><td colspan='2'><div class='hint' id='txt_shift_hint'></div></td></tr>"
         "<tr><td class='k'><span id='t_chk'>Check Interval</span><span class='help' id='h_chk'>?</span></td><td class='v'><div class='field'><input id='in_chk' type='number' step='1' min='1' max='60'><span class='unit'>min</span><button id='btn_chk_set' onclick=\"setv('check_interval',in_chk.value)\">Set</button></div></td></tr>"
         "<tr id='row_chk_hint' style='display:none'><td colspan='2'><div class='hint' id='txt_chk_hint'></div></td></tr>"
@@ -422,8 +422,9 @@ static void httpActionServerStart(){
     webui_pushLog(F("UI action: server_start"));
     apiSendJSON(F("{\"ok\":true}"));
 }
+extern WiFiClient* volatile streamClient;
 static void httpActionServerStop(){
-    rtspServerEnabled=false; if (rtspClient && rtspClient.connected()) rtspClient.stop(); isStreaming=false; rtspServer.stop();
+    isStreaming=false; streamClient=NULL; rtspServerEnabled=false; if (rtspClient && rtspClient.connected()) rtspClient.stop(); rtspServer.stop();
     webui_pushLog(F("UI action: server_stop"));
     apiSendJSON(F("{\"ok\":true}"));
 }
@@ -444,7 +445,7 @@ static void httpSet() {
     if (key == "gain") { float v; if (argToFloat("value", v) && v>=0.1f && v<=100.0f) { currentGainFactor=v; saveAudioSettings(); restartI2S(); } }
     else if (key == "rate") { uint32_t v; if (argToUInt("value", v) && v>=8000 && v<=96000) { currentSampleRate=v; if (autoThresholdEnabled) { minAcceptableRate = computeRecommendedMinRate(); } saveAudioSettings(); restartI2S(); } }
     else if (key == "buffer") { uint16_t v; if (argToUShort("value", v) && v>=256 && v<=8192) { currentBufferSize=v; if (autoThresholdEnabled) { minAcceptableRate = computeRecommendedMinRate(); } saveAudioSettings(); restartI2S(); } }
-    else if (key == "shift") { uint8_t v; if (argToUChar("value", v) && v<=24) { i2sShiftBits=v; saveAudioSettings(); restartI2S(); } }
+    // i2sShiftBits removed - fixed at 0 for PDM microphones
     else if (key == "wifi_tx") { float v; if (argToFloat("value", v) && v>=-1.0f && v<=19.5f) { extern float wifiTxPowerDbm; wifiTxPowerDbm = snapWifiTxDbm(v); applyWifiTxPower(true); saveAudioSettings(); } }
     else if (key == "auto_recovery") { String v=web.arg("value"); if (v=="on"||v=="off") { autoRecoveryEnabled=(v=="on"); saveAudioSettings(); } }
     else if (key == "thr_mode") { String v=web.arg("value"); if (v=="auto") { autoThresholdEnabled=true; minAcceptableRate = computeRecommendedMinRate(); saveAudioSettings(); } else if (v=="manual") { autoThresholdEnabled=false; saveAudioSettings(); } }
