@@ -5,8 +5,6 @@
 #include <Preferences.h>
 #include <math.h>
 #include <M5Atom.h>
-#include <lwip/sockets.h>
-#include <lwip/netdb.h>
 #include "WebUI.h"
 
 // ================== DUAL-CORE AUDIO ARCHITECTURE ==================
@@ -1034,7 +1032,8 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         rtspSessionId = String(random(100000000, 999999999));
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
-        client.print("Session: " + rtspSessionId + "\r\n");
+        // Large timeout reduces ffmpeg keepalive frequency (keepalive sent at timeout/2)
+        client.print("Session: " + rtspSessionId + ";timeout=86400\r\n");
         client.print("Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n");
 
     } else if (request.startsWith("PLAY")) {
@@ -1314,6 +1313,22 @@ void loop() {
 
     // RTSP client management (Core 0) — clear phase separation, no mutex
     if (rtspServerEnabled) {
+        // Phase: drain receive buffer during streaming (Core 0 only reads, no writes)
+        // ffmpeg sends GET_PARAMETER keepalives every ~30s; we must drain them
+        // to prevent TCP receive buffer from filling and closing the window
+        if (isStreaming && rtspClient && rtspClient.connected()) {
+            int avail = rtspClient.available();
+            if (avail > 0) {
+                // Read and discard — no response needed (ffmpeg fire-and-forget)
+                uint8_t discard[128];
+                while (avail > 0) {
+                    int toRead = (avail > (int)sizeof(discard)) ? (int)sizeof(discard) : avail;
+                    rtspClient.read(discard, toRead);
+                    avail -= toRead;
+                }
+            }
+        }
+
         // Phase: detect disconnect (Core 1 cleared streamClient)
         if (isStreaming && streamClient == NULL) {
             // Core 1 detected write failure — task stays alive for fast reconnect
@@ -1333,24 +1348,6 @@ void loop() {
                 if (newClient) {
                     rtspClient = newClient;
                     rtspClient.setNoDelay(true);
-
-                    // TCP keepalive: detect dead connections at OS level
-                    int fd = rtspClient.fd();
-                    if (fd >= 0) {
-                        int yes = 1;
-                        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
-                        int idle = 10;     // Start keepalive probes after 10s idle
-                        int interval = 5;  // Probe every 5s
-                        int count = 3;     // Give up after 3 failed probes
-                        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-                        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
-                        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
-
-                        // Larger send buffer to absorb WiFi stalls
-                        int sndbuf = 8192;
-                        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-                    }
-
                     rtspParseBufferPos = 0;
                     lastRTSPActivity = millis();
                     lastRtspClientConnectMs = millis();
