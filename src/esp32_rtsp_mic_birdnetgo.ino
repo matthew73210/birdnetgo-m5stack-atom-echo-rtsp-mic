@@ -5,6 +5,8 @@
 #include <Preferences.h>
 #include <math.h>
 #include <M5Atom.h>
+#include <lwip/sockets.h>
+#include <lwip/netdb.h>
 #include "WebUI.h"
 
 // ================== DUAL-CORE AUDIO ARCHITECTURE ==================
@@ -908,7 +910,7 @@ void setup_i2s_driver() {
 static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len) {
     size_t off = 0;
     unsigned long startTime = millis();
-    const unsigned long WRITE_TIMEOUT_MS = 50;  // 50ms timeout - balance between responsiveness and stability
+    const unsigned long WRITE_TIMEOUT_MS = 150;  // 150ms timeout - allows WiFi to recover from brief stalls
 
     while (off < len) {
         // Check timeout to prevent blocking Core 1
@@ -924,9 +926,12 @@ static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len) {
     return true;
 }
 
+static uint32_t consecutiveWriteFailures = 0;
+static const uint32_t MAX_WRITE_FAILURES = 30;  // Allow ~2s of failures before disconnect
+
 void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
     if (!client.connected()) {
-        // Client disconnected — signal Core 0 (only clear pointer, Core 0 owns isStreaming)
+        // Client actually disconnected — no tolerance, signal Core 0 immediately
         streamClient = NULL;
         return;
     }
@@ -971,10 +976,17 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
         rtpSequence++;
         rtpTimestamp += (uint32_t)numSamples;
         audioPacketsSent++;
+        consecutiveWriteFailures = 0;  // Reset on success
     } else {
         audioPacketsDropped++;
-        // Signal Core 0 to clean up (only clear pointer, Core 0 owns isStreaming)
-        streamClient = NULL;
+        consecutiveWriteFailures++;
+
+        if (consecutiveWriteFailures >= MAX_WRITE_FAILURES) {
+            // Sustained failure — connection is dead
+            Serial.printf("[Core1] %u consecutive write failures, disconnecting\n", consecutiveWriteFailures);
+            consecutiveWriteFailures = 0;
+            streamClient = NULL;
+        }
     }
 }
 
@@ -1071,7 +1083,9 @@ void handleRTSPCommand(WiFiClient &client, String request) {
     }
 }
 
-// RTSP processing (runs on Core 0, only called when !isStreaming — no contention)
+// RTSP processing (runs on Core 0)
+// Called both during negotiation (!isStreaming) and during streaming
+// to handle keepalives (GET_PARAMETER) and clean teardowns
 void processRTSP(WiFiClient &client) {
     if (!client.connected()) return;
 
@@ -1309,7 +1323,14 @@ void loop() {
             rtspClient.stop();
             if (ledMode > 0) M5.dis.drawpix(0, CRGB(0, 0, 128));
             else M5.dis.drawpix(0, CRGB(0, 0, 0));
-            simplePrintln("RTSP client disconnected");
+            unsigned long sessionSec = (millis() - lastRtspPlayMs) / 1000;
+            simplePrintln("RTSP client disconnected (session: " + String(sessionSec) + "s, dropped: " +
+                         String(audioPacketsDropped) + ", RSSI: " + String(WiFi.RSSI()) + " dBm)");
+        }
+
+        // Phase: handle RTSP commands during streaming (keepalives, teardown)
+        if (isStreaming && rtspClient && rtspClient.connected()) {
+            processRTSP(rtspClient);
         }
 
         // Phase: accept new client (only when not streaming)
@@ -1319,6 +1340,24 @@ void loop() {
                 if (newClient) {
                     rtspClient = newClient;
                     rtspClient.setNoDelay(true);
+
+                    // TCP keepalive: detect dead connections at OS level
+                    int fd = rtspClient.fd();
+                    if (fd >= 0) {
+                        int yes = 1;
+                        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+                        int idle = 10;     // Start keepalive probes after 10s idle
+                        int interval = 5;  // Probe every 5s
+                        int count = 3;     // Give up after 3 failed probes
+                        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+                        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+                        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+
+                        // Larger send buffer to absorb WiFi stalls
+                        int sndbuf = 8192;
+                        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+                    }
+
                     rtspParseBufferPos = 0;
                     lastRTSPActivity = millis();
                     lastRtspClientConnectMs = millis();

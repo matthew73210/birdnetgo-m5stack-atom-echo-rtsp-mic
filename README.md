@@ -79,8 +79,11 @@ LED behavior depends on the configurable LED Mode (Off / Static / Level):
 - **WiFi Power Control**: Adjustable TX power to reduce RF noise
 - **Buffer Profiles**: Multiple latency/stability profiles (256 to 8192 samples)
 - **Thermal Protection**: Automatic shutdown on overheating (configurable 30-95C)
+- **Connection Resilience**: Write failure tolerance (30 packets), TCP keepalive, 8KB send buffer, 150ms write timeout — survives WiFi hiccups without dropping the stream
+- **RTSP Keepalive**: Responds to GET_PARAMETER during streaming — prevents client timeout disconnects
 - **Smart Auto Recovery**: Requires 3 consecutive low-rate checks before restarting, with 2-minute cooldown to prevent restart loops
 - **RTSP Idle Timeout**: Auto-disconnects clients that connect but never stream (60s)
+- **Disconnect Diagnostics**: Logs session duration, dropped packets, and WiFi RSSI on every disconnect
 - **Scheduled Resets**: Optional periodic reboots for long-term stability
 - **Heap Monitoring**: Periodic heap logging for detecting leaks in long deployments
 - **Timestamped Logs**: NTP-synced timestamps (EST) on all log messages for easier debugging
@@ -244,11 +247,17 @@ lib_deps =
 ## Version History
 
 ### v2.2.0
+- Fixed **RTSP keepalive handling** — Core 0 now responds to GET_PARAMETER during streaming, preventing ~20 min timeout disconnects
+- Added **write failure tolerance** — 30 consecutive failures (~2s) before disconnecting, survives brief WiFi hiccups
+- Added **TCP keepalive** — OS-level dead connection detection (10s idle, 5s probes, 3 retries)
+- Added **larger TCP send buffer** (8KB) — absorbs WiFi stalls without blocking writes
+- Increased **write timeout** from 50ms to 150ms — gives WiFi time to recover per-packet
+- Fixed **auto-recovery restart loop** — requires 3 consecutive failures with 2-minute cooldown
+- Lowered auto-recovery threshold from 70% to 50% of expected packet rate
 - Added **NTP time sync** — real timestamps (EST) in all log messages
 - Added **configurable LED mode** — Off / Static / Level via Web UI
 - Changed LED colors: **blue** = ready, **green** = streaming, level mode uses green/orange/red
-- Fixed **auto-recovery restart loop** — now requires 3 consecutive failures with 2-minute cooldown
-- Lowered auto-recovery threshold from 70% to 50% of expected packet rate
+- Added **disconnect diagnostics** — logs session duration, dropped packets, and RSSI on disconnect
 
 ### v2.1.0
 - Removed mutex — replaced with lock-free pointer handoff between cores
