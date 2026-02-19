@@ -18,7 +18,7 @@ TaskHandle_t audioCaptureTaskHandle = NULL;
 volatile bool audioTaskRunning = false;
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "2.1.0"
+#define FW_VERSION "2.2.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 
@@ -375,23 +375,32 @@ void checkPerformance() {
     }
 
     if (isStreaming && (millis() - lastStatsReset) > 30000) {
+        // Cooldown: skip performance check for 2 minutes after last I2S reset
+        if (lastI2SReset > 0 && (millis() - lastI2SReset) < 120000) {
+            return;
+        }
+
         uint32_t runtime = millis() - lastStatsReset;
         uint32_t currentRate = (audioPacketsSent * 1000) / runtime;
 
         if (currentRate > maxPacketRate) maxPacketRate = currentRate;
         if (currentRate < minPacketRate) minPacketRate = currentRate;
 
+        static uint8_t consecutiveLowCount = 0;
         if (currentRate < minAcceptableRate) {
-            simplePrintln("PERFORMANCE DEGRADATION DETECTED!");
-            simplePrintln("Rate " + String(currentRate) + " < minimum " + String(minAcceptableRate) + " pkt/s");
+            consecutiveLowCount++;
+            simplePrintln("Low packet rate: " + String(currentRate) + " < " + String(minAcceptableRate) + " pkt/s (" + String(consecutiveLowCount) + "/3)");
 
-            if (autoRecoveryEnabled) {
-                simplePrintln("AUTO-RECOVERY: Restarting I2S...");
+            if (consecutiveLowCount >= 3 && autoRecoveryEnabled) {
+                simplePrintln("AUTO-RECOVERY: 3 consecutive failures, restarting I2S...");
+                consecutiveLowCount = 0;
                 restartI2S();
                 audioPacketsSent = 0;
                 lastStatsReset = millis();
                 lastI2SReset = millis();
             }
+        } else {
+            consecutiveLowCount = 0;
         }
     }
 }
@@ -517,7 +526,7 @@ void scheduleReboot(bool factoryReset, uint32_t delayMs) {
 uint32_t computeRecommendedMinRate() {
     uint32_t buf = max((uint16_t)1, currentBufferSize);
     float expectedPktPerSec = (float)currentSampleRate / (float)buf;
-    uint32_t rec = (uint32_t)(expectedPktPerSec * 0.7f + 0.5f); // 70% safety margin
+    uint32_t rec = (uint32_t)(expectedPktPerSec * 0.5f + 0.5f); // 50% safety margin
     if (rec < 5) rec = 5;
     return rec;
 }
@@ -601,13 +610,34 @@ void restartI2S() {
 }
 
 // Minimal print helpers: Serial + buffered for Web UI
+// Timestamp prefix for log messages (NTP time if available, uptime fallback)
+static String logTimestamp() {
+    time_t now;
+    time(&now);
+    if (now > 100000) {
+        struct tm ti;
+        localtime_r(&now, &ti);
+        char buf[24];
+        strftime(buf, sizeof(buf), "[%H:%M:%S] ", &ti);
+        return String(buf);
+    }
+    // Fallback: uptime
+    unsigned long s = (millis() - bootTime) / 1000;
+    unsigned long h = s / 3600; s %= 3600;
+    unsigned long m = s / 60; s %= 60;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "[%02lu:%02lu:%02lu] ", h, m, s);
+    return String(buf);
+}
+
 void simplePrint(String message) {
-    Serial.print(message);
+    Serial.print(logTimestamp() + message);
 }
 
 void simplePrintln(String message) {
-    Serial.println(message);
-    webui_pushLog(message);
+    String stamped = logTimestamp() + message;
+    Serial.println(stamped);
+    webui_pushLog(stamped);
 }
 
 // ================== CORE 1: FULL AUDIO PIPELINE ==================
@@ -1136,6 +1166,24 @@ void setup() {
     }
 
     simplePrintln("WiFi connected: " + WiFi.localIP().toString());
+
+    // NTP time sync (EST = UTC-5, no DST)
+    configTime(-5 * 3600, 0, "pool.ntp.org");
+    Serial.print("Waiting for NTP time sync...");
+    time_t now = 0;
+    for (int i = 0; i < 20 && now < 100000; i++) {
+        delay(250);
+        time(&now);
+    }
+    if (now > 100000) {
+        struct tm ti;
+        localtime_r(&now, &ti);
+        char buf[32];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
+        Serial.printf(" OK: %s EST\n", buf);
+    } else {
+        Serial.println(" failed (will use uptime)");
+    }
 
     // Apply configured WiFi TX power after connect (logs once on change)
     applyWifiTxPower(true);

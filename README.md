@@ -61,9 +61,11 @@ LED behavior depends on the configurable LED Mode (Off / Static / Level):
 - **mDNS Discovery**: Access via `rtsp://atomecho.local:8554/audio` — no IP needed
 - **Web Interface**: Full-featured web UI for configuration and monitoring
 - **PDM Support**: Native support for PDM MEMS microphones
-- **Auto Recovery**: Automatic recovery from network/streaming issues
+- **Auto Recovery**: Automatic recovery from sustained streaming issues (3 consecutive failures required, 2-min cooldown)
 - **Persistent Settings**: Configuration saved to flash memory
 - **Dual-Core**: Audio pipeline on Core 1, everything else on Core 0
+- **NTP Time Sync**: Real timestamps in logs (EST, synced at boot via pool.ntp.org)
+- **Configurable LED**: Off / Static / Level indicator modes via Web UI
 
 ### Audio Processing
 - **Automatic Gain Control (AGC)**: Auto-adjusts volume for varying distances — ideal for outdoor bird recording. Fast attack prevents clipping, slow release boosts quiet signals.
@@ -77,9 +79,11 @@ LED behavior depends on the configurable LED Mode (Off / Static / Level):
 - **WiFi Power Control**: Adjustable TX power to reduce RF noise
 - **Buffer Profiles**: Multiple latency/stability profiles (256 to 8192 samples)
 - **Thermal Protection**: Automatic shutdown on overheating (configurable 30-95C)
+- **Smart Auto Recovery**: Requires 3 consecutive low-rate checks before restarting, with 2-minute cooldown to prevent restart loops
 - **RTSP Idle Timeout**: Auto-disconnects clients that connect but never stream (60s)
 - **Scheduled Resets**: Optional periodic reboots for long-term stability
 - **Heap Monitoring**: Periodic heap logging for detecting leaks in long deployments
+- **Timestamped Logs**: NTP-synced timestamps (EST) on all log messages for easier debugging
 
 ## Getting Started
 
@@ -102,7 +106,7 @@ On first boot, the device creates a WiFi access point:
 - Device will reboot and connect to your network
 
 #### Finding Your Device
-The LED turns **green** when ready. Check Serial Monitor (115200 baud) for:
+The LED turns **blue** when ready. Check Serial Monitor (115200 baud) for:
 ```
 WiFi connected: 192.168.1.XXX
 mDNS: atomecho.local
@@ -238,6 +242,13 @@ lib_deps =
 - `CLAUDE.md` — Detailed development notes and architecture docs
 
 ## Version History
+
+### v2.2.0
+- Added **NTP time sync** — real timestamps (EST) in all log messages
+- Added **configurable LED mode** — Off / Static / Level via Web UI
+- Changed LED colors: **blue** = ready, **green** = streaming, level mode uses green/orange/red
+- Fixed **auto-recovery restart loop** — now requires 3 consecutive failures with 2-minute cooldown
+- Lowered auto-recovery threshold from 70% to 50% of expected packet rate
 
 ### v2.1.0
 - Removed mutex — replaced with lock-free pointer handoff between cores
