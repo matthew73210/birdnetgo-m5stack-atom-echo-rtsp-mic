@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <WiFiManager.h>
 #include <ESPmDNS.h>
 #include "driver/i2s.h"
@@ -1180,9 +1181,8 @@ void setup() {
     // Note: Audio buffers now allocated by Core 1 task (not in main)
     Serial.println("Audio buffers will be allocated by Core 1 pipeline task");
 
-    // WiFi optimization for stable streaming
+    // WiFi connection via WiFiManager
     Serial.println("Initializing WiFi...");
-    WiFi.setSleep(false);
 
     WiFiManager wm;
     wm.setConnectTimeout(60);
@@ -1191,6 +1191,10 @@ void setup() {
         simplePrintln("WiFi failed, restarting...");
         ESP.restart();
     }
+
+    // Disable WiFi power saving AFTER connection (must be after autoConnect)
+    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);
 
     simplePrintln("WiFi connected: " + WiFi.localIP().toString());
 
