@@ -640,6 +640,22 @@ void simplePrintln(String message) {
     webui_pushLog(stamped);
 }
 
+// Drain any pending data from RTSP client receive buffer
+// Called on connect/disconnect events only — prevents stale data buildup
+void drainRtspReceiveBuffer(WiFiClient &client) {
+    if (!client || !client.connected()) return;
+    int drained = 0;
+    while (client.available() > 0 && drained < 4096) {
+        uint8_t buf[256];
+        int n = client.read(buf, sizeof(buf));
+        if (n <= 0) break;
+        drained += n;
+    }
+    if (drained > 0) {
+        simplePrintln("Drained " + String(drained) + " bytes from RTSP receive buffer");
+    }
+}
+
 // ================== CORE 1: FULL AUDIO PIPELINE ==================
 // I2S capture → process (HPF, gain, AGC) → RTP → WiFi
 // Uses streamClient pointer (set by Core 0 on PLAY, cleared here on failure)
@@ -1313,26 +1329,11 @@ void loop() {
 
     // RTSP client management (Core 0) — clear phase separation, no mutex
     if (rtspServerEnabled) {
-        // Phase: drain receive buffer during streaming (Core 0 only reads, no writes)
-        // ffmpeg sends GET_PARAMETER keepalives every ~30s; we must drain them
-        // to prevent TCP receive buffer from filling and closing the window
-        if (isStreaming && rtspClient && rtspClient.connected()) {
-            int avail = rtspClient.available();
-            if (avail > 0) {
-                // Read and discard — no response needed (ffmpeg fire-and-forget)
-                uint8_t discard[128];
-                while (avail > 0) {
-                    int toRead = (avail > (int)sizeof(discard)) ? (int)sizeof(discard) : avail;
-                    rtspClient.read(discard, toRead);
-                    avail -= toRead;
-                }
-            }
-        }
-
         // Phase: detect disconnect (Core 1 cleared streamClient)
         if (isStreaming && streamClient == NULL) {
             // Core 1 detected write failure — task stays alive for fast reconnect
             isStreaming = false;
+            drainRtspReceiveBuffer(rtspClient);
             rtspClient.stop();
             if (ledMode > 0) M5.dis.drawpix(0, CRGB(0, 0, 128));
             else M5.dis.drawpix(0, CRGB(0, 0, 0));
@@ -1348,6 +1349,7 @@ void loop() {
                 if (newClient) {
                     rtspClient = newClient;
                     rtspClient.setNoDelay(true);
+                    drainRtspReceiveBuffer(rtspClient);
                     rtspParseBufferPos = 0;
                     lastRTSPActivity = millis();
                     lastRtspClientConnectMs = millis();

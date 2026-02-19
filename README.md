@@ -246,7 +246,7 @@ lib_deps =
 ## Version History
 
 ### v2.2.0
-- Added **RTSP receive buffer drain** — Core 0 drains incoming keepalive requests during streaming, preventing TCP window from closing and causing disconnects
+- Added **RTSP receive buffer drain** — drains stale data on connect/disconnect events, keeping the TCP window clean
 - Added **large RTSP session timeout** (86400s) — reduces ffmpeg keepalive frequency from every 30s to every ~12 hours
 - Added **write failure tolerance** — 30 consecutive failures (~2s) before disconnecting, survives brief WiFi hiccups
 - Fixed **auto-recovery restart loop** — requires 3 consecutive failures with 2-minute cooldown
