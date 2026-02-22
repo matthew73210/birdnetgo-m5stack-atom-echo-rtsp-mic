@@ -1,5 +1,4 @@
 #include <WiFi.h>
-#include <esp_wifi.h>
 #include <WiFiManager.h>
 #include <ESPmDNS.h>
 #include "driver/i2s.h"
@@ -124,7 +123,7 @@ unsigned long lastTempCheck = 0;
 uint32_t minFreeHeap = 0xFFFFFFFF;
 uint32_t maxPacketRate = 0;
 uint32_t minPacketRate = 0xFFFFFFFF;
-bool autoRecoveryEnabled = true;
+bool autoRecoveryEnabled = false;
 bool autoThresholdEnabled = true; // auto compute minAcceptableRate from sample rate and buffer size
 // Deferred reboot scheduling (to restart safely outside HTTP context)
 volatile bool scheduledFactoryReset = false;
@@ -442,7 +441,7 @@ void loadAudioSettings() {
     currentBufferSize = audioPrefs.getUShort("bufferSize", DEFAULT_BUFFER_SIZE);
     // i2sShiftBits is ALWAYS 0 for PDM microphones - not configurable
     i2sShiftBits = 0;
-    autoRecoveryEnabled = audioPrefs.getBool("autoRecovery", true);
+    autoRecoveryEnabled = audioPrefs.getBool("autoRecovery", false);
     scheduledResetEnabled = audioPrefs.getBool("schedReset", false);
     resetIntervalHours = audioPrefs.getUInt("resetHours", 24);
     minAcceptableRate = audioPrefs.getUInt("minRate", 50);
@@ -547,7 +546,7 @@ void resetToDefaultSettings() {
     currentBufferSize = DEFAULT_BUFFER_SIZE;
     i2sShiftBits = 0;  // Default for PDM microphone on M5Stack Atom Echo
 
-    autoRecoveryEnabled = true;
+    autoRecoveryEnabled = false;
     autoThresholdEnabled = true;
     scheduledResetEnabled = false;
     resetIntervalHours = 24;
@@ -1181,8 +1180,9 @@ void setup() {
     // Note: Audio buffers now allocated by Core 1 task (not in main)
     Serial.println("Audio buffers will be allocated by Core 1 pipeline task");
 
-    // WiFi connection via WiFiManager
+    // WiFi optimization for stable streaming
     Serial.println("Initializing WiFi...");
+    WiFi.setSleep(false);
 
     WiFiManager wm;
     wm.setConnectTimeout(60);
@@ -1191,10 +1191,6 @@ void setup() {
         simplePrintln("WiFi failed, restarting...");
         ESP.restart();
     }
-
-    // Disable WiFi power saving AFTER connection (must be after autoConnect)
-    WiFi.setSleep(false);
-    esp_wifi_set_ps(WIFI_PS_NONE);
 
     simplePrintln("WiFi connected: " + WiFi.localIP().toString());
 
