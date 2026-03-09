@@ -12,22 +12,23 @@ A high-quality RTSP audio streaming server for ESP32, specifically configured fo
 - **LED**: RGB LED (built-in, WS2812C)
 
 ### Technical Specifications
-- **Processor**: ESP32-PICO-D4 @ 240MHz Dual Core (configurable 80-240MHz)
+- **Processor**: ESP32-PICO-D4 @ 160MHz Dual Core (configurable 80-240MHz, default 160MHz)
 - **WiFi**: 2.4GHz 802.11 b/g/n
 - **Audio Format**: 16-bit PCM, 16kHz default (configurable 8-48kHz)
 - **Streaming**: RTSP over TCP/IP on port 8554
 
 ## Architecture
 
-### Dual-Core Design (v2.1.0)
-- **Core 1**: Complete audio pipeline (I2S capture → HPF → AGC → gain → RTP → WiFi)
+### Dual-Core Design with Socket Ownership (v2.3.0)
+- **Core 1**: Complete audio pipeline (I2S capture → HPF → AGC → gain → RTP → WiFi) + RTSP keepalive/TEARDOWN processing
 - **Core 0**: Web UI, RTSP negotiation, diagnostics, client management
 
-Cores communicate via a simple pointer handoff — no mutex, no contention:
+Core 1 **exclusively owns** the WiFiClient socket during streaming — Core 0 never touches the socket while streaming is active:
 1. Core 0 handles RTSP negotiation (OPTIONS → DESCRIBE → SETUP → PLAY)
-2. On PLAY, Core 0 sets `streamClient` pointer and `isStreaming` flag
-3. Core 1 reads audio, processes, and sends RTP packets via the pointer
-4. On disconnect, Core 1 clears the pointer; Core 0 detects and cleans up
+2. On PLAY, Core 0 hands off the socket to Core 1 via `streamClient` pointer with memory barrier
+3. Core 1 reads audio, processes, sends RTP packets, and handles RTSP keepalives/TEARDOWN
+4. On disconnect, Core 1 closes the socket itself; Core 0 detects the transition and updates LED/logs
+5. When Core 0 needs to stop streaming (TEARDOWN, overheat, WiFi loss), it signals via `requestStreamStop()` and waits for Core 1 to confirm cleanup
 
 ## Pin Configuration
 
@@ -79,7 +80,11 @@ LED behavior depends on the configurable LED Mode (Off / Static / Level):
 - **WiFi Power Control**: Adjustable TX power to reduce RF noise
 - **Buffer Profiles**: Multiple latency/stability profiles (256 to 8192 samples)
 - **Thermal Protection**: Automatic shutdown on overheating (configurable 30-95C)
-- **Connection Resilience**: Write failure tolerance (30 consecutive failures before disconnect), receive buffer drain for keepalives, large session timeout — long-lived stable streams
+- **Connection Resilience**: Write failure tolerance (100 consecutive failures before disconnect), large session timeout — long-lived stable streams
+- **Socket Ownership Model**: Core 1 exclusively owns the WiFiClient during streaming — eliminates cross-core socket races
+- **Confirmed Task Exit**: Semaphore-based task shutdown prevents double-task creation and I2S peripheral races
+- **In-Stream RTSP Processing**: Core 1 handles TEARDOWN and GET_PARAMETER keepalives during streaming — prevents TCP receive buffer saturation
+- **Proactive WiFi Disconnect Handling**: Stops streaming before WiFi reconnect — no wasted RTP into a dead radio
 - **Smart Auto Recovery**: Requires 3 consecutive low-rate checks before restarting, with 2-minute cooldown to prevent restart loops
 - **RTSP Idle Timeout**: Auto-disconnects clients that connect but never stream (60s)
 - **Disconnect Diagnostics**: Logs session duration, dropped packets, and WiFi RSSI on every disconnect
@@ -244,6 +249,18 @@ lib_deps =
 - `CLAUDE.md` — Detailed development notes and architecture docs
 
 ## Version History
+
+### v2.3.0
+- **Socket ownership model** — Core 1 exclusively owns the WiFiClient during streaming; Core 0 uses `requestStreamStop()` with confirmed handshake to stop streams safely
+- **Confirmed task exit** — `stopAudioCaptureTask()` uses a FreeRTOS semaphore (2s timeout) instead of blind delay, preventing double-task creation and I2S peripheral races
+- **In-stream RTSP processing** — Core 1 handles TEARDOWN and GET_PARAMETER keepalives during streaming, preventing TCP receive buffer saturation
+- **LED ownership guards** — `core1OwnsLED` flag prevents concurrent FastLED/RMT driver access across cores
+- **Log buffer spinlock** — `webui_pushLog()` protected with `portMUX_TYPE` spinlock for safe cross-core logging
+- **Proactive WiFi disconnect handling** — stops streaming and audio task before WiFi reconnect
+- **Memory barriers** — Xtensa `memw` instructions on critical flag transitions between cores
+- **Default CPU frequency lowered to 160MHz** — sufficient for this workload, reduces heat
+- **Copy logs button** — clipboard icon in the Web UI log panel for easy log sharing
+- All Core 0 stop paths (TEARDOWN, overheat, I2S restart, server stop, WiFi disconnect) use `requestStreamStop()` for safe cross-core shutdown
 
 ### v2.2.0
 - Added **RTSP receive buffer drain** — drains stale keepalive data on disconnect, keeping the TCP window clean

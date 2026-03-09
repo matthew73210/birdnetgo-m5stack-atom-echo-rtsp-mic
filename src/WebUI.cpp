@@ -99,10 +99,14 @@ static String logBuffer[LOG_CAP];
 static size_t logHead = 0;
 static size_t logCount = 0;
 
+extern portMUX_TYPE logMux;
+
 void webui_pushLog(const String &line) {
+    portENTER_CRITICAL(&logMux);
     logBuffer[logHead] = line;
     logHead = (logHead + 1) % LOG_CAP;
     if (logCount < LOG_CAP) logCount++;
+    portEXIT_CRITICAL(&logMux);
 }
 
 static String jsonEscape(const String &s) {
@@ -250,7 +254,7 @@ static String htmlIndex() {
         "</table></div>"
         "</div>"
 
-        "<div class='card'><h2 id='t_logs'>Logs</h2><pre id='logs' class='mono'></pre></div>"
+        "<div class='card'><div style='display:flex;justify-content:space-between;align-items:center'><h2 id='t_logs'>Logs</h2><button id='btn_copy_logs' onclick='copyLogs()' title='Copy logs' style='background:none;border:1px solid var(--border);padding:4px 8px;cursor:pointer;border-radius:8px;line-height:1'><svg width='16' height='16' viewBox='0 0 16 16' fill='none' stroke='currentColor' stroke-width='1.5'><rect x='5.5' y='5.5' width='8' height='8' rx='1.5'/><path d='M10.5 5.5V3a1.5 1.5 0 00-1.5-1.5H3A1.5 1.5 0 001.5 3v6A1.5 1.5 0 003 10.5h2.5'/></svg></button></div><pre id='logs' class='mono'></pre></div>"
 
         "</div>"
         "</div>"
@@ -265,6 +269,7 @@ static String htmlIndex() {
         "function fmtBool(b){return b?'<span class=ok>YES</span>':'<span class=bad>NO</span>'}"
         "function fmtSrv(b){return b?'<span class=ok>ENABLED</span>':'<span class=bad>DISABLED</span>'}"
         "function showOverlay(msg){ $('ovr_msg').textContent=msg; $('ovr').style.display='flex'; }"
+        "function copyLogs(){const t=$('logs').textContent;const b=$('btn_copy_logs');const orig=b.innerHTML;const ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');b.innerHTML='<svg width=16 height=16 viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"var(--acc2)\" stroke-width=\"1.5\"><path d=\"M3 9l3 3 7-7\"/></svg>';setTimeout(()=>{b.innerHTML=orig},1500)}catch(e){}document.body.removeChild(ta)}"
         "function rebootSequence(kind){ const L=T[lang]; const msg=(kind==='factory_reset')?L.resetting:L.restarting; showOverlay(msg); function tick(){ fetch('/api/status',{cache:'no-store'}).then(r=>{ if(r.ok){ location.reload(); } else { setTimeout(tick,2000); } }).catch(()=>setTimeout(tick,2000)); } setTimeout(tick,4000); }"
         "function act(a){fetch('/api/action/'+a,{cache:'no-store'}).then(r=>r.json()).then(loadAll)}"
         "function rebootNow(){ rebootSequence('reboot'); act('reboot'); }"
@@ -435,8 +440,13 @@ static void httpActionServerStart(){
     apiSendJSON(F("{\"ok\":true}"));
 }
 extern WiFiClient* volatile streamClient;
+extern bool requestStreamStop(const char* reason);
 static void httpActionServerStop(){
-    isStreaming=false; streamClient=NULL; rtspServerEnabled=false; if (rtspClient && rtspClient.connected()) rtspClient.stop(); rtspServer.stop();
+    if (isStreaming) {
+        requestStreamStop("server_stop");
+    }
+    rtspServerEnabled=false;
+    rtspServer.stop();
     webui_pushLog(F("UI action: server_stop"));
     apiSendJSON(F("{\"ok\":true}"));
 }

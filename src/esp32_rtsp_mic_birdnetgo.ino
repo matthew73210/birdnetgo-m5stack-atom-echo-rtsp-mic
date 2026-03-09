@@ -17,8 +17,15 @@ WiFiClient* volatile streamClient = NULL;
 TaskHandle_t audioCaptureTaskHandle = NULL;
 volatile bool audioTaskRunning = false;
 
+// Cross-core synchronization primitives
+portMUX_TYPE logMux = portMUX_INITIALIZER_UNLOCKED;  // spinlock for log ring buffer
+volatile bool stopStreamRequested = false;   // Core 0 asks Core 1 to stop
+volatile bool streamCleanupDone = false;     // Core 1 confirms cleanup complete
+SemaphoreHandle_t taskExitSemaphore = NULL;  // confirmed task exit
+volatile bool core1OwnsLED = false;          // LED ownership flag
+
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "2.2.0"
+#define FW_VERSION "2.3.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 
@@ -150,7 +157,7 @@ uint32_t resetIntervalHours = 24; // Default 24 hours
 // -- Configurable thresholds
 uint32_t minAcceptableRate = 50;        // Minimum acceptable packet rate (restart below this)
 uint32_t performanceCheckInterval = 15; // Check interval in minutes
-uint8_t cpuFrequencyMhz = 240;          // CPU frequency (default 240 MHz for ESP32-PICO-D4)
+uint8_t cpuFrequencyMhz = 160;          // CPU frequency (default 160 MHz — sufficient for this workload)
 
 // -- WiFi TX power (configurable)
 float wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
@@ -341,13 +348,11 @@ void checkTemperature() {
         if (!overheatLockoutActive && temp >= overheatShutdownC) {
             overheatLockoutActive = true;
             recordOverheatTrip(temp);
-            // Signal Core 1 to stop, then disable streaming
-            isStreaming = false;
-            streamClient = NULL;
-            stopAudioCaptureTask();
-            if (rtspClient && rtspClient.connected()) {
-                rtspClient.stop();
+            // Request Core 1 to stop streaming safely
+            if (isStreaming) {
+                requestStreamStop("overheat");
             }
+            stopAudioCaptureTask();
             rtspServerEnabled = false;
             rtspServer.stop();
         } else if (overheatLockoutActive && temp <= (overheatShutdownC - OVERHEAT_LIMIT_STEP_C)) {
@@ -408,6 +413,11 @@ void checkPerformance() {
 // WiFi health check
 void checkWiFiHealth() {
     if (WiFi.status() != WL_CONNECTED) {
+        // Stop streaming before reconnecting — no point sending RTP into a dead radio
+        if (isStreaming) {
+            requestStreamStop("WiFi disconnect");
+            stopAudioCaptureTask();
+        }
         simplePrintln("WiFi disconnected! Reconnecting...");
         WiFi.reconnect();
     }
@@ -447,7 +457,7 @@ void loadAudioSettings() {
     minAcceptableRate = audioPrefs.getUInt("minRate", 50);
     performanceCheckInterval = audioPrefs.getUInt("checkInterval", 15);
     autoThresholdEnabled = audioPrefs.getBool("thrAuto", true);
-    cpuFrequencyMhz = audioPrefs.getUChar("cpuFreq", 240);
+    cpuFrequencyMhz = audioPrefs.getUChar("cpuFreq", 160);
     wifiTxPowerDbm = audioPrefs.getFloat("wifiTxDbm", DEFAULT_WIFI_TX_DBM);
     highpassEnabled = audioPrefs.getBool("hpEnable", DEFAULT_HPF_ENABLED);
     highpassCutoffHz = (uint16_t)audioPrefs.getUInt("hpCutoff", DEFAULT_HPF_CUTOFF_HZ);
@@ -552,7 +562,7 @@ void resetToDefaultSettings() {
     resetIntervalHours = 24;
     minAcceptableRate = computeRecommendedMinRate();
     performanceCheckInterval = 15;
-    cpuFrequencyMhz = 240;
+    cpuFrequencyMhz = 160;
     wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
     highpassEnabled = DEFAULT_HPF_ENABLED;
     highpassCutoffHz = DEFAULT_HPF_CUTOFF_HZ;
@@ -583,9 +593,10 @@ void restartI2S() {
     simplePrintln("Restarting I2S with new parameters...");
     bool wasStreaming = isStreaming;
 
-    // Signal Core 1 to stop before touching anything
-    isStreaming = false;
-    streamClient = NULL;
+    // Request Core 1 to stop streaming safely
+    if (isStreaming) {
+        requestStreamStop("I2S restart");
+    }
 
     // Stop audio pipeline task on Core 1
     stopAudioCaptureTask();
@@ -694,6 +705,24 @@ void audioCaptureTask(void* parameter) {
     unsigned long lastLedUpdate = 0;
 
     while (audioTaskRunning) {
+        // Check if Core 0 requested us to stop streaming
+        if (stopStreamRequested) {
+            WiFiClient* client = streamClient;
+            if (client) {
+                client->stop();
+            }
+            streamClient = NULL;
+            isStreaming = false;
+            core1OwnsLED = false;
+            streamCleanupDone = true;
+            __asm__ __volatile__("memw" ::: "memory");
+            // Wait for Core 0 to clear stopStreamRequested
+            while (stopStreamRequested && audioTaskRunning) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            continue;
+        }
+
         if (!isStreaming || !streamClient) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
@@ -835,12 +864,59 @@ void audioCaptureTask(void* parameter) {
         sendRTPPacket(*client, outputBuffer, samplesRead);
         packetCount++;
 
+        // Process incoming RTSP commands during streaming (~every 200ms)
+        // Keeps all socket I/O on Core 1 during streaming
+        static unsigned long lastRtspCheck = 0;
+        if (client && isStreaming && (millis() - lastRtspCheck > 200)) {
+            lastRtspCheck = millis();
+            if (client->available() > 0) {
+                char rtspBuf[512];
+                int avail = client->available();
+                if (avail > (int)sizeof(rtspBuf) - 1) avail = sizeof(rtspBuf) - 1;
+                int n = client->read((uint8_t*)rtspBuf, avail);
+                if (n > 0) {
+                    rtspBuf[n] = '\0';
+                    // Parse for RTSP commands
+                    if (strstr(rtspBuf, "TEARDOWN") != NULL) {
+                        // Extract CSeq
+                        const char* cseqStr = strstr(rtspBuf, "CSeq: ");
+                        int cseqVal = 1;
+                        if (cseqStr) cseqVal = atoi(cseqStr + 6);
+                        // Send response (Core 1 owns the socket)
+                        char resp[128];
+                        int rlen = snprintf(resp, sizeof(resp),
+                            "RTSP/1.0 200 OK\r\nCSeq: %d\r\n\r\n", cseqVal);
+                        client->write((uint8_t*)resp, rlen);
+                        // Close and clean up
+                        client->stop();
+                        streamClient = NULL;
+                        isStreaming = false;
+                        core1OwnsLED = false;
+                        Serial.println("[Core1] TEARDOWN received, stream stopped");
+                    } else if (strstr(rtspBuf, "GET_PARAMETER") != NULL) {
+                        const char* cseqStr = strstr(rtspBuf, "CSeq: ");
+                        int cseqVal = 1;
+                        if (cseqStr) cseqVal = atoi(cseqStr + 6);
+                        char resp[128];
+                        int rlen = snprintf(resp, sizeof(resp),
+                            "RTSP/1.0 200 OK\r\nCSeq: %d\r\n\r\n", cseqVal);
+                        client->write((uint8_t*)resp, rlen);
+                        lastRTSPActivity = millis();
+                    }
+                    // Other commands silently discarded
+                }
+            }
+        }
+
         taskYIELD();
     }
 
     free(captureBuffer);
     free(outputBuffer);
+    core1OwnsLED = false;
+    audioTaskRunning = false;
     Serial.println("[Core1] Audio pipeline task stopped");
+    xSemaphoreGive(taskExitSemaphore);
     vTaskDelete(NULL);
 }
 
@@ -866,13 +942,54 @@ void startAudioCaptureTask() {
     }
 }
 
-// Stop audio pipeline task
+// Stop audio pipeline task with confirmed exit via semaphore
 void stopAudioCaptureTask() {
     if (audioCaptureTaskHandle != NULL) {
         audioTaskRunning = false;
-        vTaskDelay(pdMS_TO_TICKS(100));  // Give task time to clean up
+        // Wait for task to confirm exit (up to 2s)
+        if (xSemaphoreTake(taskExitSemaphore, pdMS_TO_TICKS(2000)) != pdTRUE) {
+            Serial.println("[Core0] WARNING: Audio task did not exit within 2s");
+        }
         audioCaptureTaskHandle = NULL;
-        // Task prints its own "stopped" message — don't duplicate here
+    }
+}
+
+// Request Core 1 to stop streaming and clean up the socket.
+// Core 0 must NOT touch the WiFiClient while Core 1 owns it.
+// Returns true if Core 1 confirmed cleanup, false on timeout.
+bool requestStreamStop(const char* reason) {
+    // Early return if not streaming
+    if (!isStreaming && streamClient == NULL) return true;
+
+    Serial.printf("[Core0] requestStreamStop: %s\n", reason);
+
+    // Signal Core 1 to stop
+    stopStreamRequested = true;
+    __asm__ __volatile__("memw" ::: "memory");  // Xtensa memory barrier
+
+    // Poll for Core 1 confirmation (up to 3s)
+    unsigned long deadline = millis() + 3000;
+    while (!streamCleanupDone && millis() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (streamCleanupDone) {
+        // Core 1 confirmed — safe to proceed
+        isStreaming = false;
+        streamClient = NULL;
+        stopStreamRequested = false;
+        streamCleanupDone = false;
+        Serial.printf("[Core0] Stream stopped cleanly: %s\n", reason);
+        return true;
+    } else {
+        // Timeout — force cleanup
+        Serial.printf("[Core0] WARNING: Stream stop timeout, forcing cleanup: %s\n", reason);
+        isStreaming = false;
+        streamClient = NULL;
+        stopStreamRequested = false;
+        streamCleanupDone = false;
+        core1OwnsLED = false;
+        return false;
     }
 }
 
@@ -945,8 +1062,11 @@ static const uint32_t MAX_WRITE_FAILURES = 100;  // Allow ~5s of failures before
 
 void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
     if (!client.connected()) {
-        // Client actually disconnected — no tolerance, signal Core 0 immediately
+        // Client disconnected — Core 1 owns the socket, close it
+        client.stop();
         streamClient = NULL;
+        isStreaming = false;
+        core1OwnsLED = false;
         return;
     }
 
@@ -996,10 +1116,13 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
         consecutiveWriteFailures++;
 
         if (consecutiveWriteFailures >= MAX_WRITE_FAILURES) {
-            // Sustained failure — connection is dead
+            // Sustained failure — Core 1 owns the socket, close it
             Serial.printf("[Core1] %u consecutive write failures, disconnecting\n", consecutiveWriteFailures);
             consecutiveWriteFailures = 0;
+            client.stop();
             streamClient = NULL;
+            isStreaming = false;
+            core1OwnsLED = false;
         }
     }
 }
@@ -1067,6 +1190,12 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         lastRtspPlayMs = millis();
         rtspPlayCount++;
 
+        // Initialize stream stop flags before handing off
+        stopStreamRequested = false;
+        streamCleanupDone = false;
+        core1OwnsLED = true;
+        __asm__ __volatile__("memw" ::: "memory");
+
         // Hand off client to Core 1 via pointer
         streamClient = &rtspClient;
         isStreaming = true;
@@ -1074,22 +1203,24 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         // Start audio capture task
         startAudioCaptureTask();
 
-        if (ledMode == 1) M5.dis.drawpix(0, CRGB(0, 128, 0));  // Green: streaming
-        else if (ledMode == 0) M5.dis.drawpix(0, CRGB(0, 0, 0));
-        // ledMode==2 handled by Core 1 audio level indicator
+        // Core 1 now owns LED during streaming
         simplePrintln("STREAMING STARTED");
 
     } else if (request.startsWith("TEARDOWN")) {
+        // Stop streaming FIRST — Core 1 owns the socket during streaming
+        if (isStreaming) {
+            requestStreamStop("TEARDOWN");
+        }
+
+        // Now Core 0 owns the socket again, safe to send response
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
         client.print("Session: " + rtspSessionId + "\r\n\r\n");
 
-        // Signal Core 1 to go idle (task stays alive for fast reconnect)
-        isStreaming = false;
-        streamClient = NULL;
-
-        if (ledMode > 0) M5.dis.drawpix(0, CRGB(0, 0, 128));
-        else M5.dis.drawpix(0, CRGB(0, 0, 0));
+        if (!core1OwnsLED) {
+            if (ledMode > 0) M5.dis.drawpix(0, CRGB(0, 0, 128));
+            else M5.dis.drawpix(0, CRGB(0, 0, 0));
+        }
         simplePrintln("STREAMING STOPPED");
     } else if (request.startsWith("GET_PARAMETER")) {
         // Many RTSP clients send GET_PARAMETER as keep-alive.
@@ -1152,6 +1283,9 @@ void setup() {
     delay(500);
     Serial.println("\n\n=== ESP32 RTSP Mic Starting ===");
     Serial.println("Board: M5Stack Atom Echo");
+
+    // Create task exit semaphore for confirmed Core 1 task shutdown
+    taskExitSemaphore = xSemaphoreCreateBinary();
 
     // Set LED to indicate startup
     M5.dis.drawpix(0, CRGB(128, 128, 0));  // Yellow for startup
@@ -1327,20 +1461,21 @@ void loop() {
         }
     }
 
-    // RTSP client management (Core 0) — clear phase separation, no mutex
+    // RTSP client management (Core 0) — clear phase separation
+    static bool wasStreaming = false;
     if (rtspServerEnabled) {
-        // Phase: detect disconnect (Core 1 cleared streamClient)
-        if (isStreaming && streamClient == NULL) {
-            // Core 1 detected write failure — task stays alive for fast reconnect
-            isStreaming = false;
-            drainRtspReceiveBuffer(rtspClient);
-            rtspClient.stop();
-            if (ledMode > 0) M5.dis.drawpix(0, CRGB(0, 0, 128));
-            else M5.dis.drawpix(0, CRGB(0, 0, 0));
+        // Phase: detect disconnect (Core 1 cleared isStreaming after self-disconnect)
+        if (wasStreaming && !isStreaming) {
+            // Core 1 already closed the socket — just update LED and log
+            if (!core1OwnsLED) {
+                if (ledMode > 0) M5.dis.drawpix(0, CRGB(0, 0, 128));
+                else M5.dis.drawpix(0, CRGB(0, 0, 0));
+            }
             unsigned long sessionSec = (millis() - lastRtspPlayMs) / 1000;
             simplePrintln("RTSP client disconnected (session: " + String(sessionSec) + "s, dropped: " +
                          String(audioPacketsDropped) + ", RSSI: " + String(WiFi.RSSI()) + " dBm)");
         }
+        wasStreaming = isStreaming;
 
         // Phase: accept new client (only when not streaming)
         if (!isStreaming) {
@@ -1365,18 +1500,16 @@ void loop() {
     } else {
         // RTSP server disabled (overheat lockout)
         if (isStreaming) {
-            isStreaming = false;
-            streamClient = NULL;
+            requestStreamStop("server disabled");
             stopAudioCaptureTask();
         }
-        if (rtspClient) {
-            rtspClient.stop();
-        }
-        if (overheatLatched) {
-            M5.dis.drawpix(0, CRGB(128, 0, 0));
-        } else {
-            if (ledMode > 0) M5.dis.drawpix(0, CRGB(0, 0, 128));
-            else M5.dis.drawpix(0, CRGB(0, 0, 0));
+        if (!core1OwnsLED) {
+            if (overheatLatched) {
+                M5.dis.drawpix(0, CRGB(128, 0, 0));
+            } else {
+                if (ledMode > 0) M5.dis.drawpix(0, CRGB(0, 0, 128));
+                else M5.dis.drawpix(0, CRGB(0, 0, 0));
+            }
         }
     }
     // Handle deferred reboot/reset safely here
