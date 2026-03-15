@@ -67,6 +67,11 @@ extern volatile uint16_t i2sLastRawZeroPct;
 extern volatile bool i2sLikelyUnsignedPcm;
 extern volatile uint8_t fftBins[32];
 extern volatile uint32_t fftFrameSeq;
+extern portMUX_TYPE webAudioMux;
+extern volatile uint32_t webAudioFrameSeq;
+extern volatile uint16_t webAudioFrameSamples;
+extern volatile uint32_t webAudioSampleRate;
+extern int16_t webAudioFrame[];
 
 // Local helper: snap requested Wi‑Fi TX power (dBm) to nearest supported step
 static float snapWifiTxDbm(float dbm) {
@@ -319,7 +324,6 @@ static String htmlIndex() {
 }
 
 static String htmlStreamer() {
-    String rtsp = String("rtsp://") + WiFi.localIP().toString() + ":8554/audio";
     String h;
     h += F(
         "<!doctype html><html><head><meta charset='utf-8'>"
@@ -327,20 +331,67 @@ static String htmlStreamer() {
         "<title>Web Streamer</title>"
         "<style>body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;background:#0b1020;color:#e7ebf2;margin:0;padding:16px}"
         ".card{max-width:980px;margin:0 auto;background:#121a2e;border:1px solid #1b2745;border-radius:12px;padding:14px}"
-        "a{color:#4ea1f3}.mono{font-family:ui-monospace,Consolas,Menlo,monospace}.muted{color:#9aa3b2}"
-        "iframe{width:100%;height:70vh;border:1px solid #1b2745;border-radius:10px;background:#050a14}</style>"
-        "</head><body><div class='card'><h2>Browser Web Streamer</h2>"
-        "<p class='muted'>Embedded browser player for the RTSP stream:</p><p><span class='mono'>");
-    h += rtsp;
-    h += F("</span></p><iframe id='player' allow='autoplay'></iframe>"
-           "<p class='muted'>If the embedded player cannot connect, copy the RTSP URL into VLC/ffplay.</p>"
-           "</div><script>const rtsp='" );
-    h += rtsp;
-    h += F("';document.getElementById('player').src='https://www.rtsp.me/embed?url='+encodeURIComponent(rtsp);</script></body></html>");
+        "button{font:inherit;padding:8px 12px;border-radius:10px;border:1px solid #1b2745;background:#0d1427;color:#e7ebf2;cursor:pointer}"
+        "button:hover{border-color:#4ea1f3} .mono{font-family:ui-monospace,Consolas,Menlo,monospace} .muted{color:#9aa3b2}"
+        ".meter{height:10px;border:1px solid #1b2745;border-radius:999px;background:#0a1224;overflow:hidden;margin:10px 0}"
+        ".fill{height:100%;width:0;background:linear-gradient(90deg,#22c55e,#16a34a)} .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}"
+        "</style></head><body><div class='card'><h2>Browser Web Streamer</h2>"
+        "<p class='muted'>This player uses the device's local PCM endpoint and plays it via WebAudio (no external iframe).</p>"
+        "<div class='row'><button id='start'>Start audio</button><button id='stop'>Stop</button><span id='st' class='muted'>Idle</span></div>"
+        "<div class='meter'><div id='m' class='fill'></div></div>"
+        "<p class='muted'>Fallback RTSP URL: <span id='rtsp' class='mono'></span></p>"
+        "<script>const rtsp='rtsp://'+location.hostname+':8554/audio';document.getElementById('rtsp').textContent=rtsp;"
+        "let ctx=null,running=false,lastSeq=0,nextT=0,timer=null;"
+        "function setStatus(t){document.getElementById('st').textContent=t;}"
+        "function setMeter(p){document.getElementById('m').style.width=Math.max(0,Math.min(100,p))+'%';}"
+        "function playFrame(rate,samples){if(!ctx)ctx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:rate});"
+        "const n=samples.length;if(!n)return;const b=ctx.createBuffer(1,n,rate);const d=b.getChannelData(0);let peak=0;"
+        "for(let i=0;i<n;i++){const v=Math.max(-1,Math.min(1,samples[i]/32768));d[i]=v;const a=Math.abs(v);if(a>peak)peak=a;}"
+        "if(nextT<ctx.currentTime+0.05)nextT=ctx.currentTime+0.05;const src=ctx.createBufferSource();src.buffer=b;src.connect(ctx.destination);src.start(nextT);nextT+=n/rate;setMeter(peak*100);}"
+        "async function pull(){if(!running)return;try{const r=await fetch('/api/web_audio?since='+lastSeq,{cache:'no-store'});"
+        "if(r.status===204){timer=setTimeout(pull,60);return;}const j=await r.json();if(!j||!j.samples){timer=setTimeout(pull,60);return;}"
+        "lastSeq=j.seq||lastSeq;playFrame(j.rate||16000,j.samples);setStatus('Playing • '+(j.rate||16000)+' Hz');timer=setTimeout(pull,20);}"
+        "catch(e){setStatus('Waiting for audio…');timer=setTimeout(pull,250);}}"
+        "document.getElementById('start').onclick=async()=>{running=true;if(!ctx)ctx=new (window.AudioContext||window.webkitAudioContext)();if(ctx.state==='suspended')await ctx.resume();setStatus('Starting…');pull();};"
+        "document.getElementById('stop').onclick=()=>{running=false;if(timer)clearTimeout(timer);timer=null;setStatus('Stopped');setMeter(0);};"
+        "</script></div></body></html>");
     return h;
 }
 
 static void httpStreamer() { web.send(200, "text/html; charset=utf-8", htmlStreamer()); }
+
+static void httpWebAudio() {
+    uint32_t since = 0;
+    if (web.hasArg("since")) since = (uint32_t)web.arg("since").toInt();
+
+    static int16_t localFrame[2048];
+    uint32_t seq = 0;
+    uint16_t samples = 0;
+    uint32_t rate = 16000;
+
+    portENTER_CRITICAL(&webAudioMux);
+    seq = webAudioFrameSeq;
+    samples = webAudioFrameSamples;
+    rate = webAudioSampleRate;
+    if (samples > 2048) samples = 2048;
+    memcpy(localFrame, webAudioFrame, samples * sizeof(int16_t));
+    portEXIT_CRITICAL(&webAudioMux);
+
+    if (samples == 0 || seq == since) {
+        web.send(204, "text/plain", "");
+        return;
+    }
+
+    String json;
+    json.reserve(64 + (samples * 8));
+    json += "{\"seq\":" + String(seq) + ",\"rate\":" + String(rate) + ",\"samples\":[";
+    for (uint16_t i = 0; i < samples; i++) {
+        if (i) json += ',';
+        json += String(localFrame[i]);
+    }
+    json += "]}";
+    apiSendJSON(json);
+}
 
 // HTTP handlery
 static void httpIndex() { web.send(200, "text/html; charset=utf-8", htmlIndex()); }
@@ -564,6 +615,7 @@ static void httpSet() {
 void webui_begin() {
     web.on("/", httpIndex);
     web.on("/streamer", httpStreamer);
+    web.on("/api/web_audio", httpWebAudio);
     web.on("/api/status", httpStatus);
     web.on("/api/audio_status", httpAudioStatus);
     web.on("/api/fft", httpFft);
