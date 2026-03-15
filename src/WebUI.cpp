@@ -55,6 +55,15 @@ extern bool overheatLatched;
 extern bool agcEnabled;
 extern volatile float agcMultiplier;
 extern uint8_t ledMode;
+extern volatile uint32_t i2sReadOkCount;
+extern volatile uint32_t i2sReadErrCount;
+extern volatile uint32_t i2sReadZeroCount;
+extern volatile uint16_t i2sLastSamplesRead;
+extern volatile int16_t i2sLastRawMin;
+extern volatile int16_t i2sLastRawMax;
+extern volatile uint16_t i2sLastRawPeakAbs;
+extern volatile uint16_t i2sLastRawRms;
+extern volatile uint16_t i2sLastRawZeroPct;
 
 // Local helper: snap requested Wi‑Fi TX power (dBm) to nearest supported step
 static float snapWifiTxDbm(float dbm) {
@@ -311,6 +320,9 @@ static void httpStatus() {
     String json = "{";
     json += "\"fw_version\":\"" + String(FW_VERSION_STR) + "\",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+    json += "\"gateway\":\"" + WiFi.gatewayIP().toString() + "\",";
+    json += "\"subnet\":\"" + WiFi.subnetMask().toString() + "\",";
+    json += "\"wifi_connected\":" + String(WiFi.status()==WL_CONNECTED?"true":"false") + ",";
     json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
     json += "\"wifi_tx_dbm\":" + String(wifiPowerLevelToDbm(currentWifiPowerLevel),1) + ",";
     json += "\"free_heap_kb\":" + String(ESP.getFreeHeap()/1024) + ",";
@@ -350,7 +362,19 @@ static void httpAudioStatus() {
     json += "\"peak_dbfs\":" + String(peak_dbfs,1) + ",";
     json += "\"clip\":" + String(audioClippedLastBlock?"true":"false") + ",";
     json += "\"clip_count\":" + String(audioClipCount) + ",";
-    json += "\"led_mode\":" + String(ledMode);
+    json += "\"led_mode\":" + String(ledMode) + ",";
+    json += "\"i2s_reads_ok\":" + String(i2sReadOkCount) + ",";
+    json += "\"i2s_reads_err\":" + String(i2sReadErrCount) + ",";
+    json += "\"i2s_reads_zero\":" + String(i2sReadZeroCount) + ",";
+    json += "\"i2s_last_samples\":" + String(i2sLastSamplesRead) + ",";
+    json += "\"i2s_raw_min\":" + String(i2sLastRawMin) + ",";
+    json += "\"i2s_raw_max\":" + String(i2sLastRawMax) + ",";
+    json += "\"i2s_raw_peak\":" + String(i2sLastRawPeakAbs) + ",";
+    json += "\"i2s_raw_rms\":" + String(i2sLastRawRms) + ",";
+    json += "\"i2s_raw_zero_pct\":" + String(i2sLastRawZeroPct) + ",";
+    bool likelyFlatline = (i2sLastRawPeakAbs < 8) || ((i2sLastRawMin == i2sLastRawMax) && i2sLastSamplesRead > 0) || (i2sLastRawZeroPct > 98);
+    json += "\"i2s_link_ok\":" + String(likelyFlatline?"false":"true") + ",";
+    json += "\"i2s_hint\":\"" + jsonEscape(likelyFlatline ? "Mic data looks flat/near-zero. Check CLK/DATA wiring, GND, and 3V3. For Unit PDM use CLK=G1 and DATA=G2." : "Raw mic signal is changing; I2S link appears active.") + "\"";
     json += "}";
     apiSendJSON(json);
 }

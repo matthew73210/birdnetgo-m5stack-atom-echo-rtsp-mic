@@ -63,6 +63,25 @@ ffplay -rtsp_transport tcp rtsp://atoms3mic.local:8554/audio
 | Orange | Signal hot, >70% (level mode) |
 | Red | Clipping or thermal protection |
 
+## Mic Link Diagnostic (no audio case)
+
+If the stream is silent, you can verify whether the ESP32 is actually receiving changing samples from the PDM mic. These counters are updated continuously after boot (you do not need an active RTSP PLAY session).
+
+```bash
+curl -s http://atoms3mic.local/api/audio_status
+```
+
+Check these fields in the JSON:
+- `i2s_reads_ok`: should increase steadily; if it stays `0`, firmware is not capturing samples yet (or running an older build).
+- `i2s_link_ok`: `true` means raw samples are changing.
+- `i2s_raw_peak` / `i2s_raw_rms`: should be above near-zero when speaking near the mic.
+- `i2s_raw_min` and `i2s_raw_max`: should not be identical for long.
+- `i2s_raw_zero_pct`: very high values (e.g. ~100%) suggest no real data.
+- `i2s_hint`: quick wiring hint if signal looks flat.
+- If VLC shows `No route to host`, this is a network path issue (not microphone capture): verify your computer is on the same subnet as the device IP, disable client/AP isolation on the Wi‑Fi, and confirm `rtsp://<device-ip>:8554/audio` is reachable from the same VLAN.
+
+For Unit PDM wiring use **CLK=G1** and **DATA=G2**, plus GND and 3V3.
+
 ## Building
 
 ```bash

@@ -45,9 +45,10 @@ const char* FW_VERSION_STR = FW_VERSION;
 #define OVERHEAT_MAX_LIMIT_C 95
 #define OVERHEAT_LIMIT_STEP_C 5
 
-// -- Pins (AtomS3 Lite + Unit Mini PDM)
-#define I2S_CLK_PIN      1  // Unit Mini PDM CLK
-#define I2S_DATA_IN_PIN  2  // Unit Mini PDM DAT
+// -- Pins (M5 Atom Echo / Unit PDM)
+// M5's reference wiring for the PDM Unit is: CLK=G1, DATA=G2.
+#define I2S_CLK_PIN      1  // PDM CLK (G1)
+#define I2S_DATA_IN_PIN  2  // PDM DATA (G2)
 #define WS2812_LED_PIN  35  // AtomS3 Lite built-in RGB LED
 
 static CRGB statusLed[1];
@@ -95,6 +96,17 @@ uint32_t audioClipCount = 0;      // total blocks where clipping occurred
 bool audioClippedLastBlock = false; // clipping occurred in last processed block
 uint16_t peakHoldAbs16 = 0;       // peak hold (recent window)
 unsigned long peakHoldUntilMs = 0; // when to clear hold
+
+// -- I2S raw capture diagnostics (helps verify PDM communication/wiring)
+volatile uint32_t i2sReadOkCount = 0;
+volatile uint32_t i2sReadErrCount = 0;
+volatile uint32_t i2sReadZeroCount = 0;
+volatile uint16_t i2sLastSamplesRead = 0;
+volatile int16_t i2sLastRawMin = 0;
+volatile int16_t i2sLastRawMax = 0;
+volatile uint16_t i2sLastRawPeakAbs = 0;
+volatile uint16_t i2sLastRawRms = 0;
+volatile uint16_t i2sLastRawZeroPct = 0;
 
 // -- LED mode: 0=off, 1=static, 2=level
 uint8_t ledMode = 1;  // Default: static purple during streaming
@@ -418,7 +430,11 @@ void checkPerformance() {
 
 // WiFi health check
 void checkWiFiHealth() {
-    if (WiFi.status() != WL_CONNECTED) {
+    static bool prevConnected = false;
+    static IPAddress prevIp(0, 0, 0, 0);
+
+    bool connected = (WiFi.status() == WL_CONNECTED);
+    if (!connected) {
         // Stop streaming before reconnecting — no point sending RTP into a dead radio
         if (isStreaming) {
             requestStreamStop("WiFi disconnect");
@@ -426,14 +442,32 @@ void checkWiFiHealth() {
         }
         simplePrintln("WiFi disconnected! Reconnecting...");
         WiFi.reconnect();
+    } else {
+        IPAddress ip = WiFi.localIP();
+        // On reconnect/IP change, make sure RTSP server socket is listening on new interface.
+        if (!prevConnected || ip != prevIp) {
+            simplePrintln("WiFi up: IP=" + ip.toString() + " GW=" + WiFi.gatewayIP().toString());
+            if (rtspServerEnabled) {
+                rtspServer.stop();
+                delay(20);
+                rtspServer.begin();
+                rtspServer.setNoDelay(true);
+                simplePrintln("RTSP server rebound on :8554");
+            }
+        }
+        prevIp = ip;
     }
+
+    prevConnected = connected;
 
     // Re-apply TX power WITHOUT logging (prevent periodic log spam)
     applyWifiTxPower(false);
 
-    int32_t rssi = WiFi.RSSI();
-    if (rssi < -85) {
-        simplePrintln("WARNING: Weak WiFi signal: " + String(rssi) + " dBm");
+    if (connected) {
+        int32_t rssi = WiFi.RSSI();
+        if (rssi < -85) {
+            simplePrintln("WARNING: Weak WiFi signal: " + String(rssi) + " dBm");
+        }
     }
 }
 
@@ -729,17 +763,16 @@ void audioCaptureTask(void* parameter) {
             continue;
         }
 
-        if (!isStreaming || !streamClient) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
+        // Keep I2S capture running even when no RTSP client is active,
+        // so /api/audio_status can show live raw-mic diagnostics.
         WiFiClient* client = streamClient;
+        bool streamActive = (isStreaming && client != NULL);
 
         // Periodic stats (every 30s) — Serial.printf only, no heap alloc
         if (millis() - lastStatsLog > 30000) {
-            Serial.printf("[Core1] Sent=%u I2Serr=%u Clip=%lu AGC=%.2f\n",
-                         packetCount, i2sErrors, audioClipCount, localAgcMult);
+            Serial.printf("[Core1] Sent=%u I2Serr=%u Clip=%lu AGC=%.2f RawPeak=%u RawRMS=%u RawMin=%d RawMax=%d Z=%u%%\n",
+                         packetCount, i2sErrors, audioClipCount, localAgcMult,
+                         i2sLastRawPeakAbs, i2sLastRawRms, i2sLastRawMin, i2sLastRawMax, i2sLastRawZeroPct);
             lastStatsLog = millis();
         }
 
@@ -752,17 +785,22 @@ void audioCaptureTask(void* parameter) {
             if (result != ESP_OK) {
                 consecutiveErrors++;
                 i2sErrors++;
+                i2sReadErrCount++;
                 if (consecutiveErrors >= MAX_ERRORS) {
                     Serial.println("[Core1] Too many I2S errors, pausing");
                     vTaskDelay(pdMS_TO_TICKS(100));
                     consecutiveErrors = 0;
                 }
+            } else {
+                i2sReadZeroCount++;
             }
             continue;
         }
 
         consecutiveErrors = 0;
+        i2sReadOkCount++;
         uint16_t samplesRead = bytesRead / sizeof(int16_t);
+        i2sLastSamplesRead = samplesRead;
 
         // Update HPF coefficients if changed
         if (highpassEnabled && (localHpfConfigSampleRate != currentSampleRate ||
@@ -783,8 +821,23 @@ void audioCaptureTask(void* parameter) {
         float peakAbs = 0.0f;
         float sumSquares = 0.0f;
 
+        // Raw I2S diagnostics before DSP (used to detect dead/flat/stuck mic input)
+        int16_t rawMin = INT16_MAX;
+        int16_t rawMax = INT16_MIN;
+        uint16_t rawPeakAbs = 0;
+        uint32_t rawZeroCount = 0;
+        float rawSumSquares = 0.0f;
+
         for (int i = 0; i < samplesRead; i++) {
-            float sample = (float)(captureBuffer[i] >> i2sShiftBits);
+            int16_t raw = captureBuffer[i];
+            if (raw < rawMin) rawMin = raw;
+            if (raw > rawMax) rawMax = raw;
+            uint16_t rawAbs = (raw < 0) ? (uint16_t)(-raw) : (uint16_t)raw;
+            if (rawAbs > rawPeakAbs) rawPeakAbs = rawAbs;
+            if (raw == 0) rawZeroCount++;
+            rawSumSquares += (float)raw * (float)raw;
+
+            float sample = (float)(raw >> i2sShiftBits);
 
             if (highpassEnabled) {
                 sample = localHpf.process(sample);
@@ -799,6 +852,20 @@ void audioCaptureTask(void* parameter) {
             if (amplified > 32767.0f) amplified = 32767.0f;
             if (amplified < -32768.0f) amplified = -32768.0f;
             outputBuffer[i] = (int16_t)amplified;
+        }
+
+        // Publish raw capture diagnostics for UI/API
+        i2sLastRawMin = rawMin;
+        i2sLastRawMax = rawMax;
+        i2sLastRawPeakAbs = rawPeakAbs;
+        if (samplesRead > 0) {
+            float rawRms = sqrtf(rawSumSquares / (float)samplesRead);
+            if (rawRms > 65535.0f) rawRms = 65535.0f;
+            i2sLastRawRms = (uint16_t)rawRms;
+            i2sLastRawZeroPct = (uint16_t)((rawZeroCount * 100UL) / samplesRead);
+        } else {
+            i2sLastRawRms = 0;
+            i2sLastRawZeroPct = 100;
         }
 
         // AGC: adjust multiplier based on RMS
@@ -840,8 +907,8 @@ void audioCaptureTask(void* parameter) {
             peakHoldAbs16 = 0;
         }
 
-        // LED update (throttled to ~10 Hz)
-        if (millis() - lastLedUpdate > 100) {
+        // LED update (throttled to ~10 Hz) only while actively streaming.
+        if (streamActive && millis() - lastLedUpdate > 100) {
             if (ledMode == 2) {
                 // Level mode: color-coded audio level
                 float pct = peakAbs / 32767.0f;
@@ -866,14 +933,16 @@ void audioCaptureTask(void* parameter) {
             lastLedUpdate = millis();
         }
 
-        // Send RTP packet
-        sendRTPPacket(*client, outputBuffer, samplesRead);
-        packetCount++;
+        if (streamActive) {
+            // Send RTP packet
+            sendRTPPacket(*client, outputBuffer, samplesRead);
+            packetCount++;
+        }
 
         // Process incoming RTSP commands during streaming (~every 200ms)
         // Keeps all socket I/O on Core 1 during streaming
         static unsigned long lastRtspCheck = 0;
-        if (client && isStreaming && (millis() - lastRtspCheck > 200)) {
+        if (streamActive && (millis() - lastRtspCheck > 200)) {
             lastRtspCheck = millis();
             if (client->available() > 0) {
                 char rtspBuf[512];
@@ -1011,7 +1080,7 @@ void setup_i2s_driver() {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
         .sample_rate = currentSampleRate,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,  // Match original demo exactly
-        .channel_format = I2S_CHANNEL_FMT_ALL_RIGHT,    // ALL_RIGHT like original demo
+        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,   // Match M5 reference PDM example
 #if ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 1, 0)
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
 #else
@@ -1367,8 +1436,9 @@ void setup() {
     setup_i2s_driver();
     Serial.println("I2S driver ready");
 
-    // Audio pipeline task will be created when RTSP streaming begins (on PLAY command)
-    Serial.println("Dual-core audio ready (Core 1 pipeline will start on RTSP PLAY)");
+    // Start Core 1 audio pipeline now so raw I2S diagnostics are available even before PLAY.
+    startAudioCaptureTask();
+    Serial.println("Dual-core audio ready (Core 1 pipeline running for always-on diagnostics)");
 
     Serial.println("Updating highpass coefficients...");
     updateHighpassCoeffs();
