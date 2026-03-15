@@ -45,9 +45,10 @@ const char* FW_VERSION_STR = FW_VERSION;
 #define OVERHEAT_MAX_LIMIT_C 95
 #define OVERHEAT_LIMIT_STEP_C 5
 
-// -- Pins (AtomS3 Lite + Unit Mini PDM)
-#define I2S_CLK_PIN      1  // Unit Mini PDM CLK
-#define I2S_DATA_IN_PIN  2  // Unit Mini PDM DAT
+// -- Pins (M5 Atom Echo / Unit PDM)
+// M5's reference wiring for the PDM Unit is: CLK=G1, DATA=G2.
+#define I2S_CLK_PIN      1  // PDM CLK (G1)
+#define I2S_DATA_IN_PIN  2  // PDM DATA (G2)
 #define WS2812_LED_PIN  35  // AtomS3 Lite built-in RGB LED
 
 static CRGB statusLed[1];
@@ -1011,7 +1012,7 @@ void setup_i2s_driver() {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
         .sample_rate = currentSampleRate,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,  // Match original demo exactly
-        .channel_format = I2S_CHANNEL_FMT_ALL_RIGHT,    // ALL_RIGHT like original demo
+        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,   // Match M5 reference PDM example
 #if ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 1, 0)
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
 #else
