@@ -115,6 +115,14 @@ volatile bool i2sLikelyUnsignedPcm = false;
 volatile uint8_t fftBins[32] = {0};
 volatile uint32_t fftFrameSeq = 0;
 
+// -- Browser WebAudio diagnostics stream (latest processed PCM block)
+portMUX_TYPE webAudioMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t webAudioFrameSeq = 0;
+volatile uint16_t webAudioFrameSamples = 0;
+volatile uint32_t webAudioSampleRate = DEFAULT_SAMPLE_RATE;
+static const uint16_t WEB_AUDIO_MAX_SAMPLES = 2048;
+int16_t webAudioFrame[WEB_AUDIO_MAX_SAMPLES] = {0};
+
 // -- LED mode: 0=off, 1=static, 2=level
 uint8_t ledMode = 1;  // Default: static purple during streaming
 
@@ -916,6 +924,16 @@ void audioCaptureTask(void* parameter) {
             if (amplified < -32768.0f) amplified = -32768.0f;
             outputBuffer[i] = (int16_t)amplified;
         }
+
+        // Publish latest processed frame for browser WebAudio endpoint
+        uint16_t publishSamples = samplesRead;
+        if (publishSamples > WEB_AUDIO_MAX_SAMPLES) publishSamples = WEB_AUDIO_MAX_SAMPLES;
+        portENTER_CRITICAL(&webAudioMux);
+        memcpy(webAudioFrame, outputBuffer, publishSamples * sizeof(int16_t));
+        webAudioFrameSamples = publishSamples;
+        webAudioSampleRate = currentSampleRate;
+        webAudioFrameSeq++;
+        portEXIT_CRITICAL(&webAudioMux);
 
         // Update spectrum diagnostics from processed output (throttled)
         static uint8_t fftDecimator = 0;
