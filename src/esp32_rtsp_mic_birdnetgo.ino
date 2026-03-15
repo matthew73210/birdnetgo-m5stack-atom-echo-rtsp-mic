@@ -4,7 +4,7 @@
 #include "driver/i2s.h"
 #include <Preferences.h>
 #include <math.h>
-#include <M5Atom.h>
+#include <FastLED.h>
 #include "WebUI.h"
 
 // ================== DUAL-CORE AUDIO ARCHITECTURE ==================
@@ -30,7 +30,7 @@ volatile bool core1OwnsLED = false;          // LED ownership flag
 const char* FW_VERSION_STR = FW_VERSION;
 
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
-#define DEFAULT_SAMPLE_RATE 16000  // M5Stack Atom Echo: 16kHz for PDM microphone
+#define DEFAULT_SAMPLE_RATE 16000  // Unit Mini PDM / BirdNET-Go preferred rate
 #define DEFAULT_GAIN_FACTOR 3.0f
 #define DEFAULT_BUFFER_SIZE 1024   // 64ms @ 16kHz - good balance for BirdNET-Go
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
@@ -45,11 +45,17 @@ const char* FW_VERSION_STR = FW_VERSION;
 #define OVERHEAT_MAX_LIMIT_C 95
 #define OVERHEAT_LIMIT_STEP_C 5
 
-// -- Pins (M5Stack Atom Echo with SPM1423 PDM Microphone)
-#define I2S_BCLK_PIN    19  // Bit Clock
-#define I2S_LRCLK_PIN   33  // Word Select / Left-Right Clock
-#define I2S_DATA_IN_PIN 23  // Microphone Data In
-#define I2S_DATA_OUT_PIN 22 // Speaker Data Out (not used for mic-only)
+// -- Pins (AtomS3 Lite + Unit Mini PDM)
+#define I2S_CLK_PIN      1  // Unit Mini PDM CLK
+#define I2S_DATA_IN_PIN  2  // Unit Mini PDM DAT
+#define WS2812_LED_PIN  35  // AtomS3 Lite built-in RGB LED
+
+static CRGB statusLed[1];
+
+inline void setStatusLed(const CRGB& color) {
+    statusLed[0] = color;
+    FastLED.show();
+}
 
 // -- Servers
 WiFiServer rtspServer(8554);
@@ -81,7 +87,7 @@ uint16_t currentBufferSize = DEFAULT_BUFFER_SIZE;
 // PDM microphones (like SPM1423 on Atom Echo) output decimated samples
 // The hardware PDM decimation produces samples already close to correct range
 // Typical range: 0-3 for PDM vs 11-13 for I2S microphones
-uint8_t i2sShiftBits = 0;  // Default for PDM microphone on M5Stack Atom Echo
+uint8_t i2sShiftBits = 0;  // Default for Unit Mini PDM
 
 // -- Audio metering / clipping diagnostics
 uint16_t lastPeakAbs16 = 0;       // last block peak absolute value (0..32767)
@@ -554,7 +560,7 @@ void resetToDefaultSettings() {
     currentSampleRate = DEFAULT_SAMPLE_RATE;
     currentGainFactor = DEFAULT_GAIN_FACTOR;
     currentBufferSize = DEFAULT_BUFFER_SIZE;
-    i2sShiftBits = 0;  // Default for PDM microphone on M5Stack Atom Echo
+    i2sShiftBits = 0;  // Default for Unit Mini PDM
 
     autoRecoveryEnabled = false;
     autoThresholdEnabled = true;
@@ -840,22 +846,22 @@ void audioCaptureTask(void* parameter) {
                 // Level mode: color-coded audio level
                 float pct = peakAbs / 32767.0f;
                 if (clipped) {
-                    M5.dis.drawpix(0, CRGB(255, 0, 0));        // Red: clipping
+                    setStatusLed(CRGB(255, 0, 0));        // Red: clipping
                 } else if (pct > 0.7f) {
-                    M5.dis.drawpix(0, CRGB(255, 165, 0));      // Orange: hot signal
+                    setStatusLed(CRGB(255, 165, 0));      // Orange: hot signal
                 } else if (pct > 0.3f) {
-                    M5.dis.drawpix(0, CRGB(0, 255, 0));        // Bright green: good level
+                    setStatusLed(CRGB(0, 255, 0));        // Bright green: good level
                 } else if (pct > 0.05f) {
-                    M5.dis.drawpix(0, CRGB(0, 64, 0));         // Dim green: low signal
+                    setStatusLed(CRGB(0, 64, 0));         // Dim green: low signal
                 } else {
-                    M5.dis.drawpix(0, CRGB(32, 0, 32));        // Dim purple: very quiet
+                    setStatusLed(CRGB(32, 0, 32));        // Dim purple: very quiet
                 }
             } else if (ledMode == 1) {
                 // Static mode: solid green during streaming
-                M5.dis.drawpix(0, CRGB(0, 128, 0));
+                setStatusLed(CRGB(0, 128, 0));
             } else {
                 // Off mode: LED dark during streaming
-                M5.dis.drawpix(0, CRGB(0, 0, 0));
+                setStatusLed(CRGB(0, 0, 0));
             }
             lastLedUpdate = millis();
         }
@@ -993,15 +999,15 @@ bool requestStreamStop(const char* reason) {
     }
 }
 
-// I2S setup for M5Stack Atom Echo (PDM microphone mode)
+// I2S setup for AtomS3 Lite + Unit Mini PDM (PDM microphone mode)
 void setup_i2s_driver() {
     i2s_driver_uninstall(I2S_NUM_0);
 
     // DMA buffer configuration - smaller for lower latency with 16kHz
-    uint16_t dma_buf_len = 60;  // Match M5Atom Echo example
+    uint16_t dma_buf_len = 60;
 
     i2s_config_t i2s_config = {
-        // PDM mode required for SPM1423 microphone on Atom Echo
+        // PDM mode for Unit Mini PDM microphone
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
         .sample_rate = currentSampleRate,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,  // Match original demo exactly
@@ -1012,7 +1018,7 @@ void setup_i2s_driver() {
         .communication_format = I2S_COMM_FORMAT_I2S,
 #endif
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 6,     // Match M5Atom Echo example
+        .dma_buf_count = 6,
         .dma_buf_len = dma_buf_len,
         .use_apll = false,
         .tx_desc_auto_clear = false,
@@ -1023,9 +1029,9 @@ void setup_i2s_driver() {
 #if (ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 3, 0))
         .mck_io_num = I2S_PIN_NO_CHANGE,
 #endif
-        .bck_io_num = I2S_BCLK_PIN,
-        .ws_io_num = I2S_LRCLK_PIN,
-        .data_out_num = I2S_DATA_OUT_PIN,
+        .bck_io_num = I2S_PIN_NO_CHANGE,
+        .ws_io_num = I2S_CLK_PIN,
+        .data_out_num = I2S_PIN_NO_CHANGE,
         .data_in_num = I2S_DATA_IN_PIN
     };
 
@@ -1218,8 +1224,8 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         client.print("Session: " + rtspSessionId + "\r\n\r\n");
 
         if (!core1OwnsLED) {
-            if (ledMode > 0) M5.dis.drawpix(0, CRGB(0, 0, 128));
-            else M5.dis.drawpix(0, CRGB(0, 0, 0));
+            if (ledMode > 0) setStatusLed(CRGB(0, 0, 128));
+            else setStatusLed(CRGB(0, 0, 0));
         }
         simplePrintln("STREAMING STOPPED");
     } else if (request.startsWith("GET_PARAMETER")) {
@@ -1276,19 +1282,20 @@ void processRTSP(WiFiClient &client) {
 // Web UI is a separate module (WebUI.*)
 
 void setup() {
-    // Initialize M5Atom (for button and LED, serial enabled)
-    M5.begin(true, false, true);
+    FastLED.addLeds<WS2812, WS2812_LED_PIN, GRB>(statusLed, 1);
+    FastLED.setBrightness(32);
+    setStatusLed(CRGB(0, 0, 0));
 
     Serial.begin(115200);
     delay(500);
     Serial.println("\n\n=== ESP32 RTSP Mic Starting ===");
-    Serial.println("Board: M5Stack Atom Echo");
+    Serial.println("Board: M5Stack AtomS3 Lite");
 
     // Create task exit semaphore for confirmed Core 1 task shutdown
     taskExitSemaphore = xSemaphoreCreateBinary();
 
     // Set LED to indicate startup
-    M5.dis.drawpix(0, CRGB(128, 128, 0));  // Yellow for startup
+    setStatusLed(CRGB(128, 128, 0));  // Yellow for startup
 
     // (4) seed for random(): combination of time and unique MAC
     randomSeed((uint32_t)micros() ^ (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF));
@@ -1349,11 +1356,11 @@ void setup() {
     // Apply configured WiFi TX power after connect (logs once on change)
     applyWifiTxPower(true);
 
-    // mDNS: allows rtsp://atomecho.local:8554/audio
-    if (MDNS.begin("atomecho")) {
+    // mDNS: allows rtsp://atoms3mic.local:8554/audio
+    if (MDNS.begin("atoms3mic")) {
         MDNS.addService("rtsp", "tcp", 8554);
         MDNS.addService("http", "tcp", 80);
-        simplePrintln("mDNS: atomecho.local");
+        simplePrintln("mDNS: atoms3mic.local");
     }
 
     Serial.println("Setting up I2S driver...");
@@ -1409,22 +1416,19 @@ void setup() {
     if (!overheatLatched) {
         simplePrintln("RTSP server ready on port 8554");
         simplePrintln("RTSP URL: rtsp://" + WiFi.localIP().toString() + ":8554/audio");
-        simplePrintln("RTSP URL: rtsp://atomecho.local:8554/audio");
+        simplePrintln("RTSP URL: rtsp://atoms3mic.local:8554/audio");
         // Set LED to blue when ready (green reserved for level indicator)
-        if (ledMode > 0) M5.dis.drawpix(0, CRGB(0, 0, 128));
-        else M5.dis.drawpix(0, CRGB(0, 0, 0));
+        if (ledMode > 0) setStatusLed(CRGB(0, 0, 128));
+        else setStatusLed(CRGB(0, 0, 0));
     } else {
         simplePrintln("RTSP server paused due to thermal latch. Clear via Web UI before resuming streaming.");
         // Set LED to red when latched
-        M5.dis.drawpix(0, CRGB(128, 0, 0));
+        setStatusLed(CRGB(128, 0, 0));
     }
     simplePrintln("Web UI: http://" + WiFi.localIP().toString() + "/");
 }
 
 void loop() {
-    // Update M5Atom (for button and LED handling)
-    M5.update();
-
     webui_handleClient();
 
     if (millis() - lastTempCheck > 60000) { // 1 min
@@ -1468,8 +1472,8 @@ void loop() {
         if (wasStreaming && !isStreaming) {
             // Core 1 already closed the socket — just update LED and log
             if (!core1OwnsLED) {
-                if (ledMode > 0) M5.dis.drawpix(0, CRGB(0, 0, 128));
-                else M5.dis.drawpix(0, CRGB(0, 0, 0));
+                if (ledMode > 0) setStatusLed(CRGB(0, 0, 128));
+                else setStatusLed(CRGB(0, 0, 0));
             }
             unsigned long sessionSec = (millis() - lastRtspPlayMs) / 1000;
             simplePrintln("RTSP client disconnected (session: " + String(sessionSec) + "s, dropped: " +
@@ -1505,10 +1509,10 @@ void loop() {
         }
         if (!core1OwnsLED) {
             if (overheatLatched) {
-                M5.dis.drawpix(0, CRGB(128, 0, 0));
+                setStatusLed(CRGB(128, 0, 0));
             } else {
-                if (ledMode > 0) M5.dis.drawpix(0, CRGB(0, 0, 128));
-                else M5.dis.drawpix(0, CRGB(0, 0, 0));
+                if (ledMode > 0) setStatusLed(CRGB(0, 0, 128));
+                else setStatusLed(CRGB(0, 0, 0));
             }
         }
     }
