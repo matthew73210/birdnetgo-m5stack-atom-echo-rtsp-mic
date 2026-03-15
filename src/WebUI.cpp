@@ -176,7 +176,7 @@ static String htmlIndex() {
         ":8554/audio' target='_blank'>rtsp://");
     h += ip;
     h += F(
-        ":8554/audio</a> · <a id='browser_stream' target='_blank' rel='noopener'>Web Streamer</a></div></div>"
+        ":8554/audio</a> · <a href='/streamer' target='_blank' rel='noopener'>Web Streamer</a></div></div>"
         "<div class='lang'><a href='https://github.com/stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic' target='_blank' class='gh'>GitHub</a>Lang: <select id='langSel'><option value='en'>English</option><option value='cs'>Čeština</option></select></div></div></div><div class='card top-meter'><div class='top-meter-label'><span>Live Input Level</span><span id='meter_db' class='mono'>-90.0 dBFS</span></div><div class='meter' aria-label='Live audio meter'><div id='meter_fill' class='meter-fill ok' style='width:0%'></div></div><div id='meter_status' class='meter-readout muted'>Waiting for audio…</div></div>"
         "<div class='row'>"
         "<div class='card'><h2 id='t_status'>Status</h2><table>"
@@ -302,12 +302,11 @@ static String htmlIndex() {
 "function drawWaterfallRow(bins){ if(!wfCanvas){ wfCanvas=$('wf'); if(!wfCanvas) return; wfCtx=wfCanvas.getContext('2d'); } if(!wfCtx) return; const w=wfCanvas.width,h=wfCanvas.height,n=bins.length||32; const row=wfCtx.getImageData(0,0,w,h-1); wfCtx.putImageData(row,0,1); const img=wfCtx.createImageData(w,1); for(let x=0;x<w;x++){ const bi=Math.min(n-1,Math.floor((x/w)*n)); const c=wfColor(bins[bi]||0); const o=x*4; img.data[o]=c[0]; img.data[o+1]=c[1]; img.data[o+2]=c[2]; img.data[o+3]=255; } wfCtx.putImageData(img,0,0); }"
 "function loadFft(){fetch('/api/fft',{cache:'no-store'}).then(r=>r.json()).then(j=>{ if(!j||!j.bins) return; if(j.seq===wfLastSeq) return; wfLastSeq=j.seq; drawWaterfallRow(j.bins); const hz=$('wf_hz'); if(hz && j.max_hz) hz.textContent='0-'+Math.round(j.max_hz)+' Hz'; }).catch(()=>{});}"
 "function loadLogs(){fetch('/api/logs',{cache:'no-store'}).then(r=>r.text()).then(t=>{ const lg=$('logs'); lg.textContent=t; lg.scrollTop=lg.scrollHeight; })}"
-"function syncStreamLinks(){ const rtspEl=$('rtsp'); const webEl=$('browser_stream'); if(!rtspEl||!webEl) return; const rtspUrl=rtspEl.textContent.trim(); webEl.href='https://www.rtsp.me/embed?url='+encodeURIComponent(rtspUrl); }"
 "function loadAll(){loadStatus();loadAudio();loadPerf();loadTherm();loadLogs()}"
 "function clearThermalLatch(){ const btn=$('btn_therm_clear'); if(btn) btn.disabled=true; fetch('/api/thermal/clear',{method:'POST',cache:'no-store'}).then(r=>r.json()).then(j=>{ if(!j.ok){ console.warn('Thermal latch clear rejected'); } loadAll(); }).catch(()=>loadAll());}"
 "setInterval(loadAll,3000);"
 "setInterval(loadFft,500);"
-        "const sel=document.getElementById('langSel'); sel.value=lang; sel.onchange=()=>{lang=sel.value;localStorage.setItem('lang',lang);applyLang()}; applyLang(); syncStreamLinks();"
+        "const sel=document.getElementById('langSel'); sel.value=lang; sel.onchange=()=>{lang=sel.value;localStorage.setItem('lang',lang);applyLang()}; applyLang();"
         "bindSaver($('in_rate'),'rate'); bindSaver($('in_gain'),'gain'); bindSaver($('in_shift'),'shift'); bindSaver($('in_thr'),'min_rate'); bindSaver($('in_chk'),'check_interval'); bindSaver($('in_hours'),'reset_hours'); bindSaver($('in_hp_cutoff'),'hp_cutoff');"
         "trackEdit($('in_rate'),'rate'); trackEdit($('in_gain'),'gain'); trackEdit($('in_shift'),'shift'); trackEdit($('in_thr'),'min_rate'); trackEdit($('in_chk'),'check_interval'); trackEdit($('in_hours'),'reset_hours'); trackEdit($('in_hp_cutoff'),'hp_cutoff');"
 "trackEdit($('sel_led'),'led_mode'); trackEdit($('in_auto'),'auto_recovery'); trackEdit($('in_thr_mode'),'thr_mode'); trackEdit($('in_sched'),'sched_reset'); trackEdit($('sel_buf'),'buffer'); trackEdit($('sel_tx'),'wifi_tx'); trackEdit($('sel_hp'),'hp_enable'); trackEdit($('sel_agc'),'agc_enable'); trackEdit($('sel_cpu'),'cpu_freq'); trackEdit($('sel_oh_enable'),'oh_enable'); trackEdit($('sel_oh_limit'),'oh_limit');"
@@ -318,6 +317,30 @@ static String htmlIndex() {
         "</script></body></html>");
     return h;
 }
+
+static String htmlStreamer() {
+    String rtsp = String("rtsp://") + WiFi.localIP().toString() + ":8554/audio";
+    String h;
+    h += F(
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Web Streamer</title>"
+        "<style>body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;background:#0b1020;color:#e7ebf2;margin:0;padding:16px}"
+        ".card{max-width:980px;margin:0 auto;background:#121a2e;border:1px solid #1b2745;border-radius:12px;padding:14px}"
+        "a{color:#4ea1f3}.mono{font-family:ui-monospace,Consolas,Menlo,monospace}.muted{color:#9aa3b2}"
+        "iframe{width:100%;height:70vh;border:1px solid #1b2745;border-radius:10px;background:#050a14}</style>"
+        "</head><body><div class='card'><h2>Browser Web Streamer</h2>"
+        "<p class='muted'>Embedded browser player for the RTSP stream:</p><p><span class='mono'>");
+    h += rtsp;
+    h += F("</span></p><iframe id='player' allow='autoplay'></iframe>"
+           "<p class='muted'>If the embedded player cannot connect, copy the RTSP URL into VLC/ffplay.</p>"
+           "</div><script>const rtsp='" );
+    h += rtsp;
+    h += F("';document.getElementById('player').src='https://www.rtsp.me/embed?url='+encodeURIComponent(rtsp);</script></body></html>");
+    return h;
+}
+
+static void httpStreamer() { web.send(200, "text/html; charset=utf-8", htmlStreamer()); }
 
 // HTTP handlery
 static void httpIndex() { web.send(200, "text/html; charset=utf-8", htmlIndex()); }
@@ -540,6 +563,7 @@ static void httpSet() {
 
 void webui_begin() {
     web.on("/", httpIndex);
+    web.on("/streamer", httpStreamer);
     web.on("/api/status", httpStatus);
     web.on("/api/audio_status", httpAudioStatus);
     web.on("/api/fft", httpFft);

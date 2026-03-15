@@ -41,6 +41,8 @@ ffplay -rtsp_transport tcp rtsp://atoms3mic.local:8554/audio
 
 **Web UI**: `http://atoms3mic.local/`
 
+**Browser streamer page**: `http://atoms3mic.local/streamer`
+
 ## Recommended Settings
 
 | Setting | Default | Notes |
