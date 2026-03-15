@@ -109,6 +109,10 @@ volatile uint16_t i2sLastRawRms = 0;
 volatile uint16_t i2sLastRawZeroPct = 0;
 volatile bool i2sLikelyUnsignedPcm = false;
 
+// -- Lightweight spectrum diagnostics for Web UI waterfall
+volatile uint8_t fftBins[32] = {0};
+volatile uint32_t fftFrameSeq = 0;
+
 // -- LED mode: 0=off, 1=static, 2=level
 uint8_t ledMode = 1;  // Default: static purple during streaming
 
@@ -708,6 +712,43 @@ void drainRtspReceiveBuffer(WiFiClient &client) {
     }
 }
 
+
+static void updateFftFromBlock(const int16_t* samples, uint16_t count) {
+    const int N = 128;
+    const int BINS = 32;
+    if (!samples || count < N) return;
+
+    float mean = 0.0f;
+    for (int i = 0; i < N; i++) mean += (float)samples[i];
+    mean /= (float)N;
+
+    float mags[BINS];
+    float maxMag = 0.0f;
+    for (int k = 0; k < BINS; k++) {
+        float re = 0.0f;
+        float im = 0.0f;
+        for (int n = 0; n < N; n++) {
+            float x = ((float)samples[n] - mean) * (0.5f - 0.5f * cosf((2.0f * PI * (float)n) / (float)(N - 1)));
+            float phase = 2.0f * PI * (float)k * (float)n / (float)N;
+            re += x * cosf(phase);
+            im -= x * sinf(phase);
+        }
+        float mag = sqrtf(re * re + im * im);
+        mag *= (1.0f + 0.01f * (float)k);
+        mags[k] = mag;
+        if (mag > maxMag) maxMag = mag;
+    }
+
+    if (maxMag < 1.0f) maxMag = 1.0f;
+    for (int k = 0; k < BINS; k++) {
+        float norm = mags[k] / maxMag;
+        if (norm < 0.0f) norm = 0.0f;
+        if (norm > 1.0f) norm = 1.0f;
+        fftBins[k] = (uint8_t)(norm * 255.0f);
+    }
+    fftFrameSeq++;
+}
+
 // ================== CORE 1: FULL AUDIO PIPELINE ==================
 // I2S capture → process (HPF, gain, AGC) → RTP → WiFi
 // Uses streamClient pointer (set by Core 0 on PLAY, cleared here on failure)
@@ -872,6 +913,13 @@ void audioCaptureTask(void* parameter) {
             if (amplified > 32767.0f) amplified = 32767.0f;
             if (amplified < -32768.0f) amplified = -32768.0f;
             outputBuffer[i] = (int16_t)amplified;
+        }
+
+        // Update spectrum diagnostics from processed output (throttled)
+        static uint8_t fftDecimator = 0;
+        fftDecimator++;
+        if ((fftDecimator & 0x03) == 0 && samplesRead >= 128) {
+            updateFftFromBlock(outputBuffer, samplesRead);
         }
 
         // Publish raw capture diagnostics for UI/API
