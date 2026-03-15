@@ -25,7 +25,7 @@ SemaphoreHandle_t taskExitSemaphore = NULL;  // confirmed task exit
 volatile bool core1OwnsLED = false;          // LED ownership flag
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "2.3.0"
+#define FW_VERSION "2.3.1"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 
@@ -107,6 +107,11 @@ volatile int16_t i2sLastRawMax = 0;
 volatile uint16_t i2sLastRawPeakAbs = 0;
 volatile uint16_t i2sLastRawRms = 0;
 volatile uint16_t i2sLastRawZeroPct = 0;
+volatile bool i2sLikelyUnsignedPcm = false;
+
+// -- Lightweight spectrum diagnostics for Web UI waterfall
+volatile uint8_t fftBins[32] = {0};
+volatile uint32_t fftFrameSeq = 0;
 
 // -- LED mode: 0=off, 1=static, 2=level
 uint8_t ledMode = 1;  // Default: static purple during streaming
@@ -707,6 +712,43 @@ void drainRtspReceiveBuffer(WiFiClient &client) {
     }
 }
 
+
+static void updateFftFromBlock(const int16_t* samples, uint16_t count) {
+    const int N = 128;
+    const int BINS = 32;
+    if (!samples || count < N) return;
+
+    float mean = 0.0f;
+    for (int i = 0; i < N; i++) mean += (float)samples[i];
+    mean /= (float)N;
+
+    float mags[BINS];
+    float maxMag = 0.0f;
+    for (int k = 0; k < BINS; k++) {
+        float re = 0.0f;
+        float im = 0.0f;
+        for (int n = 0; n < N; n++) {
+            float x = ((float)samples[n] - mean) * (0.5f - 0.5f * cosf((2.0f * PI * (float)n) / (float)(N - 1)));
+            float phase = 2.0f * PI * (float)k * (float)n / (float)N;
+            re += x * cosf(phase);
+            im -= x * sinf(phase);
+        }
+        float mag = sqrtf(re * re + im * im);
+        mag *= (1.0f + 0.01f * (float)k);
+        mags[k] = mag;
+        if (mag > maxMag) maxMag = mag;
+    }
+
+    if (maxMag < 1.0f) maxMag = 1.0f;
+    for (int k = 0; k < BINS; k++) {
+        float norm = mags[k] / maxMag;
+        if (norm < 0.0f) norm = 0.0f;
+        if (norm > 1.0f) norm = 1.0f;
+        fftBins[k] = (uint8_t)(norm * 255.0f);
+    }
+    fftFrameSeq++;
+}
+
 // ================== CORE 1: FULL AUDIO PIPELINE ==================
 // I2S capture → process (HPF, gain, AGC) → RTP → WiFi
 // Uses streamClient pointer (set by Core 0 on PLAY, cleared here on failure)
@@ -828,6 +870,7 @@ void audioCaptureTask(void* parameter) {
         uint32_t rawZeroCount = 0;
         float rawSumSquares = 0.0f;
 
+        // First pass: collect raw stats for diagnostics and format detection.
         for (int i = 0; i < samplesRead; i++) {
             int16_t raw = captureBuffer[i];
             if (raw < rawMin) rawMin = raw;
@@ -836,8 +879,26 @@ void audioCaptureTask(void* parameter) {
             if (rawAbs > rawPeakAbs) rawPeakAbs = rawAbs;
             if (raw == 0) rawZeroCount++;
             rawSumSquares += (float)raw * (float)raw;
+        }
 
-            float sample = (float)(raw >> i2sShiftBits);
+        // Some PDM front-ends return unsigned low-amplitude PCM (e.g. around 1024)
+        // instead of signed 16-bit centered at 0. Detect and normalize per block.
+        bool likelyUnsignedPdm = (rawMin >= 0 && rawMax <= 4095);
+        i2sLikelyUnsignedPcm = likelyUnsignedPdm;
+        float pdmCenter = 0.0f;
+        float pdmScale = 1.0f;
+        if (likelyUnsignedPdm) {
+            pdmCenter = (rawMax > 2047) ? 2048.0f : 1024.0f;
+            pdmScale = (rawMax > 2047) ? 16.0f : 32.0f;
+        }
+
+        // Second pass: DSP and output generation.
+        for (int i = 0; i < samplesRead; i++) {
+            int16_t raw = captureBuffer[i];
+
+            float sample = likelyUnsignedPdm
+                ? ((float)raw - pdmCenter) * pdmScale
+                : (float)(raw >> i2sShiftBits);
 
             if (highpassEnabled) {
                 sample = localHpf.process(sample);
@@ -852,6 +913,13 @@ void audioCaptureTask(void* parameter) {
             if (amplified > 32767.0f) amplified = 32767.0f;
             if (amplified < -32768.0f) amplified = -32768.0f;
             outputBuffer[i] = (int16_t)amplified;
+        }
+
+        // Update spectrum diagnostics from processed output (throttled)
+        static uint8_t fftDecimator = 0;
+        fftDecimator++;
+        if ((fftDecimator & 0x03) == 0 && samplesRead >= 128) {
+            updateFftFromBlock(outputBuffer, samplesRead);
         }
 
         // Publish raw capture diagnostics for UI/API

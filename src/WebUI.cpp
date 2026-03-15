@@ -64,6 +64,9 @@ extern volatile int16_t i2sLastRawMax;
 extern volatile uint16_t i2sLastRawPeakAbs;
 extern volatile uint16_t i2sLastRawRms;
 extern volatile uint16_t i2sLastRawZeroPct;
+extern volatile bool i2sLikelyUnsignedPcm;
+extern volatile uint8_t fftBins[32];
+extern volatile uint32_t fftFrameSeq;
 
 // Local helper: snap requested Wi‑Fi TX power (dBm) to nearest supported step
 static float snapWifiTxDbm(float dbm) {
@@ -157,7 +160,7 @@ static String htmlIndex() {
         "table{width:100%;border-collapse:collapse} td{padding:8px 6px;border-bottom:1px solid var(--border)} td.k{color:var(--muted);width:44%} td.v{font-weight:600}.meter{height:10px;border:1px solid var(--border);border-radius:999px;background:#0a1224;overflow:hidden;margin-bottom:6px}.meter-fill{height:100%;width:0%;transition:width .25s ease}.meter-fill.ok{background:linear-gradient(90deg,#22c55e,#16a34a)}.meter-fill.warn{background:linear-gradient(90deg,#fbbf24,#f59e0b)}.meter-fill.bad{background:linear-gradient(90deg,#f87171,#ef4444)}.meter-readout{font-size:13px}"
         "button,select,input{font:inherit;padding:8px 10px;border-radius:10px;border:1px solid var(--border);background:#0d1427;color:var(--fg)}"
         "button{background:#0e152a} button:hover{border-color:var(--acc)} button.active{background:var(--acc);color:#061120;border-color:#2a7dd4}"
-        ".actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px} .ok{color:var(--acc2)} .warn{color:var(--warn)} .bad{color:var(--bad)} .lang{float:right} .mono{font-family:ui-monospace,Consolas,Menlo,monospace}.top-meter{margin:0 0 12px 0}.top-meter .meter{height:14px;margin-bottom:8px}.top-meter-label{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:12px;margin-bottom:6px}"
+        ".actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px} .ok{color:var(--acc2)} .warn{color:var(--warn)} .bad{color:var(--bad)} .lang{float:right} .mono{font-family:ui-monospace,Consolas,Menlo,monospace}.top-meter{margin:0 0 12px 0}.top-meter .meter{height:14px;margin-bottom:8px}.top-meter-label{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:12px;margin-bottom:6px}.wf-wrap{margin-top:8px}.wf-head{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-bottom:6px}.wf{width:100%;height:160px;display:block;background:#050a14;border:1px solid var(--border);border-radius:8px}"
         "input[type=number]{width:130px} select{min-width:110px} .muted{color:var(--muted)}"
         ".field{display:flex;align-items:center;gap:8px} .unit{color:var(--muted);font-size:12px} .help{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border:1px solid var(--acc);border-radius:50%;font-size:12px;color:var(--fg);margin-left:6px;background:#0a1224;cursor:pointer} .help:hover{filter:brightness(1.1)} .hint{margin-top:6px;padding:8px;border:1px solid var(--border);border-radius:8px;background:#0d162c;color:var(--fg);font-size:12px;line-height:1.35}"
         ".dirty{border-color:var(--bad)!important; box-shadow:0 0 0 2px rgba(239,68,68,.25) inset; background:#1a0d12}"
@@ -263,7 +266,7 @@ static String htmlIndex() {
         "</table></div>"
         "</div>"
 
-        "<div class='card'><div style='display:flex;justify-content:space-between;align-items:center'><h2 id='t_logs'>Logs</h2><button id='btn_copy_logs' onclick='copyLogs()' title='Copy logs' style='background:none;border:1px solid var(--border);padding:4px 8px;cursor:pointer;border-radius:8px;line-height:1'><svg width='16' height='16' viewBox='0 0 16 16' fill='none' stroke='currentColor' stroke-width='1.5'><rect x='5.5' y='5.5' width='8' height='8' rx='1.5'/><path d='M10.5 5.5V3a1.5 1.5 0 00-1.5-1.5H3A1.5 1.5 0 001.5 3v6A1.5 1.5 0 003 10.5h2.5'/></svg></button></div><pre id='logs' class='mono'></pre></div>"
+        "<div class='card'><h2>FFT Waterfall</h2><div class='wf-wrap'><div class='wf-head'><span>Low &rarr; High frequency</span><span id='wf_hz' class='mono'>0-0 Hz</span></div><canvas id='wf' class='wf' width='320' height='160'></canvas></div></div><div class='card'><div style='display:flex;justify-content:space-between;align-items:center'><h2 id='t_logs'>Logs</h2><button id='btn_copy_logs' onclick='copyLogs()' title='Copy logs' style='background:none;border:1px solid var(--border);padding:4px 8px;cursor:pointer;border-radius:8px;line-height:1'><svg width='16' height='16' viewBox='0 0 16 16' fill='none' stroke='currentColor' stroke-width='1.5'><rect x='5.5' y='5.5' width='8' height='8' rx='1.5'/><path d='M10.5 5.5V3a1.5 1.5 0 00-1.5-1.5H3A1.5 1.5 0 001.5 3v6A1.5 1.5 0 003 10.5h2.5'/></svg></button></div><pre id='logs' class='mono'></pre></div>"
 
         "</div>"
         "</div>"
@@ -294,10 +297,15 @@ static String htmlIndex() {
         "function updateAdvice(a){const L=T[lang]; let tips=[]; if(a.buffer_size<512) tips.push(L.adv_buf512); if(a.buffer_size<1024) tips.push(L.adv_buf1024); if(a.gain>20) tips.push(L.adv_gain); $('adv').textContent=tips.join(' ');}"
         "function loadPerf(){fetch('/api/perf_status',{cache:'no-store'}).then(r=>r.json()).then(j=>{ const el=$('in_auto'); if(el) el.value=j.auto_recovery?'on':'off'; const thr=$('in_thr'); const chk=$('in_chk'); const mode=$('in_thr_mode'); const sch=$('in_sched'); const hrs=$('in_hours'); const now=Date.now(); if(mode){ const editing=(edits['thr_mode']&&now<edits['thr_mode']); if(!(locks['thr_mode']&&now<locks['thr_mode']) && !editing) mode.value=j.auto_threshold?'auto':'manual'; toggleDirty(mode,'thr_mode'); } if(thr){ const editing=(edits['min_rate']&&now<edits['min_rate']); if(!(locks['min_rate']&&now<locks['min_rate']) && !editing) thr.value=j.restart_threshold_pkt_s; toggleDirty(thr,'min_rate'); } if(chk){ const editing=(edits['check_interval']&&now<edits['check_interval']); if(!(locks['check_interval']&&now<locks['check_interval']) && !editing) chk.value=j.check_interval_min; toggleDirty(chk,'check_interval'); } if(sch){ const editing=(edits['sched_reset']&&now<edits['sched_reset']); if(!(locks['sched_reset']&&now<locks['sched_reset']) && !editing) sch.value=j.scheduled_reset?'on':'off'; toggleDirty(sch,'sched_reset'); } if(hrs){ const editing=(edits['reset_hours']&&now<edits['reset_hours']); if(!(locks['reset_hours']&&now<locks['reset_hours']) && !editing) hrs.value=j.reset_hours; toggleDirty(hrs,'reset_hours'); } $('row_min_rate').style.display=j.auto_threshold?'none':''; })}"
 "function loadTherm(){fetch('/api/thermal',{cache:'no-store'}).then(r=>r.json()).then(j=>{ const now=Date.now(); const L=T[lang]; const en=$('sel_oh_enable'); if(en){ const editing=(edits['oh_enable']&&now<edits['oh_enable']); if(!(locks['oh_enable']&&now<locks['oh_enable']) && !editing) en.value=j.protection_enabled?'on':'off'; toggleDirty(en,'oh_enable'); } const lim=$('sel_oh_limit'); if(lim){ const editing=(edits['oh_limit']&&now<edits['oh_limit']); if(!(locks['oh_limit']&&now<locks['oh_limit']) && !editing) lim.value=(Number(j.shutdown_c)||80).toFixed(0); toggleDirty(lim,'oh_limit'); } const sc=$('sel_cpu'); if(sc && !(locks['cpu_freq']&&now<locks['cpu_freq'])){ sc.value=j.cpu_mhz; } const currentValid=(j.current_valid&&typeof j.current_c==='number'&&isFinite(j.current_c)); const cur=$('therm_now'); if(cur) cur.textContent=currentValid?j.current_c.toFixed(1)+' °C':'N/A'; const max=$('therm_max'); if(max){ const maxValid=(typeof j.max_c==='number'&&isFinite(j.max_c)); max.textContent=maxValid?j.max_c.toFixed(1)+' °C':'N/A'; } const cpu=$('therm_cpu'); if(cpu) cpu.textContent=j.cpu_mhz+' MHz'; const status=$('therm_status'); if(status){ if(j.sensor_fault){ status.innerHTML='<span class=warn>'+L.therm_status_sensor_fault+'</span>'; } else if(j.latched_persist){ status.innerHTML='<span class=warn>'+L.therm_status_latched_persist+'</span>'; } else if(!j.protection_enabled){ status.innerHTML='<span class=bad>'+L.therm_status_disabled+'</span>'; } else if(j.manual_restart || j.latched){ status.innerHTML='<span class=warn>'+L.therm_status_latched+'</span>'; } else { status.innerHTML='<span class=ok>'+L.therm_status_ready+'</span>'; } } const latchRow=$('row_therm_latch'); const latchMsg=$('txt_therm_latch'); const latchBtn=$('btn_therm_clear'); if(latchRow){ if(j.latched_persist){ latchRow.style.display=''; if(latchMsg) latchMsg.textContent=L.therm_latch_notice; if(latchBtn){ latchBtn.textContent=L.therm_clear_btn; latchBtn.disabled=false; } } else { latchRow.style.display='none'; if(latchBtn){ latchBtn.disabled=true; } } } const last=$('therm_last'); if(last){ if(j.sensor_fault){ last.textContent=L.therm_last_sensor_fault; } else if(j.last_trip_ts && j.last_trip_ts.length){ let msg=L.therm_last_fmt; const temp=(typeof j.last_trip_c==='number'&&isFinite(j.last_trip_c)&&j.last_trip_c>0)?j.last_trip_c.toFixed(1):'0'; const limit=(Number(j.shutdown_c)||0).toFixed(0); const ts=j.last_trip_ts||L.therm_time_unknown; const ago=j.last_trip_since||L.therm_time_ago_unknown; msg=msg.replace('%TEMP%',temp).replace('%LIMIT%',limit).replace('%TIME%',ts).replace('%AGO%',ago); last.textContent=msg; if(j.latched_persist){ last.textContent+=' — '+L.therm_status_latched_persist; } else if(j.manual_restart){ last.textContent+=' — '+L.therm_status_latched; } } else if(j.last_reason && j.last_reason.length){ last.textContent=j.last_reason; } else { last.textContent=L.therm_last_none; } } })}"
+"let wfCtx=null,wfCanvas=null,wfLastSeq=0;"
+"function wfColor(v){const x=Math.max(0,Math.min(255,v|0)); if(x<64) return [0,0,x*2]; if(x<128) return [0,(x-64)*4,255]; if(x<192) return [(x-128)*4,255,255-(x-128)*4]; return [255,255-(x-192)*4,0];}"
+"function drawWaterfallRow(bins){ if(!wfCanvas){ wfCanvas=$('wf'); if(!wfCanvas) return; wfCtx=wfCanvas.getContext('2d'); } if(!wfCtx) return; const w=wfCanvas.width,h=wfCanvas.height,n=bins.length||32; const row=wfCtx.getImageData(0,0,w,h-1); wfCtx.putImageData(row,0,1); const img=wfCtx.createImageData(w,1); for(let x=0;x<w;x++){ const bi=Math.min(n-1,Math.floor((x/w)*n)); const c=wfColor(bins[bi]||0); const o=x*4; img.data[o]=c[0]; img.data[o+1]=c[1]; img.data[o+2]=c[2]; img.data[o+3]=255; } wfCtx.putImageData(img,0,0); }"
+"function loadFft(){fetch('/api/fft',{cache:'no-store'}).then(r=>r.json()).then(j=>{ if(!j||!j.bins) return; if(j.seq===wfLastSeq) return; wfLastSeq=j.seq; drawWaterfallRow(j.bins); const hz=$('wf_hz'); if(hz && j.max_hz) hz.textContent='0-'+Math.round(j.max_hz)+' Hz'; }).catch(()=>{});}"
 "function loadLogs(){fetch('/api/logs',{cache:'no-store'}).then(r=>r.text()).then(t=>{ const lg=$('logs'); lg.textContent=t; lg.scrollTop=lg.scrollHeight; })}"
 "function loadAll(){loadStatus();loadAudio();loadPerf();loadTherm();loadLogs()}"
 "function clearThermalLatch(){ const btn=$('btn_therm_clear'); if(btn) btn.disabled=true; fetch('/api/thermal/clear',{method:'POST',cache:'no-store'}).then(r=>r.json()).then(j=>{ if(!j.ok){ console.warn('Thermal latch clear rejected'); } loadAll(); }).catch(()=>loadAll());}"
 "setInterval(loadAll,3000);"
+"setInterval(loadFft,500);"
         "const sel=document.getElementById('langSel'); sel.value=lang; sel.onchange=()=>{lang=sel.value;localStorage.setItem('lang',lang);applyLang()}; applyLang();"
         "bindSaver($('in_rate'),'rate'); bindSaver($('in_gain'),'gain'); bindSaver($('in_shift'),'shift'); bindSaver($('in_thr'),'min_rate'); bindSaver($('in_chk'),'check_interval'); bindSaver($('in_hours'),'reset_hours'); bindSaver($('in_hp_cutoff'),'hp_cutoff');"
         "trackEdit($('in_rate'),'rate'); trackEdit($('in_gain'),'gain'); trackEdit($('in_shift'),'shift'); trackEdit($('in_thr'),'min_rate'); trackEdit($('in_chk'),'check_interval'); trackEdit($('in_hours'),'reset_hours'); trackEdit($('in_hp_cutoff'),'hp_cutoff');"
@@ -305,6 +313,7 @@ static String htmlIndex() {
         "const H=(hid,rid)=>{const h=$(hid), r=$(rid); if(h&&r){ h.onclick=()=>{ r.style.display = (r.style.display==='none'||!r.style.display)?'block':'none'; }; }};"
 "H('h_led','row_led_hint'); H('h_rate','row_rate_hint'); H('h_gain','row_gain_hint'); H('h_hpf','row_hpf_hint'); H('h_hpf_cut','row_hpf_cut_hint'); H('h_agc','row_agc_hint'); H('h_buf','row_buf_hint'); H('h_auto','row_auto_hint'); H('h_thr','row_thr_hint'); H('h_thr_mode','row_thrmode_hint'); H('h_chk','row_chk_hint'); H('h_sched','row_sched_hint'); H('h_hours','row_hours_hint'); H('h_tx','row_tx_hint'); H('h_shift','row_shift_hint'); H('h_cpu','row_cpu_hint'); H('h_level','row_level_hint'); H('h_therm_protect','row_therm_hint_protect'); H('h_therm_limit','row_therm_hint_limit');"
         "loadAll();"
+"loadFft();"
         "</script></body></html>");
     return h;
 }
@@ -372,10 +381,29 @@ static void httpAudioStatus() {
     json += "\"i2s_raw_peak\":" + String(i2sLastRawPeakAbs) + ",";
     json += "\"i2s_raw_rms\":" + String(i2sLastRawRms) + ",";
     json += "\"i2s_raw_zero_pct\":" + String(i2sLastRawZeroPct) + ",";
+    json += "\"i2s_unsigned_pcm\":" + String(i2sLikelyUnsignedPcm?"true":"false") + ",";
     bool likelyFlatline = (i2sLastRawPeakAbs < 8) || ((i2sLastRawMin == i2sLastRawMax) && i2sLastSamplesRead > 0) || (i2sLastRawZeroPct > 98);
     json += "\"i2s_link_ok\":" + String(likelyFlatline?"false":"true") + ",";
-    json += "\"i2s_hint\":\"" + jsonEscape(likelyFlatline ? "Mic data looks flat/near-zero. Check CLK/DATA wiring, GND, and 3V3. For Unit PDM use CLK=G1 and DATA=G2." : "Raw mic signal is changing; I2S link appears active.") + "\"";
+    String i2sHint;
+    if (likelyFlatline) {
+        i2sHint = "Mic data looks flat/near-zero. Check CLK/DATA wiring, GND, and 3V3. For Unit PDM use CLK=G1 and DATA=G2.";
+    } else if (i2sLikelyUnsignedPcm) {
+        i2sHint = "Mic signal is active (unsigned PCM detected). Firmware auto-normalizes this format before streaming.";
+    } else {
+        i2sHint = "Raw mic signal is changing; I2S link appears active.";
+    }
+    json += "\"i2s_hint\":\"" + jsonEscape(i2sHint) + "\"";
     json += "}";
+    apiSendJSON(json);
+}
+
+static void httpFft() {
+    String json = "{\"seq\":" + String(fftFrameSeq) + ",\"bins\":[";
+    for (int i = 0; i < 32; i++) {
+        if (i) json += ",";
+        json += String((uint32_t)fftBins[i]);
+    }
+    json += "],\"sample_rate\":" + String(currentSampleRate) + ",\"max_hz\":" + String((float)currentSampleRate * 0.5f, 1) + "}";
     apiSendJSON(json);
 }
 
@@ -513,6 +541,7 @@ void webui_begin() {
     web.on("/", httpIndex);
     web.on("/api/status", httpStatus);
     web.on("/api/audio_status", httpAudioStatus);
+    web.on("/api/fft", httpFft);
     web.on("/api/perf_status", httpPerfStatus);
     web.on("/api/thermal", httpThermal);
     web.on("/api/thermal/clear", HTTP_POST, httpThermalClear);
