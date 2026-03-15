@@ -1,6 +1,6 @@
-# M5Stack Atom Echo — RTSP Microphone for BirdNET-Go
+# AtomS3 Lite + Unit Mini PDM — RTSP Microphone for BirdNET-Go
 
-A high-quality RTSP audio streaming server for the **M5Stack Atom Echo**, streaming live audio to [BirdNET-Go](https://github.com/tphakala/birdnet-go) or any RTSP-compatible client.
+A high-quality RTSP audio streaming server for the **AtomS3 Lite + Unit Mini PDM**, streaming live audio to [BirdNET-Go](https://github.com/tphakala/birdnet-go) or any RTSP-compatible client.
 
 <p align="left">
   <img src="https://shop.m5stack.com/cdn/shop/files/3_e4ea519e-765f-4f30-aad1-7855ff9f8744_1200x1200.jpg" alt="M5Stack Atom Echo" width="300">
@@ -11,7 +11,7 @@ A high-quality RTSP audio streaming server for the **M5Stack Atom Echo**, stream
 ## Features
 
 - **Dual-core architecture** — Core 1 handles full audio pipeline, Core 0 handles Web UI and RTSP negotiation
-- **mDNS discovery** — `atomecho.local`, no IP needed
+- **mDNS discovery** — `atoms3mic.local`, no IP needed
 - **Web UI** — configure settings, view signal levels, logs, and diagnostics
 - **AGC** — automatic gain control for varying bird distances
 - **High-pass filter** — 2nd-order Butterworth (default 300Hz) removes wind/traffic
@@ -32,20 +32,20 @@ On first boot, connect to the `ESP32-RTSP-Mic-AP` access point and configure you
 
 ### 3. Stream
 ```bash
-vlc rtsp://atomecho.local:8554/audio
+vlc rtsp://atoms3mic.local:8554/audio
 # or
-ffplay -rtsp_transport tcp rtsp://atomecho.local:8554/audio
+ffplay -rtsp_transport tcp rtsp://atoms3mic.local:8554/audio
 ```
 
-**BirdNET-Go**: set audio source to `rtsp://atomecho.local:8554/audio`
+**BirdNET-Go**: set audio source to `rtsp://atoms3mic.local:8554/audio`
 
-**Web UI**: `http://atomecho.local/`
+**Web UI**: `http://atoms3mic.local/`
 
 ## Recommended Settings
 
 | Setting | Default | Notes |
 |---------|---------|-------|
-| Sample Rate | 16000 Hz | Optimal for PDM on Atom Echo |
+| Sample Rate | 16000 Hz | Optimal for Unit Mini PDM |
 | Gain | 3.0x | Good for outdoor use |
 | AGC | OFF | Enable for varying bird distances |
 | High-Pass | ON, 300 Hz | Removes rumble, keeps bird calls |
@@ -75,7 +75,6 @@ pio device monitor -b 115200 # Serial monitor
 ```ini
 lib_deps =
     tzapu/WiFiManager @ ^2.0.17
-    m5stack/M5Atom @ ^0.1.3
     fastled/FastLED @ ^3.10.3
 ```
 
@@ -87,5 +86,5 @@ lib_deps =
 
 This project is largely based on [birdnetgo-esp32-rtsp-mic](https://github.com/Sukecz/birdnetgo-esp32-rtsp-mic) by [@Sukecz](https://github.com/Sukecz) — thank you for the excellent foundation!
 
-- M5Stack for the Atom Echo hardware
+- M5Stack for AtomS3 Lite and Unit Mini PDM hardware
 - [BirdNET-Go](https://github.com/tphakala/birdnet-go) community
