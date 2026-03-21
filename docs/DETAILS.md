@@ -91,17 +91,24 @@ Core 1 **exclusively owns** the WiFiClient socket during streaming — Core 0 ne
 
 ### Audio Clipping / Distortion
 1. Decrease gain
-2. Enable AGC (fast attack prevents clipping)
-3. Check signal level — aim for 30–70%
+2. Start around 1.0x manual gain for hot PDM mics
+3. Enable AGC only after manual gain is in a sane range
+4. Check signal level — aim for 30–70%
 
 ### First Connection Fails
 Some RTSP clients (VLC) probe the server on first connect. The second connection works immediately.
 
+### VLC / RTSP Transport
+- The firmware serves **RTP interleaved over RTSP/TCP**.
+- If a client insists on UDP transport, SETUP is rejected so the failure is explicit instead of half-connecting and stalling.
+- Prefer `ffplay -rtsp_transport tcp ...` for testing and force TCP in VLC when possible.
+
 ### Stream Drops / Connection Issues
 1. Check WiFi signal strength (RSSI > -70 dBm)
 2. Increase buffer size to 2048 or 4096
-3. Enable auto recovery
-4. Reduce WiFi TX power if causing interference
+3. Keep gain conservative; constant clipping can sound like choppy/echoy transport failure
+4. Enable auto recovery
+5. Reduce WiFi TX power if causing interference
 
 ### Reachable RTSP but Nearly Silent Audio
 If the client can reach `:8554` and `/api/audio_status` is updating, transport is healthy.
