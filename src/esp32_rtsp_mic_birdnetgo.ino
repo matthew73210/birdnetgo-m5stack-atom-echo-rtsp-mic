@@ -772,6 +772,20 @@ static uint16_t computeI2sDmaBufferLen() {
     return dmaBufLen;
 }
 
+static uint8_t computeI2sDmaBufferCount() {
+    return 8;
+}
+
+static uint16_t computeI2sReadBufferSamples() {
+    // ESP-IDF guidance for polling reads is to make the application read buffer
+    // larger than the total DMA ring so a read cycle can fully drain capture.
+    const uint32_t dmaRingSamples = (uint32_t)computeI2sDmaBufferLen() * (uint32_t)computeI2sDmaBufferCount();
+    uint32_t readSamples = dmaRingSamples + computeI2sDmaBufferLen();
+    if (readSamples < effectiveAudioChunkSize()) readSamples = effectiveAudioChunkSize();
+    if (readSamples > WEB_AUDIO_MAX_SAMPLES) readSamples = WEB_AUDIO_MAX_SAMPLES;
+    return (uint16_t)readSamples;
+}
+
 // Compute recommended minimum packet-rate threshold based on the effective stream chunk size
 uint32_t computeRecommendedMinRate() {
     uint32_t buf = max((uint16_t)1, effectiveAudioChunkSize());
@@ -1030,8 +1044,9 @@ void audioCaptureTask(void* parameter) {
     uint32_t packetCount = 0;
 
     const uint16_t chunkSamples = effectiveAudioChunkSize();
-    int16_t* captureBuffer = (int16_t*)malloc(chunkSamples * sizeof(int16_t));
-    int16_t* outputBuffer = (int16_t*)malloc(chunkSamples * sizeof(int16_t));
+    const uint16_t readBufferSamples = computeI2sReadBufferSamples();
+    int16_t* captureBuffer = (int16_t*)malloc(readBufferSamples * sizeof(int16_t));
+    int16_t* outputBuffer = (int16_t*)malloc(readBufferSamples * sizeof(int16_t));
 
     if (!captureBuffer || !outputBuffer) {
         Serial.println("[Core1] FATAL: Failed to allocate audio buffers!");
@@ -1065,8 +1080,8 @@ void audioCaptureTask(void* parameter) {
     unsigned long lastLedUpdate = 0;
     unsigned long lastGoodCaptureMs = millis();
     int16_t lastOutputSample = 0;
-    const TickType_t readTimeoutTicks = pdMS_TO_TICKS(max(20UL, min(100UL,
-        ((unsigned long)chunkSamples * 1000UL) / max((uint32_t)1, currentSampleRate) + 10UL)));
+    const TickType_t readTimeoutTicks = pdMS_TO_TICKS(max(20UL, min(200UL,
+        ((unsigned long)readBufferSamples * 1000UL) / max((uint32_t)1, currentSampleRate) + 10UL)));
 
     while (audioTaskRunning) {
         // Check if Core 0 requested us to stop streaming
@@ -1103,7 +1118,7 @@ void audioCaptureTask(void* parameter) {
 
         // Read from I2S with a cadence-aware timeout so concealment can kick in
         esp_err_t result = i2s_read(I2S_NUM_0, captureBuffer,
-                                    chunkSamples * sizeof(int16_t),
+                                    readBufferSamples * sizeof(int16_t),
                                     &bytesRead, readTimeoutTicks);
         unsigned long processStartUs = micros();
 
@@ -1538,7 +1553,7 @@ void setup_i2s_driver() {
     i2s_driver_uninstall(I2S_NUM_0);
 
     const uint16_t dma_buf_len = computeI2sDmaBufferLen();
-    const uint8_t dma_buf_count = 8;
+    const uint8_t dma_buf_count = computeI2sDmaBufferCount();
 
     i2s_config_t i2s_config = {
         // PDM mode for Unit Mini PDM microphone
@@ -1577,6 +1592,7 @@ void setup_i2s_driver() {
                   String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
                   " (chunk " + String(effectiveAudioChunkSize()) + ")" +
                   ", dma " + String(dma_buf_count) + "x" + String(dma_buf_len) +
+                  ", read " + String(computeI2sReadBufferSamples()) +
                   ", shiftBits " + String(i2sShiftBits));
 }
 
