@@ -26,7 +26,7 @@ SemaphoreHandle_t taskExitSemaphore = NULL;  // confirmed task exit
 volatile bool core1OwnsLED = false;          // LED ownership flag
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "2.5.0"
+#define FW_VERSION "2.6.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 static const uint16_t OTA_PORT = 3232;
@@ -139,20 +139,28 @@ const float AGC_ATTACK_RATE = 0.05f;   // Fast attack (gain reduction) per buffe
 const float AGC_RELEASE_RATE = 0.001f; // Slow release (gain increase) per buffer
 
 // -- Adaptive background-noise filter (auto gate/bed suppression)
+// Tuned to avoid the old "tap tap tap" artifact caused by per-sample gain pumping.
 volatile bool noiseFilterEnabled = true;
 volatile float noiseFloorDbfs = -90.0f;
 volatile float noiseGateDbfs = -90.0f;
 volatile float noiseReductionDb = 0.0f;
 const float NOISE_FLOOR_INIT = 300.0f;
-const float NOISE_FLOOR_FAST = 0.08f;
-const float NOISE_FLOOR_SLOW = 0.003f;
-const float NOISE_GATE_RATIO = 2.8f;
-const float NOISE_GATE_MARGIN = 180.0f;
+const float NOISE_FLOOR_FAST = 0.015f;
+const float NOISE_FLOOR_SLOW = 0.0008f;
+const float NOISE_GATE_RATIO = 2.6f;
+const float NOISE_GATE_MARGIN = 220.0f;
 const float NOISE_GATE_MIN = 220.0f;
 const float NOISE_GATE_MAX = 5200.0f;
-const float NOISE_FILTER_MIN_GAIN = 0.18f;
-const float NOISE_FILTER_ATTACK = 0.35f;
-const float NOISE_FILTER_RELEASE = 0.04f;
+const float NOISE_GATE_CLOSE_RATIO = 0.72f;
+const float NOISE_FILTER_MIN_GAIN = 0.55f;
+const float NOISE_FILTER_ATTACK = 0.006f;
+const float NOISE_FILTER_RELEASE = 0.0008f;
+const float NOISE_ENV_ATTACK = 0.010f;
+const float NOISE_ENV_RELEASE = 0.0012f;
+const uint16_t NOISE_GATE_HOLD_MS = 120;
+const char* DEVICE_TITLE = "M5 Atom RTSP Microphone";
+const char* DEVICE_INPUT_PROFILE = "PDM input profile (AtomS3 Lite + Unit Mini PDM tuned)";
+const char* FILTER_CHAIN_BASE = "Input normalize -> 2nd-order Butterworth high-pass -> adaptive noise bed suppressor -> manual gain -> limiter -> optional AGC";
 
 // -- High-pass filter (biquad) to cut low-frequency rumble
 struct Biquad {
@@ -269,6 +277,24 @@ void applyWifiTxPower(bool log = true) {
             simplePrintln("WiFi TX power set to " + String(wifiPowerLevelToDbm(currentWifiPowerLevel), 1) + " dBm");
         }
     }
+}
+
+String describeHardwareProfile() {
+    return String(DEVICE_TITLE) + " / " + DEVICE_INPUT_PROFILE;
+}
+
+String describeFilterChain() {
+    String chain = FILTER_CHAIN_BASE;
+    chain += highpassEnabled
+        ? (String(" (HPF ON @ ") + String(highpassCutoffHz) + " Hz)")
+        : String(" (HPF bypassed)");
+    chain += noiseFilterEnabled
+        ? String(", noise suppressor active")
+        : String(", noise suppressor bypassed");
+    chain += agcEnabled
+        ? String(", AGC active")
+        : String(", AGC bypassed");
+    return chain;
 }
 
 // Recompute HPF coefficients (2nd-order Butterworth high-pass)
@@ -908,6 +934,8 @@ void audioCaptureTask(void* parameter) {
     float localNoiseFloor = NOISE_FLOOR_INIT;
     float localNoiseGate = max(NOISE_GATE_MIN, localNoiseFloor * NOISE_GATE_RATIO + NOISE_GATE_MARGIN);
     float localNoiseGain = 1.0f;
+    float localNoiseEnv = 0.0f;
+    uint32_t localNoiseGateHoldSamples = 0;
     float localNoiseReduction = 0.0f;
     const float LIMITER_TARGET_PEAK = 26000.0f;  // ~79% FS to keep headroom and reduce harsh clipping
     const float LIMITER_RELEASE = 0.02f;         // Slow recovery keeps ambience stable instead of pumping
@@ -1041,18 +1069,34 @@ void audioCaptureTask(void* parameter) {
 
             float sampleAbs = fabsf(sample);
             if (noiseFilterEnabled) {
-                float follow = (sampleAbs <= localNoiseGate) ? NOISE_FLOOR_FAST : NOISE_FLOOR_SLOW;
-                localNoiseFloor += (sampleAbs - localNoiseFloor) * follow;
+                float envSlew = (sampleAbs > localNoiseEnv) ? NOISE_ENV_ATTACK : NOISE_ENV_RELEASE;
+                localNoiseEnv += (sampleAbs - localNoiseEnv) * envSlew;
+
+                float floorFollow = (localNoiseEnv <= localNoiseGate) ? NOISE_FLOOR_FAST : NOISE_FLOOR_SLOW;
+                localNoiseFloor += (localNoiseEnv - localNoiseFloor) * floorFollow;
                 if (localNoiseFloor < 0.0f) localNoiseFloor = 0.0f;
                 localNoiseGate = localNoiseFloor * NOISE_GATE_RATIO + NOISE_GATE_MARGIN;
                 if (localNoiseGate < NOISE_GATE_MIN) localNoiseGate = NOISE_GATE_MIN;
                 if (localNoiseGate > NOISE_GATE_MAX) localNoiseGate = NOISE_GATE_MAX;
 
+                uint32_t holdSamples = ((uint32_t)currentSampleRate * NOISE_GATE_HOLD_MS) / 1000UL;
+                if (holdSamples < 1) holdSamples = 1;
+
+                if (localNoiseEnv >= localNoiseGate) {
+                    localNoiseGateHoldSamples = holdSamples;
+                } else if (localNoiseGateHoldSamples > 0) {
+                    localNoiseGateHoldSamples--;
+                }
+
                 float desiredNoiseGain = 1.0f;
-                if (sampleAbs < localNoiseGate && localNoiseGate > 1.0f) {
-                    float normalized = sampleAbs / localNoiseGate;
+                float closeThreshold = localNoiseGate * NOISE_GATE_CLOSE_RATIO;
+                if (localNoiseGateHoldSamples == 0 && localNoiseGate > 1.0f && localNoiseEnv < closeThreshold) {
+                    float normalized = localNoiseEnv / closeThreshold;
+                    if (normalized < 0.0f) normalized = 0.0f;
+                    if (normalized > 1.0f) normalized = 1.0f;
                     desiredNoiseGain = NOISE_FILTER_MIN_GAIN + (1.0f - NOISE_FILTER_MIN_GAIN) * normalized * normalized;
                 }
+
                 float noiseSlew = (desiredNoiseGain < localNoiseGain) ? NOISE_FILTER_ATTACK : NOISE_FILTER_RELEASE;
                 localNoiseGain += (desiredNoiseGain - localNoiseGain) * noiseSlew;
                 if (localNoiseGain < NOISE_FILTER_MIN_GAIN) localNoiseGain = NOISE_FILTER_MIN_GAIN;
@@ -1061,6 +1105,8 @@ void audioCaptureTask(void* parameter) {
                 localNoiseReduction = 20.0f * log10f(max(localNoiseGain, 0.0001f));
             } else {
                 localNoiseGain = 1.0f;
+                localNoiseEnv = 0.0f;
+                localNoiseGateHoldSamples = 0;
                 localNoiseReduction = 0.0f;
             }
 
