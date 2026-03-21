@@ -13,6 +13,7 @@ extern uint32_t rtpTimestamp;
 extern unsigned long lastStatsReset;
 extern unsigned long lastRtspPlayMs;
 extern uint32_t rtspPlayCount;
+extern const char* currentRtspTransportName();
 extern unsigned long lastRtspClientConnectMs;
 extern unsigned long bootTime;
 extern unsigned long lastRTSPActivity;
@@ -441,6 +442,7 @@ static void httpStatus() {
     json += "\"current_rate_pkt_s\":" + String(currentRate) + ",";
     json += "\"last_rtsp_connect\":\"" + jsonEscape(formatSince(lastRtspClientConnectMs)) + "\",";
     json += "\"last_stream_start\":\"" + jsonEscape(formatSince(lastRtspPlayMs)) + "\",";
+    json += "\"rtsp_transport\":\"" + String(currentRtspTransportName()) + "\",";
     json += "\"hardware_profile\":\"" + jsonEscape(describeHardwareProfile()) + "\"";
     json += "}";
     apiSendJSON(json);
@@ -466,7 +468,7 @@ static void httpAudioStatus() {
     json += "\"noise_gate_dbfs\":" + String(noiseGateDbfs, 1) + ",";
     json += "\"noise_reduction_db\":" + String(noiseReductionDb, 1) + ",";
     json += "\"filter_chain\":\"" + jsonEscape(describeFilterChain()) + "\",";
-    json += "\"filter_detail\":\"Adaptive suppressor follows an envelope with hold to avoid tapping artifacts when the gate closes.\",";
+    json += "\"filter_detail\":\"Adaptive suppressor follows an envelope with hold, then reopens faster on fresh onsets so short chirps are not shaved after a quiet gap.\",";
     json += "\"audio_pipeline_load_pct\":" + String(audioPipelineLoadPct, 1) + ",";
     json += "\"i2s_fallback_blocks\":" + String(audioFallbackBlockCount) + ",";
     json += "\"i2s_last_gap_ms\":" + String(i2sLastGapMs) + ",";

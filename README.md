@@ -45,9 +45,11 @@ On first boot, connect to the `ESP32-RTSP-Mic-AP` access point and configure you
 vlc rtsp://atoms3mic.local:8554/audio
 # or
 ffplay -rtsp_transport tcp rtsp://atoms3mic.local:8554/audio
+# or request UDP / RTP unicast
+ffplay -rtsp_transport udp rtsp://atoms3mic.local:8554/audio
 ```
 
-This firmware currently supports **RTSP interleaved over TCP** only. If VLC is used, force TCP transport in the client settings or CLI.
+This firmware now supports both **RTSP interleaved over TCP** and **RTP/AVP over UDP unicast**. Most clients can choose with their normal RTSP transport option (`-rtsp_transport tcp|udp`, VLC transport preference, BirdNET-Go/ffmpeg input flags).
 
 **BirdNET-Go**: set audio source to `rtsp://atoms3mic.local:8554/audio`
 
@@ -64,7 +66,7 @@ The live path is now:
 `input normalize -> 2nd-order Butterworth high-pass -> adaptive noise suppressor -> manual gain -> limiter -> optional AGC`
 
 - **High-pass filter**: 2nd-order Butterworth, about **12 dB/octave**, default **450 Hz**.
-- **Adaptive noise suppressor**: follows the signal envelope instead of raw per-sample peaks, then adds a short hold time before closing the gate. This is specifically to reduce the repeated **tap / drop / tap, especially when capture cadence faltered** artifact that could happen when the meter and noise gate fell together.
+- **Adaptive noise suppressor**: follows the signal envelope instead of raw per-sample peaks, adds a short hold time before closing the gate, then reopens quickly on fresh onsets so short chirps or speech attacks are not dulled after a quiet gap. This is specifically to reduce the repeated **tap / drop / tap, especially when capture cadence faltered** artifact without shaving the first tens of milliseconds of intermittent calls.
 - **Limiter**: keeps sudden peaks below the harsh clipping region.
 - **AGC**: optional final stage that rides overall level slowly after the main cleanup stages.
 
