@@ -9,10 +9,10 @@
 
 ### Pin Configuration
 ```cpp
-I2S_BCLK_PIN    = 19  // Bit Clock
-I2S_LRCLK_PIN   = 33  // Left-Right Clock / Word Select
-I2S_DATA_IN_PIN = 23  // Microphone Data Input (PDM)
-I2S_DATA_OUT_PIN = 22 // Speaker Data Output (not used)
+I2S_CLK_PIN     = 33  // Microphone clock
+I2S_DATA_IN_PIN = 23  // Microphone data
+WS2812_LED_PIN  = 27  // Built-in RGB LED
+// G19 / G22 / G23 / G33 are reserved by the Atom Echo audio path
 ```
 
 ## Architecture
@@ -100,7 +100,7 @@ Some RTSP clients (VLC) probe the server on first connect. The second connection
 
 ### VLC / RTSP Transport
 - The firmware serves **RTP interleaved over RTSP/TCP**.
-- If a client insists on UDP transport, SETUP is rejected so the failure is explicit instead of half-connecting and stalling.
+- Many clients work best when they are explicitly told to use TCP transport.
 - Prefer `ffplay -rtsp_transport tcp ...` for testing and force TCP in VLC when possible.
 
 ### Stream Drops / Connection Issues
