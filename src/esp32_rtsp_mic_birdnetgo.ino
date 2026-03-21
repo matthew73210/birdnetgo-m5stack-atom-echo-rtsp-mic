@@ -113,6 +113,9 @@ volatile uint16_t i2sLastRawPeakAbs = 0;
 volatile uint16_t i2sLastRawRms = 0;
 volatile uint16_t i2sLastRawZeroPct = 0;
 volatile bool i2sLikelyUnsignedPcm = false;
+volatile uint32_t audioFallbackBlockCount = 0;
+volatile uint32_t i2sLastGapMs = 0;
+volatile float audioPipelineLoadPct = 0.0f;
 
 // -- Lightweight spectrum diagnostics for Web UI waterfall
 volatile uint8_t fftBins[32] = {0};
@@ -125,6 +128,15 @@ volatile uint16_t webAudioFrameSamples = 0;
 volatile uint32_t webAudioSampleRate = DEFAULT_SAMPLE_RATE;
 static const uint16_t WEB_AUDIO_MAX_SAMPLES = 2048;
 int16_t webAudioFrame[WEB_AUDIO_MAX_SAMPLES] = {0};
+
+// -- Lightweight telemetry history for Web UI graphs
+portMUX_TYPE telemetryMux = portMUX_INITIALIZER_UNLOCKED;
+static const uint16_t TELEMETRY_HISTORY_LEN = 120;
+volatile uint32_t telemetryHistorySeq = 0;
+uint8_t telemetryCpuLoadPct[TELEMETRY_HISTORY_LEN] = {0};
+int16_t telemetryTempDeciC[TELEMETRY_HISTORY_LEN] = {0};
+uint16_t telemetryHistoryHead = 0;
+uint16_t telemetryHistoryCount = 0;
 
 // -- LED mode: 0=off, 1=static, 2=level
 uint8_t ledMode = 1;  // Default: static purple during streaming
@@ -187,6 +199,7 @@ unsigned long lastMemoryCheck = 0;
 unsigned long lastPerformanceCheck = 0;
 unsigned long lastWiFiCheck = 0;
 unsigned long lastTempCheck = 0;
+unsigned long lastTelemetrySampleMs = 0;
 uint32_t minFreeHeap = 0xFFFFFFFF;
 uint32_t maxPacketRate = 0;
 uint32_t minPacketRate = 0xFFFFFFFF;
@@ -295,6 +308,29 @@ String describeFilterChain() {
         ? String(", AGC active")
         : String(", AGC bypassed");
     return chain;
+}
+
+static void fillConcealmentBlock(int16_t* buffer, uint16_t samples, int16_t lastSample) {
+    if (!buffer || samples == 0) return;
+    for (uint16_t i = 0; i < samples; ++i) {
+        float remain = 1.0f - ((float)(i + 1) / (float)samples);
+        if (remain < 0.0f) remain = 0.0f;
+        buffer[i] = (int16_t)((float)lastSample * remain);
+    }
+}
+
+void recordTelemetrySample(float cpuLoadPct, float tempC, bool tempValid) {
+    if (cpuLoadPct < 0.0f) cpuLoadPct = 0.0f;
+    if (cpuLoadPct > 100.0f) cpuLoadPct = 100.0f;
+    int16_t tempDeci = tempValid ? (int16_t)lroundf(tempC * 10.0f) : INT16_MIN;
+
+    portENTER_CRITICAL(&telemetryMux);
+    telemetryCpuLoadPct[telemetryHistoryHead] = (uint8_t)lroundf(cpuLoadPct);
+    telemetryTempDeciC[telemetryHistoryHead] = tempDeci;
+    telemetryHistoryHead = (telemetryHistoryHead + 1) % TELEMETRY_HISTORY_LEN;
+    if (telemetryHistoryCount < TELEMETRY_HISTORY_LEN) telemetryHistoryCount++;
+    telemetryHistorySeq++;
+    portEXIT_CRITICAL(&telemetryMux);
 }
 
 // Recompute HPF coefficients (2nd-order Butterworth high-pass)
@@ -944,6 +980,10 @@ void audioCaptureTask(void* parameter) {
     uint32_t i2sErrors = 0;
     unsigned long lastStatsLog = millis();
     unsigned long lastLedUpdate = 0;
+    unsigned long lastGoodCaptureMs = millis();
+    int16_t lastOutputSample = 0;
+    const TickType_t readTimeoutTicks = pdMS_TO_TICKS(max(20UL, min(100UL,
+        ((unsigned long)chunkSamples * 1000UL) / max((uint32_t)1, currentSampleRate) + 10UL)));
 
     while (audioTaskRunning) {
         // Check if Core 0 requested us to stop streaming
@@ -977,10 +1017,11 @@ void audioCaptureTask(void* parameter) {
             lastStatsLog = millis();
         }
 
-        // Read from I2S with 100ms timeout (allows clean task exit)
+        // Read from I2S with a cadence-aware timeout so concealment can kick in
         esp_err_t result = i2s_read(I2S_NUM_0, captureBuffer,
                                     chunkSamples * sizeof(int16_t),
-                                    &bytesRead, pdMS_TO_TICKS(100));
+                                    &bytesRead, readTimeoutTicks);
+        unsigned long processStartUs = micros();
 
         if (result != ESP_OK || bytesRead == 0) {
             if (result != ESP_OK) {
@@ -995,11 +1036,30 @@ void audioCaptureTask(void* parameter) {
             } else {
                 i2sReadZeroCount++;
             }
+
+            if (streamActive) {
+                audioFallbackBlockCount++;
+                i2sLastGapMs = millis() - lastGoodCaptureMs;
+                fillConcealmentBlock(outputBuffer, chunkSamples, lastOutputSample);
+                lastOutputSample = outputBuffer[chunkSamples - 1];
+                lastPeakAbs16 = (uint16_t)abs((int)outputBuffer[0]);
+                audioClippedLastBlock = false;
+                sendRTPPacket(*client, outputBuffer, chunkSamples);
+                packetCount++;
+
+                float blockMs = (1000.0f * (float)chunkSamples) / max((float)currentSampleRate, 1.0f);
+                float workMs = (float)(micros() - processStartUs) / 1000.0f;
+                float instLoad = (blockMs > 0.0f) ? (workMs * 100.0f / blockMs) : 0.0f;
+                if (instLoad > 100.0f) instLoad = 100.0f;
+                audioPipelineLoadPct += (instLoad - audioPipelineLoadPct) * 0.20f;
+            }
             continue;
         }
 
         consecutiveErrors = 0;
         i2sReadOkCount++;
+        lastGoodCaptureMs = millis();
+        i2sLastGapMs = 0;
         uint16_t samplesRead = bytesRead / sizeof(int16_t);
         i2sLastSamplesRead = samplesRead;
 
@@ -1127,6 +1187,9 @@ void audioCaptureTask(void* parameter) {
             if (amplified < -32768.0f) amplified = -32768.0f;
             outputBuffer[i] = (int16_t)amplified;
         }
+        if (samplesRead > 0) {
+            lastOutputSample = outputBuffer[samplesRead - 1];
+        }
 
         // Publish latest processed frame for browser WebAudio endpoint
         uint16_t publishSamples = samplesRead;
@@ -1241,6 +1304,12 @@ void audioCaptureTask(void* parameter) {
             sendRTPPacket(*client, outputBuffer, samplesRead);
             packetCount++;
         }
+
+        float blockMs = (1000.0f * (float)max((uint16_t)1, samplesRead)) / max((float)currentSampleRate, 1.0f);
+        float workMs = (float)(micros() - processStartUs) / 1000.0f;
+        float instLoad = (blockMs > 0.0f) ? (workMs * 100.0f / blockMs) : 0.0f;
+        if (instLoad > 100.0f) instLoad = 100.0f;
+        audioPipelineLoadPct += (instLoad - audioPipelineLoadPct) * 0.15f;
 
         // Process incoming RTSP commands during streaming (~every 200ms)
         // Keeps all socket I/O on Core 1 during streaming
@@ -1683,6 +1752,9 @@ void setup() {
 
     // (4) seed for random(): combination of time and unique MAC
     randomSeed((uint32_t)micros() ^ (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF));
+    for (uint16_t i = 0; i < TELEMETRY_HISTORY_LEN; ++i) {
+        telemetryTempDeciC[i] = INT16_MIN;
+    }
 
     bootTime = millis(); // Store boot time
     rtpSSRC = (uint32_t)random(1, 0x7FFFFFFF);
@@ -1827,9 +1899,14 @@ void loop() {
     webui_handleClient();
     ArduinoOTA.handle();
 
-    if (millis() - lastTempCheck > 60000) { // 1 min
+    if (millis() - lastTempCheck > 5000) { // 5 s
         checkTemperature();
         lastTempCheck = millis();
+    }
+
+    if (millis() - lastTelemetrySampleMs > 3000) {
+        recordTelemetrySample(audioPipelineLoadPct, lastTemperatureC, lastTemperatureValid);
+        lastTelemetrySampleMs = millis();
     }
 
     // Heap monitoring (every 10 minutes — useful for detecting leaks in long deployments)

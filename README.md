@@ -12,7 +12,7 @@ A high-quality RTSP audio streaming server for **M5 Atom-class ESP32 devices**, 
 
 - **Dual-core architecture** — Core 1 handles full audio pipeline, Core 0 handles Web UI and RTSP negotiation
 - **mDNS discovery** — `atoms3mic.local` (default; use the hostname shown in boot logs if customized), no IP needed
-- **Web UI** — configure settings, view signal levels, logs, and diagnostics
+- **Web UI** — configure settings, view signal levels, logs, diagnostics, realtime audio-load graph, and temperature history
 - **AGC** — automatic gain control for varying bird distances
 - **Adaptive noise filter** — auto-learns the background noise floor, uses an envelope follower plus hold-time, and suppresses steady hiss / HVAC / room tone without the old tap-tap gain pumping
 - **High-pass filter** — 2nd-order Butterworth (default 450Hz) removes wind/traffic
@@ -64,7 +64,7 @@ The live path is now:
 `input normalize -> 2nd-order Butterworth high-pass -> adaptive noise suppressor -> manual gain -> limiter -> optional AGC`
 
 - **High-pass filter**: 2nd-order Butterworth, about **12 dB/octave**, default **450 Hz**.
-- **Adaptive noise suppressor**: follows the signal envelope instead of raw per-sample peaks, then adds a short hold time before closing the gate. This is specifically to reduce the repeated **tap / drop / tap** artifact that could happen when the meter and noise gate fell together.
+- **Adaptive noise suppressor**: follows the signal envelope instead of raw per-sample peaks, then adds a short hold time before closing the gate. This is specifically to reduce the repeated **tap / drop / tap, especially when capture cadence faltered** artifact that could happen when the meter and noise gate fell together.
 - **Limiter**: keeps sudden peaks below the harsh clipping region.
 - **AGC**: optional final stage that rides overall level slowly after the main cleanup stages.
 
@@ -173,3 +173,8 @@ This project is largely based on [birdnetgo-esp32-rtsp-mic](https://github.com/S
 ## Atom Echo note
 
 This firmware is now less hard-coded to the AtomS3 branding in the UI/API, but the actual capture backend is still **ESP32 PDM receive mode**. That matches the Unit Mini PDM path well. **Atom Echo** hardware uses a different audio frontend (codec/I2S rather than the same raw PDM mic path), so making it truly plug-and-play will require a separate codec profile/backend instead of only changing pin labels.
+
+
+## If tapping is still present
+
+This firmware does **not** toggle a microphone-enable GPIO during normal capture. If you still hear tapping that lines up with meter drops, the more likely cause is a brief **I2S read gap / underrun**. This build now keeps RTP cadence alive with a short concealment block instead of skipping a packet, and the Web UI exposes fallback counts plus realtime load/temperature graphs so you can correlate the taps with capture stalls or CPU spikes.
