@@ -137,10 +137,10 @@ volatile uint32_t fftFrameSeq = 0;
 // -- Browser WebAudio diagnostics stream (latest processed PCM block)
 portMUX_TYPE webAudioMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint32_t webAudioFrameSeq = 0;
-volatile uint16_t webAudioFrameSamples = 0;
-volatile uint32_t webAudioSampleRate = DEFAULT_SAMPLE_RATE;
-static const uint16_t WEB_AUDIO_MAX_SAMPLES = 2048;
-int16_t webAudioFrame[WEB_AUDIO_MAX_SAMPLES] = {0};
+volatile uint16_t webAudioFrameSamples[WEB_AUDIO_RING_LEN] = {0};
+volatile uint32_t webAudioSampleRate[WEB_AUDIO_RING_LEN] = {0};
+volatile uint32_t webAudioRingSeq[WEB_AUDIO_RING_LEN] = {0};
+int16_t webAudioFrame[WEB_AUDIO_RING_LEN][WEB_AUDIO_MAX_SAMPLES] = {{0}};
 
 // -- Lightweight telemetry history for Web UI graphs
 portMUX_TYPE telemetryMux = portMUX_INITIALIZER_UNLOCKED;
@@ -1285,10 +1285,13 @@ void audioCaptureTask(void* parameter) {
         uint16_t publishSamples = samplesRead;
         if (publishSamples > WEB_AUDIO_MAX_SAMPLES) publishSamples = WEB_AUDIO_MAX_SAMPLES;
         portENTER_CRITICAL(&webAudioMux);
-        memcpy(webAudioFrame, outputBuffer, publishSamples * sizeof(int16_t));
-        webAudioFrameSamples = publishSamples;
-        webAudioSampleRate = currentSampleRate;
-        webAudioFrameSeq++;
+        uint32_t nextWebAudioSeq = webAudioFrameSeq + 1U;
+        uint8_t webAudioSlot = (uint8_t)((nextWebAudioSeq - 1U) % WEB_AUDIO_RING_LEN);
+        memcpy(webAudioFrame[webAudioSlot], outputBuffer, publishSamples * sizeof(int16_t));
+        webAudioFrameSamples[webAudioSlot] = publishSamples;
+        webAudioSampleRate[webAudioSlot] = currentSampleRate;
+        webAudioRingSeq[webAudioSlot] = nextWebAudioSeq;
+        webAudioFrameSeq = nextWebAudioSeq;
         portEXIT_CRITICAL(&webAudioMux);
 
         // Update spectrum diagnostics from processed output (throttled)

@@ -1,6 +1,9 @@
 #pragma once
 #include <Arduino.h>
 
+static const uint16_t WEB_AUDIO_MAX_SAMPLES = 2048;
+static const uint8_t WEB_AUDIO_RING_LEN = 8;
+
 // Web UI (ESP32 RTSP Mic for BirdNET-Go): initialization and request handling
 void webui_begin();
 void webui_handleClient();
