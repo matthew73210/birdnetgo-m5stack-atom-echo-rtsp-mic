@@ -1731,6 +1731,8 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         // better compatibility: include actual IP
         sdp += "c=IN IP4 " + ip + "\r\n";
         sdp += "t=0 0\r\n";
+        sdp += "a=control:*\r\n";
+        sdp += "a=range:npt=0-\r\n";
         sdp += "m=audio 0 RTP/AVP 96\r\n";
         sdp += "a=rtpmap:96 L16/" + String(currentSampleRate) + "/1\r\n";
         sdp += "a=control:track1\r\n";
@@ -1794,10 +1796,13 @@ void handleRTSPCommand(WiFiClient &client, String request) {
 
     } else if (request.startsWith("PLAY")) {
         // Send PLAY response FIRST (still on Core 0, Core 1 not started yet)
+        String ip = WiFi.localIP().toString();
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
         client.print("Session: " + rtspSessionId + "\r\n");
-        client.print("Range: npt=0.000-\r\n\r\n");
+        client.print("Range: npt=0.000-\r\n");
+        client.print("RTP-Info: url=rtsp://" + ip + ":8554/audio/track1;seq=" + String(rtpSequence) +
+                     ";rtptime=" + String(rtpTimestamp) + "\r\n\r\n");
 
         rtpSequence = 0;
         rtpTimestamp = 0;
