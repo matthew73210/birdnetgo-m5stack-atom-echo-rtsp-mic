@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
+#include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include "driver/i2s.h"
@@ -15,6 +16,11 @@
 
 // Pointer handoff: Core 0 sets on PLAY, Core 1 uses for streaming, clears on failure
 WiFiClient* volatile streamClient = NULL;
+
+enum RtspTransportMode : uint8_t {
+    RTSP_TRANSPORT_TCP_INTERLEAVED = 0,
+    RTSP_TRANSPORT_UDP_UNICAST = 1,
+};
 TaskHandle_t audioCaptureTaskHandle = NULL;
 volatile bool audioTaskRunning = false;
 
@@ -74,6 +80,13 @@ uint16_t rtpSequence = 0;
 uint32_t rtpTimestamp = 0;
 uint32_t rtpSSRC = 0x43215678;
 unsigned long lastRTSPActivity = 0;
+RtspTransportMode activeRtspTransport = RTSP_TRANSPORT_TCP_INTERLEAVED;
+WiFiUDP rtpUdp;
+IPAddress rtspUdpClientIp;
+uint16_t rtspUdpClientRtpPort = 0;
+uint16_t rtspUdpClientRtcpPort = 0;
+static const uint16_t RTP_UDP_SERVER_PORT = 6970;
+static const uint16_t RTCP_UDP_SERVER_PORT = 6971;
 
 // -- Buffers
 uint8_t rtspParseBuffer[1024];
@@ -167,6 +180,7 @@ const float NOISE_GATE_CLOSE_RATIO = 0.72f;
 const float NOISE_FILTER_MIN_GAIN = 0.55f;
 const float NOISE_FILTER_ATTACK = 0.006f;
 const float NOISE_FILTER_RELEASE = 0.0008f;
+const float NOISE_FILTER_REOPEN = 0.0035f;
 const float NOISE_ENV_ATTACK = 0.010f;
 const float NOISE_ENV_RELEASE = 0.0012f;
 const uint16_t NOISE_GATE_HOLD_MS = 120;
@@ -243,6 +257,57 @@ uint32_t rtspConnectCount = 0;
 uint32_t rtspPlayCount = 0;
 
 // ===============================================
+
+static const char* rtspTransportModeName(RtspTransportMode mode) {
+    switch (mode) {
+        case RTSP_TRANSPORT_UDP_UNICAST: return "udp";
+        case RTSP_TRANSPORT_TCP_INTERLEAVED:
+        default: return "tcp";
+    }
+}
+
+const char* currentRtspTransportName() {
+    return rtspTransportModeName(activeRtspTransport);
+}
+
+static String extractRtspHeader(const String &request, const char* headerName) {
+    String needle = String("\r\n") + headerName;
+    int start = request.indexOf(needle);
+    if (start < 0 && request.startsWith(String(headerName))) {
+        start = 0;
+    } else if (start >= 0) {
+        start += 2;
+    }
+    if (start < 0) return String("");
+    int colon = request.indexOf(':', start);
+    if (colon < 0) return String("");
+    int end = request.indexOf("\r\n", colon);
+    if (end < 0) end = request.length();
+    String value = request.substring(colon + 1, end);
+    value.trim();
+    return value;
+}
+
+static bool parseRtspClientPorts(const String &transportHeader, uint16_t &rtpPort, uint16_t &rtcpPort) {
+    int idx = transportHeader.indexOf("client_port=");
+    if (idx < 0) return false;
+    idx += 12;
+    int end = idx;
+    while (end < transportHeader.length()) {
+        char c = transportHeader[end];
+        if ((c < '0' || c > '9') && c != '-') break;
+        end++;
+    }
+    String ports = transportHeader.substring(idx, end);
+    int dash = ports.indexOf('-');
+    if (dash < 0) return false;
+    int p0 = ports.substring(0, dash).toInt();
+    int p1 = ports.substring(dash + 1).toInt();
+    if (p0 <= 0 || p0 > 65535 || p1 <= 0 || p1 > 65535) return false;
+    rtpPort = (uint16_t)p0;
+    rtcpPort = (uint16_t)p1;
+    return true;
+}
 
 // Helper: convert WiFi power enum to dBm (for logs)
 float wifiPowerLevelToDbm(wifi_power_t lvl) {
@@ -992,6 +1057,7 @@ void audioCaptureTask(void* parameter) {
             if (client) {
                 client->stop();
             }
+            rtpUdp.stop();
             streamClient = NULL;
             isStreaming = false;
             core1OwnsLED = false;
@@ -1129,6 +1195,7 @@ void audioCaptureTask(void* parameter) {
 
             float sampleAbs = fabsf(sample);
             if (noiseFilterEnabled) {
+                float prevNoiseEnv = localNoiseEnv;
                 float envSlew = (sampleAbs > localNoiseEnv) ? NOISE_ENV_ATTACK : NOISE_ENV_RELEASE;
                 localNoiseEnv += (sampleAbs - localNoiseEnv) * envSlew;
 
@@ -1157,7 +1224,12 @@ void audioCaptureTask(void* parameter) {
                     desiredNoiseGain = NOISE_FILTER_MIN_GAIN + (1.0f - NOISE_FILTER_MIN_GAIN) * normalized * normalized;
                 }
 
+                bool onsetDetected = (sampleAbs > prevNoiseEnv) &&
+                                    ((localNoiseGateHoldSamples > 0) || (localNoiseEnv >= closeThreshold));
                 float noiseSlew = (desiredNoiseGain < localNoiseGain) ? NOISE_FILTER_ATTACK : NOISE_FILTER_RELEASE;
+                if (desiredNoiseGain >= 0.999f && localNoiseGain < 0.999f && onsetDetected) {
+                    noiseSlew = NOISE_FILTER_REOPEN;
+                }
                 localNoiseGain += (desiredNoiseGain - localNoiseGain) * noiseSlew;
                 if (localNoiseGain < NOISE_FILTER_MIN_GAIN) localNoiseGain = NOISE_FILTER_MIN_GAIN;
                 if (localNoiseGain > 1.0f) localNoiseGain = 1.0f;
@@ -1511,6 +1583,7 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
     if (!client.connected()) {
         // Client disconnected — Core 1 owns the socket, close it
         client.stop();
+        rtpUdp.stop();
         streamClient = NULL;
         isStreaming = false;
         core1OwnsLED = false;
@@ -1524,13 +1597,6 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
         const uint16_t payloadSize = (uint16_t)(packetSamples * (int)sizeof(int16_t));
         const uint16_t packetSize = (uint16_t)(12 + payloadSize);
         const unsigned long packetWindowMs = max(40UL, min(140UL, (unsigned long)(((uint32_t)packetSamples * 1000UL) / max((uint32_t)1, currentSampleRate)) * 2UL));
-
-        // RTSP interleaved header: '$' 0x24, channel 0, length
-        uint8_t inter[4];
-        inter[0] = 0x24;
-        inter[1] = 0x00;
-        inter[2] = (uint8_t)((packetSize >> 8) & 0xFF);
-        inter[3] = (uint8_t)(packetSize & 0xFF);
 
         // RTP header (12 bytes)
         uint8_t header[12];
@@ -1555,9 +1621,25 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
             packetAudio[i] = (int16_t)s;
         }
 
-        bool success = writeAll(client, inter, sizeof(inter), packetWindowMs) &&
-                       writeAll(client, header, sizeof(header), packetWindowMs) &&
-                       writeAll(client, (uint8_t*)packetAudio, payloadSize, packetWindowMs);
+        bool success = false;
+        if (activeRtspTransport == RTSP_TRANSPORT_UDP_UNICAST) {
+            success = (rtspUdpClientRtpPort != 0) && rtpUdp.beginPacket(rtspUdpClientIp, rtspUdpClientRtpPort) == 1;
+            if (success) {
+                success = (rtpUdp.write(header, sizeof(header)) == sizeof(header)) &&
+                          (rtpUdp.write((uint8_t*)packetAudio, payloadSize) == payloadSize) &&
+                          rtpUdp.endPacket() == 1;
+            }
+        } else {
+            // RTSP interleaved header: '$' 0x24, channel 0, length
+            uint8_t inter[4];
+            inter[0] = 0x24;
+            inter[1] = 0x00;
+            inter[2] = (uint8_t)((packetSize >> 8) & 0xFF);
+            inter[3] = (uint8_t)(packetSize & 0xFF);
+            success = writeAll(client, inter, sizeof(inter), packetWindowMs) &&
+                      writeAll(client, header, sizeof(header), packetWindowMs) &&
+                      writeAll(client, (uint8_t*)packetAudio, payloadSize, packetWindowMs);
+        }
 
         if (success) {
             rtpSequence++;
@@ -1574,6 +1656,7 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
                 Serial.printf("[Core1] %u consecutive write failures, disconnecting\n", consecutiveWriteFailures);
                 consecutiveWriteFailures = 0;
                 client.stop();
+                rtpUdp.stop();
                 streamClient = NULL;
                 isStreaming = false;
                 core1OwnsLED = false;
@@ -1627,12 +1710,51 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         if (rtspSessionId.length() == 0) {
             rtspSessionId = String(random(100000000, 999999999));
         }
+
+        String transport = extractRtspHeader(request, "Transport");
+        String transportLower = transport;
+        transportLower.toLowerCase();
+        bool wantsTcp = transportLower.indexOf("rtp/avp/tcp") >= 0 || transportLower.indexOf("interleaved=") >= 0;
+        bool wantsUdp = transportLower.indexOf("rtp/avp") >= 0 && transportLower.indexOf("client_port=") >= 0 && transportLower.indexOf("rtp/avp/tcp") < 0;
+
+        activeRtspTransport = RTSP_TRANSPORT_TCP_INTERLEAVED;
+        rtspUdpClientIp = client.remoteIP();
+        rtspUdpClientRtpPort = 0;
+        rtspUdpClientRtcpPort = 0;
+
+        if (wantsUdp) {
+            uint16_t clientRtp = 0;
+            uint16_t clientRtcp = 0;
+            if (!parseRtspClientPorts(transportLower, clientRtp, clientRtcp)) {
+                client.print("RTSP/1.0 461 Unsupported Transport\r\n");
+                client.print("CSeq: " + cseq + "\r\n\r\n");
+                return;
+            }
+            activeRtspTransport = RTSP_TRANSPORT_UDP_UNICAST;
+            rtspUdpClientRtpPort = clientRtp;
+            rtspUdpClientRtcpPort = clientRtcp;
+            rtpUdp.stop();
+            rtpUdp.begin(RTP_UDP_SERVER_PORT);
+        } else if (!wantsTcp && transport.length() > 0) {
+            client.print("RTSP/1.0 461 Unsupported Transport\r\n");
+            client.print("CSeq: " + cseq + "\r\n\r\n");
+            return;
+        }
+
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
         // Large timeout reduces ffmpeg keepalive frequency (keepalive sent at timeout/2)
         client.print("Session: " + rtspSessionId + ";timeout=86400\r\n");
-        client.print("Transport: RTP/AVP/TCP;unicast;interleaved=0-1;mode=\"PLAY\";ssrc=" +
-                     String(rtpSSRC, HEX) + "\r\n\r\n");
+        if (activeRtspTransport == RTSP_TRANSPORT_UDP_UNICAST) {
+            client.print("Transport: RTP/AVP;unicast;client_port=" + String(rtspUdpClientRtpPort) + "-" +
+                         String(rtspUdpClientRtcpPort) + ";server_port=" + String(RTP_UDP_SERVER_PORT) + "-" +
+                         String(RTCP_UDP_SERVER_PORT) + ";ssrc=" + String(rtpSSRC, HEX) + ";mode=\"PLAY\"\r\n\r\n");
+            simplePrintln("RTSP SETUP using UDP transport to " + rtspUdpClientIp.toString() + ":" + String(rtspUdpClientRtpPort));
+        } else {
+            client.print("Transport: RTP/AVP/TCP;unicast;interleaved=0-1;mode=\"PLAY\";ssrc=" +
+                         String(rtpSSRC, HEX) + "\r\n\r\n");
+            simplePrintln("RTSP SETUP using TCP interleaved transport");
+        }
 
     } else if (request.startsWith("PLAY")) {
         // Send PLAY response FIRST (still on Core 0, Core 1 not started yet)
@@ -1663,7 +1785,7 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         startAudioCaptureTask();
 
         // Core 1 now owns LED during streaming
-        simplePrintln("STREAMING STARTED");
+        simplePrintln("STREAMING STARTED via " + String(rtspTransportModeName(activeRtspTransport)));
 
     } else if (request.startsWith("TEARDOWN")) {
         // Stop streaming FIRST — Core 1 owns the socket during streaming
@@ -1934,6 +2056,7 @@ void loop() {
         if (millis() - lastRTSPActivity > 60000) {
             simplePrintln("RTSP idle timeout — disconnecting");
             rtspClient.stop();
+            rtpUdp.stop();
             rtspParseBufferPos = 0;
         }
     }
