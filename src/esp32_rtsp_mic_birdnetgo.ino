@@ -137,10 +137,10 @@ volatile uint32_t fftFrameSeq = 0;
 // -- Browser WebAudio diagnostics stream (latest processed PCM block)
 portMUX_TYPE webAudioMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint32_t webAudioFrameSeq = 0;
-volatile uint16_t webAudioFrameSamples = 0;
-volatile uint32_t webAudioSampleRate = DEFAULT_SAMPLE_RATE;
-static const uint16_t WEB_AUDIO_MAX_SAMPLES = 2048;
-int16_t webAudioFrame[WEB_AUDIO_MAX_SAMPLES] = {0};
+volatile uint16_t webAudioFrameSamples[WEB_AUDIO_RING_LEN] = {0};
+volatile uint32_t webAudioSampleRate[WEB_AUDIO_RING_LEN] = {0};
+volatile uint32_t webAudioRingSeq[WEB_AUDIO_RING_LEN] = {0};
+int16_t webAudioFrame[WEB_AUDIO_RING_LEN][WEB_AUDIO_MAX_SAMPLES] = {{0}};
 
 // -- Lightweight telemetry history for Web UI graphs
 portMUX_TYPE telemetryMux = portMUX_INITIALIZER_UNLOCKED;
@@ -754,6 +754,38 @@ uint16_t effectiveAudioChunkSize() {
     return chunk;
 }
 
+static uint16_t computeI2sDmaBufferLen() {
+    // Fixed 60-sample DMA blocks are fine at 16 kHz, but at 48 kHz they only provide
+    // ~7.5 ms of total capture slack and force a lot of interrupt churn. That makes
+    // the stream sound choppy even when average CPU usage still looks low.
+    uint16_t dmaBufLen = (uint16_t)(effectiveAudioChunkSize() / 4U);
+
+    if (currentSampleRate >= 48000) {
+        if (dmaBufLen < 256) dmaBufLen = 256;
+    } else if (currentSampleRate >= 32000) {
+        if (dmaBufLen < 192) dmaBufLen = 192;
+    } else if (dmaBufLen < 128) {
+        dmaBufLen = 128;
+    }
+
+    if (dmaBufLen > 512) dmaBufLen = 512;
+    return dmaBufLen;
+}
+
+static uint8_t computeI2sDmaBufferCount() {
+    return 8;
+}
+
+static uint16_t computeI2sReadBufferSamples() {
+    // ESP-IDF guidance for polling reads is to make the application read buffer
+    // larger than the total DMA ring so a read cycle can fully drain capture.
+    const uint32_t dmaRingSamples = (uint32_t)computeI2sDmaBufferLen() * (uint32_t)computeI2sDmaBufferCount();
+    uint32_t readSamples = dmaRingSamples + computeI2sDmaBufferLen();
+    if (readSamples < effectiveAudioChunkSize()) readSamples = effectiveAudioChunkSize();
+    if (readSamples > WEB_AUDIO_MAX_SAMPLES) readSamples = WEB_AUDIO_MAX_SAMPLES;
+    return (uint16_t)readSamples;
+}
+
 // Compute recommended minimum packet-rate threshold based on the effective stream chunk size
 uint32_t computeRecommendedMinRate() {
     uint32_t buf = max((uint16_t)1, effectiveAudioChunkSize());
@@ -1012,8 +1044,9 @@ void audioCaptureTask(void* parameter) {
     uint32_t packetCount = 0;
 
     const uint16_t chunkSamples = effectiveAudioChunkSize();
-    int16_t* captureBuffer = (int16_t*)malloc(chunkSamples * sizeof(int16_t));
-    int16_t* outputBuffer = (int16_t*)malloc(chunkSamples * sizeof(int16_t));
+    const uint16_t readBufferSamples = computeI2sReadBufferSamples();
+    int16_t* captureBuffer = (int16_t*)malloc(readBufferSamples * sizeof(int16_t));
+    int16_t* outputBuffer = (int16_t*)malloc(readBufferSamples * sizeof(int16_t));
 
     if (!captureBuffer || !outputBuffer) {
         Serial.println("[Core1] FATAL: Failed to allocate audio buffers!");
@@ -1047,8 +1080,8 @@ void audioCaptureTask(void* parameter) {
     unsigned long lastLedUpdate = 0;
     unsigned long lastGoodCaptureMs = millis();
     int16_t lastOutputSample = 0;
-    const TickType_t readTimeoutTicks = pdMS_TO_TICKS(max(20UL, min(100UL,
-        ((unsigned long)chunkSamples * 1000UL) / max((uint32_t)1, currentSampleRate) + 10UL)));
+    const TickType_t readTimeoutTicks = pdMS_TO_TICKS(max(20UL, min(200UL,
+        ((unsigned long)readBufferSamples * 1000UL) / max((uint32_t)1, currentSampleRate) + 10UL)));
 
     while (audioTaskRunning) {
         // Check if Core 0 requested us to stop streaming
@@ -1085,7 +1118,7 @@ void audioCaptureTask(void* parameter) {
 
         // Read from I2S with a cadence-aware timeout so concealment can kick in
         esp_err_t result = i2s_read(I2S_NUM_0, captureBuffer,
-                                    chunkSamples * sizeof(int16_t),
+                                    readBufferSamples * sizeof(int16_t),
                                     &bytesRead, readTimeoutTicks);
         unsigned long processStartUs = micros();
 
@@ -1267,10 +1300,13 @@ void audioCaptureTask(void* parameter) {
         uint16_t publishSamples = samplesRead;
         if (publishSamples > WEB_AUDIO_MAX_SAMPLES) publishSamples = WEB_AUDIO_MAX_SAMPLES;
         portENTER_CRITICAL(&webAudioMux);
-        memcpy(webAudioFrame, outputBuffer, publishSamples * sizeof(int16_t));
-        webAudioFrameSamples = publishSamples;
-        webAudioSampleRate = currentSampleRate;
-        webAudioFrameSeq++;
+        uint32_t nextWebAudioSeq = webAudioFrameSeq + 1U;
+        uint8_t webAudioSlot = (uint8_t)((nextWebAudioSeq - 1U) % WEB_AUDIO_RING_LEN);
+        memcpy(webAudioFrame[webAudioSlot], outputBuffer, publishSamples * sizeof(int16_t));
+        webAudioFrameSamples[webAudioSlot] = publishSamples;
+        webAudioSampleRate[webAudioSlot] = currentSampleRate;
+        webAudioRingSeq[webAudioSlot] = nextWebAudioSeq;
+        webAudioFrameSeq = nextWebAudioSeq;
         portEXIT_CRITICAL(&webAudioMux);
 
         // Update spectrum diagnostics from processed output (throttled)
@@ -1516,8 +1552,8 @@ bool requestStreamStop(const char* reason) {
 void setup_i2s_driver() {
     i2s_driver_uninstall(I2S_NUM_0);
 
-    // DMA buffer configuration - smaller for lower latency with 16kHz
-    uint16_t dma_buf_len = 60;
+    const uint16_t dma_buf_len = computeI2sDmaBufferLen();
+    const uint8_t dma_buf_count = computeI2sDmaBufferCount();
 
     i2s_config_t i2s_config = {
         // PDM mode for Unit Mini PDM microphone
@@ -1531,7 +1567,7 @@ void setup_i2s_driver() {
         .communication_format = I2S_COMM_FORMAT_I2S,
 #endif
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 6,
+        .dma_buf_count = dma_buf_count,
         .dma_buf_len = dma_buf_len,
         .use_apll = false,
         .tx_desc_auto_clear = false,
@@ -1555,6 +1591,8 @@ void setup_i2s_driver() {
     simplePrintln("I2S ready (PDM mode): " + String(currentSampleRate) + "Hz, gain " +
                   String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
                   " (chunk " + String(effectiveAudioChunkSize()) + ")" +
+                  ", dma " + String(dma_buf_count) + "x" + String(dma_buf_len) +
+                  ", read " + String(computeI2sReadBufferSamples()) +
                   ", shiftBits " + String(i2sShiftBits));
 }
 
@@ -1597,36 +1635,35 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
         const uint16_t payloadSize = (uint16_t)(packetSamples * (int)sizeof(int16_t));
         const uint16_t packetSize = (uint16_t)(12 + payloadSize);
         const unsigned long packetWindowMs = max(40UL, min(140UL, (unsigned long)(((uint32_t)packetSamples * 1000UL) / max((uint32_t)1, currentSampleRate)) * 2UL));
+        uint8_t packetBuffer[12 + (1024 * sizeof(int16_t))];
 
-        // RTP header (12 bytes)
-        uint8_t header[12];
-        header[0] = 0x80;      // V=2, P=0, X=0, CC=0
-        header[1] = 96;        // M=0, PT=96 (dynamic)
-        header[2] = (uint8_t)((rtpSequence >> 8) & 0xFF);
-        header[3] = (uint8_t)(rtpSequence & 0xFF);
-        header[4] = (uint8_t)((rtpTimestamp >> 24) & 0xFF);
-        header[5] = (uint8_t)((rtpTimestamp >> 16) & 0xFF);
-        header[6] = (uint8_t)((rtpTimestamp >> 8) & 0xFF);
-        header[7] = (uint8_t)(rtpTimestamp & 0xFF);
-        header[8]  = (uint8_t)((rtpSSRC >> 24) & 0xFF);
-        header[9]  = (uint8_t)((rtpSSRC >> 16) & 0xFF);
-        header[10] = (uint8_t)((rtpSSRC >> 8) & 0xFF);
-        header[11] = (uint8_t)(rtpSSRC & 0xFF);
+        // RTP header (12 bytes) + network-order PCM payload in one contiguous buffer.
+        packetBuffer[0] = 0x80;      // V=2, P=0, X=0, CC=0
+        packetBuffer[1] = 96;        // M=0, PT=96 (dynamic)
+        packetBuffer[2] = (uint8_t)((rtpSequence >> 8) & 0xFF);
+        packetBuffer[3] = (uint8_t)(rtpSequence & 0xFF);
+        packetBuffer[4] = (uint8_t)((rtpTimestamp >> 24) & 0xFF);
+        packetBuffer[5] = (uint8_t)((rtpTimestamp >> 16) & 0xFF);
+        packetBuffer[6] = (uint8_t)((rtpTimestamp >> 8) & 0xFF);
+        packetBuffer[7] = (uint8_t)(rtpTimestamp & 0xFF);
+        packetBuffer[8]  = (uint8_t)((rtpSSRC >> 24) & 0xFF);
+        packetBuffer[9]  = (uint8_t)((rtpSSRC >> 16) & 0xFF);
+        packetBuffer[10] = (uint8_t)((rtpSSRC >> 8) & 0xFF);
+        packetBuffer[11] = (uint8_t)(rtpSSRC & 0xFF);
 
-        int16_t* packetAudio = audioData + offsetSamples;
-        // Host->network: per-sample byte-swap (16bit PCM L16 big-endian)
+        const int16_t* packetAudio = audioData + offsetSamples;
+        // Host->network: 16-bit PCM L16 big-endian payload immediately after the header.
         for (int i = 0; i < packetSamples; ++i) {
             uint16_t s = (uint16_t)packetAudio[i];
-            s = (uint16_t)((s << 8) | (s >> 8));
-            packetAudio[i] = (int16_t)s;
+            packetBuffer[12 + (i * 2)] = (uint8_t)((s >> 8) & 0xFF);
+            packetBuffer[12 + (i * 2) + 1] = (uint8_t)(s & 0xFF);
         }
 
         bool success = false;
         if (activeRtspTransport == RTSP_TRANSPORT_UDP_UNICAST) {
             success = (rtspUdpClientRtpPort != 0) && rtpUdp.beginPacket(rtspUdpClientIp, rtspUdpClientRtpPort) == 1;
             if (success) {
-                success = (rtpUdp.write(header, sizeof(header)) == sizeof(header)) &&
-                          (rtpUdp.write((uint8_t*)packetAudio, payloadSize) == payloadSize) &&
+                success = (rtpUdp.write(packetBuffer, packetSize) == packetSize) &&
                           rtpUdp.endPacket() == 1;
             }
         } else {
@@ -1637,8 +1674,7 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
             inter[2] = (uint8_t)((packetSize >> 8) & 0xFF);
             inter[3] = (uint8_t)(packetSize & 0xFF);
             success = writeAll(client, inter, sizeof(inter), packetWindowMs) &&
-                      writeAll(client, header, sizeof(header), packetWindowMs) &&
-                      writeAll(client, (uint8_t*)packetAudio, payloadSize, packetWindowMs);
+                      writeAll(client, packetBuffer, packetSize, packetWindowMs);
         }
 
         if (success) {

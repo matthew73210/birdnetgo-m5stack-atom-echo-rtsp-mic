@@ -78,9 +78,10 @@ extern volatile uint8_t fftBins[32];
 extern volatile uint32_t fftFrameSeq;
 extern portMUX_TYPE webAudioMux;
 extern volatile uint32_t webAudioFrameSeq;
-extern volatile uint16_t webAudioFrameSamples;
-extern volatile uint32_t webAudioSampleRate;
-extern int16_t webAudioFrame[];
+extern volatile uint16_t webAudioFrameSamples[WEB_AUDIO_RING_LEN];
+extern volatile uint32_t webAudioSampleRate[WEB_AUDIO_RING_LEN];
+extern volatile uint32_t webAudioRingSeq[WEB_AUDIO_RING_LEN];
+extern int16_t webAudioFrame[WEB_AUDIO_RING_LEN][WEB_AUDIO_MAX_SAMPLES];
 extern portMUX_TYPE telemetryMux;
 extern volatile uint32_t telemetryHistorySeq;
 extern uint8_t telemetryCpuLoadPct[];
@@ -88,6 +89,13 @@ extern int16_t telemetryTempDeciC[];
 extern uint16_t telemetryHistoryHead;
 extern uint16_t telemetryHistoryCount;
 static const uint16_t TELEMETRY_HISTORY_LEN = 120;
+
+struct WebAudioSnapshot {
+    uint32_t seq;
+    uint16_t samples;
+    uint32_t rate;
+    int16_t frame[WEB_AUDIO_MAX_SAMPLES];
+};
 
 // Local helper: snap requested Wi‑Fi TX power (dBm) to nearest supported step
 static float snapWifiTxDbm(float dbm) {
@@ -360,61 +368,103 @@ static String htmlStreamer() {
         ".meter{height:10px;border:1px solid #1b2745;border-radius:999px;background:#0a1224;overflow:hidden;margin:10px 0}"
         ".fill{height:100%;width:0;background:linear-gradient(90deg,#22c55e,#16a34a)} .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}"
         "</style></head><body><div class='card'><h2>Browser Web Streamer</h2>"
-        "<p class='muted'>This player uses the device's local PCM endpoint and plays it via WebAudio (no external iframe).</p>"
+        "<p class='muted'>This player uses a binary PCM endpoint with a short jitter buffer so browser playback stays smooth.</p>"
         "<div class='row'><button id='start'>Start audio</button><button id='stop'>Stop</button><span id='st' class='muted'>Idle</span></div>"
         "<div class='meter'><div id='m' class='fill'></div></div>"
         "<p class='muted'>Fallback RTSP URL: <span id='rtsp' class='mono'></span></p>"
         "<script>const rtsp='rtsp://'+location.hostname+':8554/audio';document.getElementById('rtsp').textContent=rtsp;"
-        "let ctx=null,running=false,lastSeq=0,nextT=0,timer=null;"
+        "let ctx=null,running=false,lastSeq=0,nextT=0,timer=null,inFlight=false;"
+        "const MIN_AHEAD=0.08,TARGET_AHEAD=0.18;"
         "function setStatus(t){document.getElementById('st').textContent=t;}"
         "function setMeter(p){document.getElementById('m').style.width=Math.max(0,Math.min(100,p))+'%';}"
-        "function playFrame(rate,samples){if(!ctx)ctx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:rate});"
+        "function schedulePull(ms){if(timer)clearTimeout(timer);timer=setTimeout(pull,ms);}"
+        "function playFrame(rate,samples){if(!ctx)ctx=new (window.AudioContext||window.webkitAudioContext)();"
         "const n=samples.length;if(!n)return;const b=ctx.createBuffer(1,n,rate);const d=b.getChannelData(0);let peak=0;"
         "for(let i=0;i<n;i++){const v=Math.max(-1,Math.min(1,samples[i]/32768));d[i]=v;const a=Math.abs(v);if(a>peak)peak=a;}"
-        "if(nextT<ctx.currentTime+0.05)nextT=ctx.currentTime+0.05;const src=ctx.createBufferSource();src.buffer=b;src.connect(ctx.destination);src.start(nextT);nextT+=n/rate;setMeter(peak*100);}"
-        "async function pull(){if(!running)return;try{const r=await fetch('/api/web_audio?since='+lastSeq,{cache:'no-store'});"
-        "if(r.status===204){timer=setTimeout(pull,60);return;}const j=await r.json();if(!j||!j.samples){timer=setTimeout(pull,60);return;}"
-        "lastSeq=j.seq||lastSeq;playFrame(j.rate||16000,j.samples);setStatus('Playing • '+(j.rate||16000)+' Hz');timer=setTimeout(pull,20);}"
-        "catch(e){setStatus('Waiting for audio…');timer=setTimeout(pull,250);}}"
-        "document.getElementById('start').onclick=async()=>{running=true;if(!ctx)ctx=new (window.AudioContext||window.webkitAudioContext)();if(ctx.state==='suspended')await ctx.resume();setStatus('Starting…');pull();};"
-        "document.getElementById('stop').onclick=()=>{running=false;if(timer)clearTimeout(timer);timer=null;setStatus('Stopped');setMeter(0);};"
+        "if(nextT<ctx.currentTime+MIN_AHEAD)nextT=ctx.currentTime+MIN_AHEAD;const src=ctx.createBufferSource();src.buffer=b;src.connect(ctx.destination);src.start(nextT);nextT+=n/rate;setMeter(peak*100);}"
+        "async function pull(){if(!running||inFlight)return;inFlight=true;try{const r=await fetch('/api/web_audio_pcm?since='+lastSeq,{cache:'no-store'});"
+        "if(r.status===204){inFlight=false;schedulePull(5);return;}if(!r.ok)throw new Error('HTTP '+r.status);"
+        "const seq=Number(r.headers.get('X-WebAudio-Seq')||'0');const rate=Number(r.headers.get('X-WebAudio-Rate')||'16000');"
+        "const samples=Number(r.headers.get('X-WebAudio-Samples')||'0');const buf=await r.arrayBuffer();let pcm=new Int16Array(buf);"
+        "if(samples>0&&samples<pcm.length)pcm=pcm.subarray(0,samples);if(!pcm.length){inFlight=false;schedulePull(5);return;}"
+        "lastSeq=seq||lastSeq;playFrame(rate,pcm);const ahead=Math.max(0,nextT-ctx.currentTime);setStatus('Playing • '+rate+' Hz • buffer '+Math.round(ahead*1000)+' ms');"
+        "inFlight=false;schedulePull(ahead<TARGET_AHEAD?0:15);}"
+        "catch(e){inFlight=false;setStatus('Waiting for audio…');schedulePull(120);}}"
+        "document.getElementById('start').onclick=async()=>{running=true;lastSeq=0;nextT=0;if(!ctx)ctx=new (window.AudioContext||window.webkitAudioContext)();if(ctx.state==='suspended')await ctx.resume();setStatus('Starting…');pull();};"
+        "document.getElementById('stop').onclick=()=>{running=false;inFlight=false;lastSeq=0;nextT=0;if(timer)clearTimeout(timer);timer=null;setStatus('Stopped');setMeter(0);};"
         "</script></div></body></html>");
     return h;
 }
 
 static void httpStreamer() { web.send(200, "text/html; charset=utf-8", htmlStreamer()); }
 
+static bool getWebAudioSnapshot(uint32_t since, WebAudioSnapshot& snapshot) {
+    bool ok = false;
+
+    portENTER_CRITICAL(&webAudioMux);
+    uint32_t newestSeq = webAudioFrameSeq;
+    if (newestSeq != 0) {
+        uint32_t oldestSeq = (newestSeq > WEB_AUDIO_RING_LEN) ? (newestSeq - WEB_AUDIO_RING_LEN + 1U) : 1U;
+        uint32_t targetSeq = (since == 0) ? newestSeq : (since + 1U);
+        if (targetSeq < oldestSeq) targetSeq = oldestSeq;
+        if (targetSeq <= newestSeq) {
+            uint8_t slot = (uint8_t)((targetSeq - 1U) % WEB_AUDIO_RING_LEN);
+            if (webAudioRingSeq[slot] == targetSeq) {
+                snapshot.seq = targetSeq;
+                snapshot.samples = webAudioFrameSamples[slot];
+                snapshot.rate = webAudioSampleRate[slot];
+                if (snapshot.samples > WEB_AUDIO_MAX_SAMPLES) snapshot.samples = WEB_AUDIO_MAX_SAMPLES;
+                memcpy(snapshot.frame, webAudioFrame[slot], snapshot.samples * sizeof(int16_t));
+                ok = (snapshot.samples > 0);
+            }
+        }
+    }
+    portEXIT_CRITICAL(&webAudioMux);
+
+    return ok;
+}
+
 static void httpWebAudio() {
     uint32_t since = 0;
     if (web.hasArg("since")) since = (uint32_t)web.arg("since").toInt();
 
-    static int16_t localFrame[2048];
-    uint32_t seq = 0;
-    uint16_t samples = 0;
-    uint32_t rate = 16000;
-
-    portENTER_CRITICAL(&webAudioMux);
-    seq = webAudioFrameSeq;
-    samples = webAudioFrameSamples;
-    rate = webAudioSampleRate;
-    if (samples > 2048) samples = 2048;
-    memcpy(localFrame, webAudioFrame, samples * sizeof(int16_t));
-    portEXIT_CRITICAL(&webAudioMux);
-
-    if (samples == 0 || seq == since) {
+    static WebAudioSnapshot snapshot;
+    if (!getWebAudioSnapshot(since, snapshot)) {
         web.send(204, "text/plain", "");
         return;
     }
 
     String json;
-    json.reserve(64 + (samples * 8));
-    json += "{\"seq\":" + String(seq) + ",\"rate\":" + String(rate) + ",\"samples\":[";
-    for (uint16_t i = 0; i < samples; i++) {
+    json.reserve(64 + (snapshot.samples * 8));
+    json += "{\"seq\":" + String(snapshot.seq) + ",\"rate\":" + String(snapshot.rate) + ",\"samples\":[";
+    for (uint16_t i = 0; i < snapshot.samples; i++) {
         if (i) json += ',';
-        json += String(localFrame[i]);
+        json += String(snapshot.frame[i]);
     }
     json += "]}";
     apiSendJSON(json);
+}
+
+static void httpWebAudioPcm() {
+    uint32_t since = 0;
+    if (web.hasArg("since")) since = (uint32_t)web.arg("since").toInt();
+
+    static WebAudioSnapshot snapshot;
+    if (!getWebAudioSnapshot(since, snapshot)) {
+        web.send(204, "text/plain", "");
+        return;
+    }
+
+    size_t payloadBytes = (size_t)snapshot.samples * sizeof(int16_t);
+    web.sendHeader("Cache-Control", "no-store");
+    web.sendHeader("X-WebAudio-Seq", String(snapshot.seq));
+    web.sendHeader("X-WebAudio-Rate", String(snapshot.rate));
+    web.sendHeader("X-WebAudio-Samples", String(snapshot.samples));
+    web.setContentLength(payloadBytes);
+    web.send(200, "application/octet-stream", "");
+    if (payloadBytes > 0) {
+        web.client().write((const uint8_t*)snapshot.frame, payloadBytes);
+    }
 }
 
 // HTTP handlery
@@ -684,6 +734,7 @@ void webui_begin() {
     web.on("/", httpIndex);
     web.on("/streamer", httpStreamer);
     web.on("/api/web_audio", httpWebAudio);
+    web.on("/api/web_audio_pcm", httpWebAudioPcm);
     web.on("/api/status", httpStatus);
     web.on("/api/audio_status", httpAudioStatus);
     web.on("/api/telemetry_history", httpTelemetryHistory);
