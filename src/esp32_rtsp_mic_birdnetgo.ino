@@ -25,14 +25,14 @@ SemaphoreHandle_t taskExitSemaphore = NULL;  // confirmed task exit
 volatile bool core1OwnsLED = false;          // LED ownership flag
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "2.3.2"
+#define FW_VERSION "2.4.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
 #define DEFAULT_SAMPLE_RATE 16000  // Unit Mini PDM / BirdNET-Go preferred rate
 #define DEFAULT_GAIN_FACTOR 1.0f
-#define DEFAULT_BUFFER_SIZE 2048   // 128ms @ 16kHz - safer default for VLC / weaker WiFi links
+#define DEFAULT_BUFFER_SIZE 1024   // 64ms @ 16kHz - lower default latency while keeping WiFi headroom
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
 #define DEFAULT_NETWORK_HOSTNAME "atoms3mic"
 // High-pass filter defaults (to remove low-frequency rumble)
@@ -134,6 +134,22 @@ const float AGC_MIN_MULT = 0.1f;
 const float AGC_MAX_MULT = 6.0f;       // Keep AGC from driving persistent background noise too hard
 const float AGC_ATTACK_RATE = 0.05f;   // Fast attack (gain reduction) per buffer
 const float AGC_RELEASE_RATE = 0.001f; // Slow release (gain increase) per buffer
+
+// -- Adaptive background-noise filter (auto gate/bed suppression)
+volatile bool noiseFilterEnabled = true;
+volatile float noiseFloorDbfs = -90.0f;
+volatile float noiseGateDbfs = -90.0f;
+volatile float noiseReductionDb = 0.0f;
+const float NOISE_FLOOR_INIT = 300.0f;
+const float NOISE_FLOOR_FAST = 0.08f;
+const float NOISE_FLOOR_SLOW = 0.003f;
+const float NOISE_GATE_RATIO = 2.8f;
+const float NOISE_GATE_MARGIN = 180.0f;
+const float NOISE_GATE_MIN = 220.0f;
+const float NOISE_GATE_MAX = 5200.0f;
+const float NOISE_FILTER_MIN_GAIN = 0.18f;
+const float NOISE_FILTER_ATTACK = 0.35f;
+const float NOISE_FILTER_RELEASE = 0.04f;
 
 // -- High-pass filter (biquad) to cut low-frequency rumble
 struct Biquad {
@@ -521,6 +537,7 @@ void loadAudioSettings() {
     highpassEnabled = audioPrefs.getBool("hpEnable", DEFAULT_HPF_ENABLED);
     highpassCutoffHz = (uint16_t)audioPrefs.getUInt("hpCutoff", DEFAULT_HPF_CUTOFF_HZ);
     agcEnabled = audioPrefs.getBool("agcEnable", false);
+    noiseFilterEnabled = audioPrefs.getBool("noiseFilter", true);
     if (!hasSampleRatePref) currentSampleRate = DEFAULT_SAMPLE_RATE;
     if (!hasGainPref) currentGainFactor = DEFAULT_GAIN_FACTOR;
     if (!hasBufferPref) currentBufferSize = DEFAULT_BUFFER_SIZE;
@@ -574,6 +591,7 @@ void saveAudioSettings() {
     audioPrefs.putBool("hpEnable", highpassEnabled);
     audioPrefs.putUInt("hpCutoff", (uint32_t)highpassCutoffHz);
     audioPrefs.putBool("agcEnable", agcEnabled);
+    audioPrefs.putBool("noiseFilter", noiseFilterEnabled);
     audioPrefs.putUChar("ledMode", ledMode);
     audioPrefs.putBool("ohEnable", overheatProtectionEnabled);
     uint32_t ohLimit = (uint32_t)(overheatShutdownC + 0.5f);
@@ -631,6 +649,10 @@ void resetToDefaultSettings() {
     highpassCutoffHz = DEFAULT_HPF_CUTOFF_HZ;
     agcEnabled = false;
     agcMultiplier = 1.0f;
+    noiseFilterEnabled = true;
+    noiseFloorDbfs = -90.0f;
+    noiseGateDbfs = -90.0f;
+    noiseReductionDb = 0.0f;
     ledMode = 1;
     overheatProtectionEnabled = DEFAULT_OVERHEAT_PROTECTION;
     overheatShutdownC = (float)DEFAULT_OVERHEAT_LIMIT_C;
@@ -797,9 +819,13 @@ void audioCaptureTask(void* parameter) {
     uint32_t localHpfConfigSampleRate = hpfConfigSampleRate;
     uint16_t localHpfConfigCutoff = hpfConfigCutoff;
 
-    // AGC and limiter state (local)
+    // AGC, limiter, and noise-filter state (local)
     float localAgcMult = 1.0f;
     float localLimiterGain = 1.0f;
+    float localNoiseFloor = NOISE_FLOOR_INIT;
+    float localNoiseGate = max(NOISE_GATE_MIN, localNoiseFloor * NOISE_GATE_RATIO + NOISE_GATE_MARGIN);
+    float localNoiseGain = 1.0f;
+    float localNoiseReduction = 0.0f;
     const float LIMITER_TARGET_PEAK = 26000.0f;  // ~79% FS to keep headroom and reduce harsh clipping
     const float LIMITER_RELEASE = 0.02f;         // Slow recovery keeps ambience stable instead of pumping
     const float LIMITER_MIN_GAIN = 0.20f;
@@ -884,7 +910,7 @@ void audioCaptureTask(void* parameter) {
             if (localLimiterGain > 1.0f) localLimiterGain = 1.0f;
         }
 
-        // Process audio: HPF, gain, limiter, clipping detection, RMS for AGC
+        // Process audio: HPF, adaptive noise filter, gain, limiter, clipping detection, RMS for AGC
         bool clipped = false;
         float peakAbs = 0.0f;
         float sumSquares = 0.0f;
@@ -928,6 +954,31 @@ void audioCaptureTask(void* parameter) {
 
             if (highpassEnabled) {
                 sample = localHpf.process(sample);
+            }
+
+            float sampleAbs = fabsf(sample);
+            if (noiseFilterEnabled) {
+                float follow = (sampleAbs <= localNoiseGate) ? NOISE_FLOOR_FAST : NOISE_FLOOR_SLOW;
+                localNoiseFloor += (sampleAbs - localNoiseFloor) * follow;
+                if (localNoiseFloor < 0.0f) localNoiseFloor = 0.0f;
+                localNoiseGate = localNoiseFloor * NOISE_GATE_RATIO + NOISE_GATE_MARGIN;
+                if (localNoiseGate < NOISE_GATE_MIN) localNoiseGate = NOISE_GATE_MIN;
+                if (localNoiseGate > NOISE_GATE_MAX) localNoiseGate = NOISE_GATE_MAX;
+
+                float desiredNoiseGain = 1.0f;
+                if (sampleAbs < localNoiseGate && localNoiseGate > 1.0f) {
+                    float normalized = sampleAbs / localNoiseGate;
+                    desiredNoiseGain = NOISE_FILTER_MIN_GAIN + (1.0f - NOISE_FILTER_MIN_GAIN) * normalized * normalized;
+                }
+                float noiseSlew = (desiredNoiseGain < localNoiseGain) ? NOISE_FILTER_ATTACK : NOISE_FILTER_RELEASE;
+                localNoiseGain += (desiredNoiseGain - localNoiseGain) * noiseSlew;
+                if (localNoiseGain < NOISE_FILTER_MIN_GAIN) localNoiseGain = NOISE_FILTER_MIN_GAIN;
+                if (localNoiseGain > 1.0f) localNoiseGain = 1.0f;
+                sample *= localNoiseGain;
+                localNoiseReduction = 20.0f * log10f(max(localNoiseGain, 0.0001f));
+            } else {
+                localNoiseGain = 1.0f;
+                localNoiseReduction = 0.0f;
             }
 
             float amplified = sample * effectiveGain * localLimiterGain;
@@ -995,6 +1046,18 @@ void audioCaptureTask(void* parameter) {
                 if (localAgcMult > AGC_MAX_MULT) localAgcMult = AGC_MAX_MULT;
             }
             agcMultiplier = localAgcMult;  // Publish for WebUI
+        }
+
+        if (noiseFilterEnabled) {
+            float floorNorm = max(localNoiseFloor, 1.0f) / 32767.0f;
+            float gateNorm = max(localNoiseGate, 1.0f) / 32767.0f;
+            noiseFloorDbfs = 20.0f * log10f(floorNorm);
+            noiseGateDbfs = 20.0f * log10f(gateNorm);
+            noiseReductionDb = localNoiseReduction;
+        } else {
+            noiseFloorDbfs = -90.0f;
+            noiseGateDbfs = -90.0f;
+            noiseReductionDb = 0.0f;
         }
 
         // Update metering
@@ -1227,7 +1290,8 @@ void setup_i2s_driver() {
 static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len) {
     size_t off = 0;
     unsigned long startTime = millis();
-    const unsigned long WRITE_TIMEOUT_MS = 120;  // Give slower WiFi/VLC readers a bit more headroom before dropping frames
+    const unsigned long bufferWindowMs = max(25UL, min(80UL, (unsigned long)(((uint32_t)currentBufferSize * 1000UL) / max((uint32_t)1, currentSampleRate))));
+    const unsigned long WRITE_TIMEOUT_MS = bufferWindowMs;  // Drop late packets sooner so live audio stays closer to real time
 
     while (off < len) {
         // Check timeout to prevent blocking Core 1
