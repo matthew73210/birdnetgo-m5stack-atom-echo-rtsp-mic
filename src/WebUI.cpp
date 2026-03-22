@@ -79,10 +79,10 @@ extern volatile uint8_t fftBins[32];
 extern volatile uint32_t fftFrameSeq;
 extern portMUX_TYPE webAudioMux;
 extern volatile uint32_t webAudioFrameSeq;
-extern volatile uint16_t webAudioFrameSamples[WEB_AUDIO_RING_LEN];
-extern volatile uint32_t webAudioSampleRate[WEB_AUDIO_RING_LEN];
-extern volatile uint32_t webAudioRingSeq[WEB_AUDIO_RING_LEN];
-extern int16_t webAudioFrame[WEB_AUDIO_RING_LEN][WEB_AUDIO_MAX_SAMPLES];
+extern volatile uint16_t webAudioFrameSamples[WEB_AUDIO_FRAME_RING_LEN];
+extern volatile uint32_t webAudioSampleRate[WEB_AUDIO_FRAME_RING_LEN];
+extern volatile uint32_t webAudioRingSeq[WEB_AUDIO_FRAME_RING_LEN];
+extern int16_t webAudioFrame[WEB_AUDIO_FRAME_RING_LEN][WEB_AUDIO_FRAME_MAX_SAMPLES];
 extern portMUX_TYPE telemetryMux;
 extern volatile uint32_t telemetryHistorySeq;
 extern uint8_t telemetryCpuLoadPct[];
@@ -95,7 +95,7 @@ struct WebAudioSnapshot {
     uint32_t seq;
     uint16_t samples;
     uint32_t rate;
-    int16_t frame[WEB_AUDIO_MAX_SAMPLES];
+    int16_t frame[WEB_AUDIO_FRAME_MAX_SAMPLES];
 };
 
 // Local helper: snap requested Wi‑Fi TX power (dBm) to nearest supported step
@@ -423,16 +423,16 @@ static bool getWebAudioSnapshot(uint32_t since, WebAudioSnapshot& snapshot) {
     portENTER_CRITICAL(&webAudioMux);
     uint32_t newestSeq = webAudioFrameSeq;
     if (newestSeq != 0) {
-        uint32_t oldestSeq = (newestSeq > WEB_AUDIO_RING_LEN) ? (newestSeq - WEB_AUDIO_RING_LEN + 1U) : 1U;
+        uint32_t oldestSeq = (newestSeq > WEB_AUDIO_FRAME_RING_LEN) ? (newestSeq - WEB_AUDIO_FRAME_RING_LEN + 1U) : 1U;
         uint32_t targetSeq = (since == 0) ? newestSeq : (since + 1U);
         if (targetSeq < oldestSeq) targetSeq = oldestSeq;
         if (targetSeq <= newestSeq) {
-            uint8_t slot = (uint8_t)((targetSeq - 1U) % WEB_AUDIO_RING_LEN);
+            uint8_t slot = (uint8_t)((targetSeq - 1U) % WEB_AUDIO_FRAME_RING_LEN);
             if (webAudioRingSeq[slot] == targetSeq) {
                 snapshot.seq = targetSeq;
                 snapshot.samples = webAudioFrameSamples[slot];
                 snapshot.rate = webAudioSampleRate[slot];
-                if (snapshot.samples > WEB_AUDIO_MAX_SAMPLES) snapshot.samples = WEB_AUDIO_MAX_SAMPLES;
+                if (snapshot.samples > WEB_AUDIO_FRAME_MAX_SAMPLES) snapshot.samples = WEB_AUDIO_FRAME_MAX_SAMPLES;
                 memcpy(snapshot.frame, webAudioFrame[slot], snapshot.samples * sizeof(int16_t));
                 ok = (snapshot.samples > 0);
             }
