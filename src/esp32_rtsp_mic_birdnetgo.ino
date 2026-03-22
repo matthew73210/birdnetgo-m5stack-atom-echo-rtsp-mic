@@ -4,7 +4,6 @@
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include "driver/i2s.h"
-#include "esp_netif.h"
 #include <Preferences.h>
 #include <time.h>
 #include <math.h>
@@ -596,8 +595,6 @@ void checkPerformance() {
 void checkWiFiHealth() {
     static bool prevConnected = false;
     static IPAddress prevIp(0, 0, 0, 0);
-    static String prevIpv6Link = "";
-    static String prevIpv6Global = "";
 
     bool connected = (WiFi.status() == WL_CONNECTED);
     if (!connected) {
@@ -610,8 +607,6 @@ void checkWiFiHealth() {
         WiFi.reconnect();
     } else {
         IPAddress ip = WiFi.localIP();
-        String ipv6Link = currentIpv6LinkLocal();
-        String ipv6Global = currentIpv6Global();
         // On reconnect/IP change, make sure RTSP server socket is listening on new interface.
         if (!prevConnected || ip != prevIp) {
             simplePrintln("WiFi up: IP=" + ip.toString() + " GW=" + WiFi.gatewayIP().toString());
@@ -623,15 +618,7 @@ void checkWiFiHealth() {
                 simplePrintln("RTSP server rebound on :8554");
             }
         }
-        if (ipv6Link != prevIpv6Link && ipv6Link.length()) {
-            simplePrintln("IPv6 link-local ready: " + ipv6Link);
-        }
-        if (ipv6Global != prevIpv6Global && ipv6Global.length()) {
-            simplePrintln("IPv6 global ready: " + ipv6Global);
-        }
         prevIp = ip;
-        prevIpv6Link = ipv6Link;
-        prevIpv6Global = ipv6Global;
     }
 
     prevConnected = connected;
@@ -899,32 +886,6 @@ static bool timeIsSynced() {
     time_t now = 0;
     time(&now);
     return now > 100000;
-}
-
-static esp_netif_t* wifiStaNetif() {
-    return esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-}
-
-static String formatIPv6Address(const esp_ip6_addr_t& addr) {
-    char buf[48];
-    snprintf(buf, sizeof(buf), IPV6STR, IPV62STR(&addr));
-    return String(buf);
-}
-
-static String currentIpv6LinkLocal() {
-    esp_netif_t* netif = wifiStaNetif();
-    if (netif == nullptr) return String("");
-    esp_ip6_addr_t addr = {};
-    if (esp_netif_get_ip6_linklocal(netif, &addr) != ESP_OK) return String("");
-    return formatIPv6Address(addr);
-}
-
-static String currentIpv6Global() {
-    esp_netif_t* netif = wifiStaNetif();
-    if (netif == nullptr) return String("");
-    esp_ip6_addr_t addr = {};
-    if (esp_netif_get_ip6_global(netif, &addr) != ESP_OK) return String("");
-    return formatIPv6Address(addr);
 }
 
 static String logTimestamp() {
@@ -1998,14 +1959,6 @@ void setup() {
 
     simplePrintln("WiFi connected: " + WiFi.localIP().toString());
 
-    esp_netif_t* staNetif = wifiStaNetif();
-    esp_err_t ipv6Err = (staNetif != nullptr) ? esp_netif_create_ip6_linklocal(staNetif) : ESP_ERR_INVALID_STATE;
-    if (ipv6Err == ESP_OK) {
-        simplePrintln("IPv6 enabled for WiFi STA (waiting for router advertisement)");
-    } else {
-        simplePrintln("IPv6 enable request failed or unsupported by current network stack");
-    }
-
     // Automatic wall-clock sync via NTP in UTC.
     configTzTime(NTP_TZ, "pool.ntp.org", "time.nist.gov", "time.google.com");
     Serial.print("Waiting for NTP time sync (UTC)...");
@@ -2022,15 +1975,6 @@ void setup() {
         Serial.printf(" OK: %s\n", buf);
     } else {
         Serial.println(" failed (will use uptime)");
-    }
-
-    String ipv6Link = currentIpv6LinkLocal();
-    if (ipv6Link.length()) {
-        simplePrintln("IPv6 link-local: " + ipv6Link);
-    }
-    String ipv6Global = currentIpv6Global();
-    if (ipv6Global.length()) {
-        simplePrintln("IPv6 global: " + ipv6Global);
     }
 
     // Apply configured WiFi TX power after connect (logs once on change)
