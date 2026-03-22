@@ -57,6 +57,9 @@ This firmware now supports both **RTSP interleaved over TCP** and **RTP/AVP over
 
 **Browser streamer page**: `http://atoms3mic.local/streamer`
 
+The Web UI status panel now also shows:
+- **Current Time** — auto-synced from NTP in UTC, then rendered in your browser's local timezone
+
 ## Recommended Settings
 
 ## Filter Chain
@@ -123,6 +126,18 @@ Expected behavior:
 - `audio_status` should return JSON with increasing `i2s_reads_ok`.
 
 If `ping` fails or `nc` says `No route to host`, fix routing/VLAN/AP isolation/firewall first. RTSP negotiation cannot start until plain TCP connectivity to `<device-ip>:8554` works.
+
+### macOS note: Terminal works, VLC.app says `No route to host`
+
+If `ping`, `nc`, and `curl` all work from Terminal, but **VLC.app** still reports `No route to host`, the issue may be **macOS app-level Local Network permission**, not the ESP32 RTSP server.
+
+Symptoms usually look like this:
+- `ping <device-ip>` works
+- `nc -vz <device-ip> 8554` works
+- `curl http://<device-ip>/api/audio_status` works
+- `VLC.app` still logs `connect() failed: No route to host`
+
+On affected macOS versions, Local Network access is granted per app. Check **System Settings → Privacy & Security → Local Network** and make sure VLC is allowed. If VLC does not appear there yet, launching `/Applications/VLC.app/Contents/MacOS/VLC ...` from Terminal can help trigger the prompt.
 
 If all network checks pass but audio still sounds nearly silent:
 - Use the Web UI meter (`peak_dbfs`) while speaking/clapping near the mic.

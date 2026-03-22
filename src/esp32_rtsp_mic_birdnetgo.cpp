@@ -5,6 +5,7 @@
 #include <ESPmDNS.h>
 #include "driver/i2s.h"
 #include <Preferences.h>
+#include <time.h>
 #include <math.h>
 #include <FastLED.h>
 #include "WebUI.h"
@@ -34,8 +35,62 @@ volatile bool core1OwnsLED = false;          // LED ownership flag
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
 #define FW_VERSION "2.6.0"
 // Expose FW version as a global C string for WebUI/API
+
 const char* FW_VERSION_STR = FW_VERSION;
 static const uint16_t OTA_PORT = 3232;
+static const char* NTP_TZ = "UTC0";
+
+// Forward declarations required now that the main sketch is compiled as C++.
+const char* rtspTransportModeName(RtspTransportMode mode);
+String currentRtspTransportName();
+String extractRtspHeader(const String& request, const char* headerName);
+bool parseRtspClientPorts(const String& transportHeader, uint16_t& rtpPort, uint16_t& rtcpPort);
+float wifiPowerLevelToDbm(wifi_power_t level);
+wifi_power_t pickWifiPowerLevel(float requestedDbm);
+void applyWifiTxPower(float requestedDbm);
+String describeHardwareProfile();
+String describeFilterChain();
+void fillConcealmentBlock(int16_t* buffer, size_t samples);
+void recordTelemetrySample();
+void updateHighpassCoeffs(uint32_t sampleRate, uint16_t cutoffHz);
+String formatUptime(unsigned long ms);
+String formatSince(unsigned long timestampMs);
+bool isTemperatureValid(float tempC);
+void persistOverheatNote(const String& reason);
+void recordOverheatTrip(float tempC, const String& reason);
+void checkTemperature();
+void checkPerformance();
+void checkWiFiHealth();
+void checkScheduledReset();
+void loadAudioSettings();
+void saveAudioSettings();
+void scheduleReboot(unsigned long delayMs = 0);
+size_t effectiveAudioChunkSize();
+int computeI2sDmaBufferLen(uint16_t chunkSamples);
+int computeI2sDmaBufferCount(uint16_t chunkSamples);
+size_t computeI2sReadBufferSamples(uint16_t chunkSamples);
+uint32_t computeRecommendedMinRate();
+void resetToDefaultSettings();
+void restartI2S();
+bool timeIsSynced();
+String logTimestamp();
+void simplePrint(const String& msg);
+void simplePrintln(const String& msg);
+void resumeRtspServerAfterOtaFailure();
+void setupArduinoOta();
+void drainRtspReceiveBuffer(WiFiClient& client);
+void updateFftFromBlock(const int16_t* samples, size_t count);
+void audioCaptureTask(void* parameter);
+bool startAudioCaptureTask();
+void stopAudioCaptureTask();
+bool requestStreamStop(const char* reason = nullptr);
+void setup_i2s_driver();
+bool writeAll(WiFiClient& client, const uint8_t* data, size_t len);
+void sendRTPPacket(WiFiClient& client, int16_t* audioData, size_t samples);
+void handleRTSPCommand(WiFiClient& client, String& request);
+void processRTSP();
+void setup();
+void loop();
 
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
 #define DEFAULT_SAMPLE_RATE 16000  // Unit Mini PDM / BirdNET-Go preferred rate
@@ -137,10 +192,10 @@ volatile uint32_t fftFrameSeq = 0;
 // -- Browser WebAudio diagnostics stream (latest processed PCM block)
 portMUX_TYPE webAudioMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint32_t webAudioFrameSeq = 0;
-volatile uint16_t webAudioFrameSamples[WEB_AUDIO_RING_LEN] = {0};
-volatile uint32_t webAudioSampleRate[WEB_AUDIO_RING_LEN] = {0};
-volatile uint32_t webAudioRingSeq[WEB_AUDIO_RING_LEN] = {0};
-int16_t webAudioFrame[WEB_AUDIO_RING_LEN][WEB_AUDIO_MAX_SAMPLES] = {{0}};
+volatile uint16_t webAudioFrameSamples[WEB_AUDIO_FRAME_RING_LEN] = {0};
+volatile uint32_t webAudioSampleRate[WEB_AUDIO_FRAME_RING_LEN] = {0};
+volatile uint32_t webAudioRingSeq[WEB_AUDIO_FRAME_RING_LEN] = {0};
+int16_t webAudioFrame[WEB_AUDIO_FRAME_RING_LEN][WEB_AUDIO_FRAME_MAX_SAMPLES] = {{0}};
 
 // -- Lightweight telemetry history for Web UI graphs
 portMUX_TYPE telemetryMux = portMUX_INITIALIZER_UNLOCKED;
@@ -466,7 +521,7 @@ static bool isTemperatureValid(float temp) {
     return true;
 }
 
-// Format current local time, fallback to uptime when no RTC/NTP time available
+// Persist thermal shutdown metadata; timestamps use uptime strings until wall-clock sync is available
 static void persistOverheatNote() {
     audioPrefs.begin("audio", false);
     audioPrefs.putString("ohReason", overheatLastReason);
@@ -782,7 +837,7 @@ static uint16_t computeI2sReadBufferSamples() {
     const uint32_t dmaRingSamples = (uint32_t)computeI2sDmaBufferLen() * (uint32_t)computeI2sDmaBufferCount();
     uint32_t readSamples = dmaRingSamples + computeI2sDmaBufferLen();
     if (readSamples < effectiveAudioChunkSize()) readSamples = effectiveAudioChunkSize();
-    if (readSamples > WEB_AUDIO_MAX_SAMPLES) readSamples = WEB_AUDIO_MAX_SAMPLES;
+    if (readSamples > WEB_AUDIO_FRAME_MAX_SAMPLES) readSamples = WEB_AUDIO_FRAME_MAX_SAMPLES;
     return (uint16_t)readSamples;
 }
 
@@ -880,12 +935,18 @@ void restartI2S() {
 
 // Minimal print helpers: Serial + buffered for Web UI
 // Timestamp prefix for log messages (NTP time if available, uptime fallback)
-static String logTimestamp() {
-    time_t now;
+static bool timeIsSynced() {
+    time_t now = 0;
     time(&now);
-    if (now > 100000) {
+    return now > 100000;
+}
+
+static String logTimestamp() {
+    time_t now = 0;
+    time(&now);
+    if (timeIsSynced()) {
         struct tm ti;
-        localtime_r(&now, &ti);
+        gmtime_r(&now, &ti);
         char buf[24];
         strftime(buf, sizeof(buf), "[%H:%M:%S] ", &ti);
         return String(buf);
@@ -1298,10 +1359,10 @@ void audioCaptureTask(void* parameter) {
 
         // Publish latest processed frame for browser WebAudio endpoint
         uint16_t publishSamples = samplesRead;
-        if (publishSamples > WEB_AUDIO_MAX_SAMPLES) publishSamples = WEB_AUDIO_MAX_SAMPLES;
+        if (publishSamples > WEB_AUDIO_FRAME_MAX_SAMPLES) publishSamples = WEB_AUDIO_FRAME_MAX_SAMPLES;
         portENTER_CRITICAL(&webAudioMux);
         uint32_t nextWebAudioSeq = webAudioFrameSeq + 1U;
-        uint8_t webAudioSlot = (uint8_t)((nextWebAudioSeq - 1U) % WEB_AUDIO_RING_LEN);
+        uint8_t webAudioSlot = (uint8_t)((nextWebAudioSeq - 1U) % WEB_AUDIO_FRAME_RING_LEN);
         memcpy(webAudioFrame[webAudioSlot], outputBuffer, publishSamples * sizeof(int16_t));
         webAudioFrameSamples[webAudioSlot] = publishSamples;
         webAudioSampleRate[webAudioSlot] = currentSampleRate;
@@ -1951,9 +2012,9 @@ void setup() {
 
     simplePrintln("WiFi connected: " + WiFi.localIP().toString());
 
-    // NTP time sync (EST = UTC-5, no DST)
-    configTime(-5 * 3600, 0, "pool.ntp.org");
-    Serial.print("Waiting for NTP time sync...");
+    // Automatic wall-clock sync via NTP in UTC.
+    configTzTime(NTP_TZ, "pool.ntp.org", "time.nist.gov", "time.google.com");
+    Serial.print("Waiting for NTP time sync (UTC)...");
     time_t now = 0;
     for (int i = 0; i < 20 && now < 100000; i++) {
         delay(250);
@@ -1961,10 +2022,10 @@ void setup() {
     }
     if (now > 100000) {
         struct tm ti;
-        localtime_r(&now, &ti);
+        gmtime_r(&now, &ti);
         char buf[32];
-        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
-        Serial.printf(" OK: %s EST\n", buf);
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &ti);
+        Serial.printf(" OK: %s\n", buf);
     } else {
         Serial.println(" failed (will use uptime)");
     }

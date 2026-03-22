@@ -145,7 +145,7 @@ Focus on signal conditioning:
 - Large RTSP session timeout (86400s)
 - Write failure tolerance (100 consecutive failures before disconnect)
 - Auto-recovery disabled by default (false positive prevention)
-- NTP time sync (EST timestamps)
+- NTP time sync (UTC timestamps; Web UI renders viewer-local time)
 - Configurable LED mode (Off / Static / Level)
 - Blue = ready, green = streaming LED colors
 - Disconnect diagnostics (session duration, dropped packets, RSSI)
