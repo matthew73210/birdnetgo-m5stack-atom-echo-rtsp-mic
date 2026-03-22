@@ -4,6 +4,7 @@
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include "driver/i2s.h"
+#include "esp_netif.h"
 #include <Preferences.h>
 #include <time.h>
 #include <math.h>
@@ -609,8 +610,8 @@ void checkWiFiHealth() {
         WiFi.reconnect();
     } else {
         IPAddress ip = WiFi.localIP();
-        String ipv6Link = WiFi.STA.hasLinkLocalIPv6() ? WiFi.STA.linkLocalIPv6().toString() : String("");
-        String ipv6Global = WiFi.STA.hasGlobalIPv6() ? WiFi.STA.globalIPv6().toString() : String("");
+        String ipv6Link = currentIpv6LinkLocal();
+        String ipv6Global = currentIpv6Global();
         // On reconnect/IP change, make sure RTSP server socket is listening on new interface.
         if (!prevConnected || ip != prevIp) {
             simplePrintln("WiFi up: IP=" + ip.toString() + " GW=" + WiFi.gatewayIP().toString());
@@ -898,6 +899,32 @@ static bool timeIsSynced() {
     time_t now = 0;
     time(&now);
     return now > 100000;
+}
+
+static esp_netif_t* wifiStaNetif() {
+    return esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+}
+
+static String formatIPv6Address(const esp_ip6_addr_t& addr) {
+    char buf[48];
+    snprintf(buf, sizeof(buf), IPV6STR, IPV62STR(&addr));
+    return String(buf);
+}
+
+static String currentIpv6LinkLocal() {
+    esp_netif_t* netif = wifiStaNetif();
+    if (netif == nullptr) return String("");
+    esp_ip6_addr_t addr = {};
+    if (esp_netif_get_ip6_linklocal(netif, &addr) != ESP_OK) return String("");
+    return formatIPv6Address(addr);
+}
+
+static String currentIpv6Global() {
+    esp_netif_t* netif = wifiStaNetif();
+    if (netif == nullptr) return String("");
+    esp_ip6_addr_t addr = {};
+    if (esp_netif_get_ip6_global(netif, &addr) != ESP_OK) return String("");
+    return formatIPv6Address(addr);
 }
 
 static String logTimestamp() {
@@ -1971,8 +1998,9 @@ void setup() {
 
     simplePrintln("WiFi connected: " + WiFi.localIP().toString());
 
-    bool ipv6Enabled = WiFi.STA.enableIPv6(true);
-    if (ipv6Enabled) {
+    esp_netif_t* staNetif = wifiStaNetif();
+    esp_err_t ipv6Err = (staNetif != nullptr) ? esp_netif_create_ip6_linklocal(staNetif) : ESP_ERR_INVALID_STATE;
+    if (ipv6Err == ESP_OK) {
         simplePrintln("IPv6 enabled for WiFi STA (waiting for router advertisement)");
     } else {
         simplePrintln("IPv6 enable request failed or unsupported by current network stack");
@@ -1996,11 +2024,13 @@ void setup() {
         Serial.println(" failed (will use uptime)");
     }
 
-    if (WiFi.STA.hasLinkLocalIPv6()) {
-        simplePrintln("IPv6 link-local: " + WiFi.STA.linkLocalIPv6().toString());
+    String ipv6Link = currentIpv6LinkLocal();
+    if (ipv6Link.length()) {
+        simplePrintln("IPv6 link-local: " + ipv6Link);
     }
-    if (WiFi.STA.hasGlobalIPv6()) {
-        simplePrintln("IPv6 global: " + WiFi.STA.globalIPv6().toString());
+    String ipv6Global = currentIpv6Global();
+    if (ipv6Global.length()) {
+        simplePrintln("IPv6 global: " + ipv6Global);
     }
 
     // Apply configured WiFi TX power after connect (logs once on change)

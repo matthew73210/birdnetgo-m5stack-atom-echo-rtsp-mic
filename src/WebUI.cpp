@@ -3,6 +3,7 @@
 #include <time.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include "esp_netif.h"
 #include "WebUI.h"
 
 // External variables and functions from main (.ino) – ESP32 RTSP Mic for BirdNET-Go
@@ -176,14 +177,30 @@ static String currentTimeUtcIso() {
     return String(buf);
 }
 
+static esp_netif_t* wifiStaNetif() {
+    return esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+}
+
+static String formatIPv6Address(const esp_ip6_addr_t& addr) {
+    char buf[48];
+    snprintf(buf, sizeof(buf), IPV6STR, IPV62STR(&addr));
+    return String(buf);
+}
+
 static String currentIPv6LinkLocal() {
-    if (!WiFi.STA.hasLinkLocalIPv6()) return String("");
-    return WiFi.STA.linkLocalIPv6().toString();
+    esp_netif_t* netif = wifiStaNetif();
+    if (netif == nullptr) return String("");
+    esp_ip6_addr_t addr = {};
+    if (esp_netif_get_ip6_linklocal(netif, &addr) != ESP_OK) return String("");
+    return formatIPv6Address(addr);
 }
 
 static String currentIPv6Global() {
-    if (!WiFi.STA.hasGlobalIPv6()) return String("");
-    return WiFi.STA.globalIPv6().toString();
+    esp_netif_t* netif = wifiStaNetif();
+    if (netif == nullptr) return String("");
+    esp_ip6_addr_t addr = {};
+    if (esp_netif_get_ip6_global(netif, &addr) != ESP_OK) return String("");
+    return formatIPv6Address(addr);
 }
 
 static String profileName(uint16_t buf) {
