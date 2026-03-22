@@ -3,7 +3,7 @@
 See `README.md` for project documentation, features, architecture, and usage.
 
 ## Key Files
-- `src/esp32_rtsp_mic_birdnetgo.ino` — Main firmware (dual-core audio, RTSP, I2S)
+- `src/esp32_rtsp_mic_birdnetgo.cpp` — Main firmware (dual-core audio, RTSP, I2S)
 - `src/WebUI.cpp` — Web interface (HTML/JS/CSS embedded as string literals, API endpoints)
 - `src/WebUI.h` — WebUI header
 - `platformio.ini` — Build configuration and dependencies

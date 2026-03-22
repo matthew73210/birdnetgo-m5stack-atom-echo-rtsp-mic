@@ -5,7 +5,7 @@
 #include <WebServer.h>
 #include "WebUI.h"
 
-// External variables and functions from main (.ino) – ESP32 RTSP Mic for BirdNET-Go
+// External variables and functions from main firmware translation unit – ESP32 RTSP Mic for BirdNET-Go
 extern WiFiServer rtspServer;
 extern WiFiClient rtspClient;
 extern volatile bool isStreaming;

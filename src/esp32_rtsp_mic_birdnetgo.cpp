@@ -35,9 +35,62 @@ volatile bool core1OwnsLED = false;          // LED ownership flag
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
 #define FW_VERSION "2.6.0"
 // Expose FW version as a global C string for WebUI/API
+
 const char* FW_VERSION_STR = FW_VERSION;
 static const uint16_t OTA_PORT = 3232;
 static const char* NTP_TZ = "UTC0";
+
+// Forward declarations required now that the main sketch is compiled as C++.
+const char* rtspTransportModeName(RtspTransportMode mode);
+String currentRtspTransportName();
+String extractRtspHeader(const String& request, const char* headerName);
+bool parseRtspClientPorts(const String& transportHeader, uint16_t& rtpPort, uint16_t& rtcpPort);
+float wifiPowerLevelToDbm(wifi_power_t level);
+wifi_power_t pickWifiPowerLevel(float requestedDbm);
+void applyWifiTxPower(float requestedDbm);
+String describeHardwareProfile();
+String describeFilterChain();
+void fillConcealmentBlock(int16_t* buffer, size_t samples);
+void recordTelemetrySample();
+void updateHighpassCoeffs(uint32_t sampleRate, uint16_t cutoffHz);
+String formatUptime(unsigned long ms);
+String formatSince(unsigned long timestampMs);
+bool isTemperatureValid(float tempC);
+void persistOverheatNote(const String& reason);
+void recordOverheatTrip(float tempC, const String& reason);
+void checkTemperature();
+void checkPerformance();
+void checkWiFiHealth();
+void checkScheduledReset();
+void loadAudioSettings();
+void saveAudioSettings();
+void scheduleReboot(unsigned long delayMs = 0);
+size_t effectiveAudioChunkSize();
+int computeI2sDmaBufferLen(uint16_t chunkSamples);
+int computeI2sDmaBufferCount(uint16_t chunkSamples);
+size_t computeI2sReadBufferSamples(uint16_t chunkSamples);
+uint32_t computeRecommendedMinRate();
+void resetToDefaultSettings();
+void restartI2S();
+bool timeIsSynced();
+String logTimestamp();
+void simplePrint(const String& msg);
+void simplePrintln(const String& msg);
+void resumeRtspServerAfterOtaFailure();
+void setupArduinoOta();
+void drainRtspReceiveBuffer(WiFiClient& client);
+void updateFftFromBlock(const int16_t* samples, size_t count);
+void audioCaptureTask(void* parameter);
+bool startAudioCaptureTask();
+void stopAudioCaptureTask();
+bool requestStreamStop(const char* reason = nullptr);
+void setup_i2s_driver();
+bool writeAll(WiFiClient& client, const uint8_t* data, size_t len);
+void sendRTPPacket(WiFiClient& client, int16_t* audioData, size_t samples);
+void handleRTSPCommand(WiFiClient& client, String& request);
+void processRTSP();
+void setup();
+void loop();
 
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
 #define DEFAULT_SAMPLE_RATE 16000  // Unit Mini PDM / BirdNET-Go preferred rate
