@@ -5,6 +5,7 @@
 #include <ESPmDNS.h>
 #include "driver/i2s.h"
 #include <Preferences.h>
+#include <time.h>
 #include <math.h>
 #include <FastLED.h>
 #include "WebUI.h"
@@ -36,6 +37,7 @@ volatile bool core1OwnsLED = false;          // LED ownership flag
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 static const uint16_t OTA_PORT = 3232;
+static const char* NTP_TZ = "UTC0";
 
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
 #define DEFAULT_SAMPLE_RATE 16000  // Unit Mini PDM / BirdNET-Go preferred rate
@@ -466,7 +468,7 @@ static bool isTemperatureValid(float temp) {
     return true;
 }
 
-// Format current local time, fallback to uptime when no RTC/NTP time available
+// Persist thermal shutdown metadata; timestamps use uptime strings until wall-clock sync is available
 static void persistOverheatNote() {
     audioPrefs.begin("audio", false);
     audioPrefs.putString("ohReason", overheatLastReason);
@@ -593,6 +595,8 @@ void checkPerformance() {
 void checkWiFiHealth() {
     static bool prevConnected = false;
     static IPAddress prevIp(0, 0, 0, 0);
+    static String prevIpv6Link = "";
+    static String prevIpv6Global = "";
 
     bool connected = (WiFi.status() == WL_CONNECTED);
     if (!connected) {
@@ -605,6 +609,8 @@ void checkWiFiHealth() {
         WiFi.reconnect();
     } else {
         IPAddress ip = WiFi.localIP();
+        String ipv6Link = WiFi.STA.hasLinkLocalIPv6() ? WiFi.STA.linkLocalIPv6().toString() : String("");
+        String ipv6Global = WiFi.STA.hasGlobalIPv6() ? WiFi.STA.globalIPv6().toString() : String("");
         // On reconnect/IP change, make sure RTSP server socket is listening on new interface.
         if (!prevConnected || ip != prevIp) {
             simplePrintln("WiFi up: IP=" + ip.toString() + " GW=" + WiFi.gatewayIP().toString());
@@ -616,7 +622,15 @@ void checkWiFiHealth() {
                 simplePrintln("RTSP server rebound on :8554");
             }
         }
+        if (ipv6Link != prevIpv6Link && ipv6Link.length()) {
+            simplePrintln("IPv6 link-local ready: " + ipv6Link);
+        }
+        if (ipv6Global != prevIpv6Global && ipv6Global.length()) {
+            simplePrintln("IPv6 global ready: " + ipv6Global);
+        }
         prevIp = ip;
+        prevIpv6Link = ipv6Link;
+        prevIpv6Global = ipv6Global;
     }
 
     prevConnected = connected;
@@ -880,12 +894,18 @@ void restartI2S() {
 
 // Minimal print helpers: Serial + buffered for Web UI
 // Timestamp prefix for log messages (NTP time if available, uptime fallback)
-static String logTimestamp() {
-    time_t now;
+static bool timeIsSynced() {
+    time_t now = 0;
     time(&now);
-    if (now > 100000) {
+    return now > 100000;
+}
+
+static String logTimestamp() {
+    time_t now = 0;
+    time(&now);
+    if (timeIsSynced()) {
         struct tm ti;
-        localtime_r(&now, &ti);
+        gmtime_r(&now, &ti);
         char buf[24];
         strftime(buf, sizeof(buf), "[%H:%M:%S] ", &ti);
         return String(buf);
@@ -1951,9 +1971,16 @@ void setup() {
 
     simplePrintln("WiFi connected: " + WiFi.localIP().toString());
 
-    // NTP time sync (EST = UTC-5, no DST)
-    configTime(-5 * 3600, 0, "pool.ntp.org");
-    Serial.print("Waiting for NTP time sync...");
+    bool ipv6Enabled = WiFi.STA.enableIPv6(true);
+    if (ipv6Enabled) {
+        simplePrintln("IPv6 enabled for WiFi STA (waiting for router advertisement)");
+    } else {
+        simplePrintln("IPv6 enable request failed or unsupported by current network stack");
+    }
+
+    // Automatic wall-clock sync via NTP in UTC.
+    configTzTime(NTP_TZ, "pool.ntp.org", "time.nist.gov", "time.google.com");
+    Serial.print("Waiting for NTP time sync (UTC)...");
     time_t now = 0;
     for (int i = 0; i < 20 && now < 100000; i++) {
         delay(250);
@@ -1961,12 +1988,19 @@ void setup() {
     }
     if (now > 100000) {
         struct tm ti;
-        localtime_r(&now, &ti);
+        gmtime_r(&now, &ti);
         char buf[32];
-        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
-        Serial.printf(" OK: %s EST\n", buf);
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &ti);
+        Serial.printf(" OK: %s\n", buf);
     } else {
         Serial.println(" failed (will use uptime)");
+    }
+
+    if (WiFi.STA.hasLinkLocalIPv6()) {
+        simplePrintln("IPv6 link-local: " + WiFi.STA.linkLocalIPv6().toString());
+    }
+    if (WiFi.STA.hasGlobalIPv6()) {
+        simplePrintln("IPv6 global: " + WiFi.STA.globalIPv6().toString());
     }
 
     // Apply configured WiFi TX power after connect (logs once on change)

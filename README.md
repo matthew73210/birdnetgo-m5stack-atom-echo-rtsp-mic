@@ -57,6 +57,16 @@ This firmware now supports both **RTSP interleaved over TCP** and **RTP/AVP over
 
 **Browser streamer page**: `http://atoms3mic.local/streamer`
 
+The Web UI status panel now also shows:
+- **Current Time** — auto-synced from NTP in UTC, then rendered in your browser's local timezone
+- **IPv6** — link-local and global IPv6 addresses when your router advertises them
+
+If you connect over a literal IPv6 address, remember to wrap it in brackets:
+
+```bash
+vlc rtsp://[fe80::1234:5678:9abc:def0]:8554/audio
+```
+
 ## Recommended Settings
 
 ## Filter Chain
