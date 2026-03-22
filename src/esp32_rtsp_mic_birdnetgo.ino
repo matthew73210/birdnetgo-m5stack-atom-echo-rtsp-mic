@@ -3,7 +3,6 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
-#include <esp_timer.h>
 #include "driver/i2s.h"
 #include <Preferences.h>
 #include <math.h>
@@ -33,7 +32,7 @@ SemaphoreHandle_t taskExitSemaphore = NULL;  // confirmed task exit
 volatile bool core1OwnsLED = false;          // LED ownership flag
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "2.6.1"
+#define FW_VERSION "2.6.2"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 static const uint16_t OTA_PORT = 3232;
@@ -80,7 +79,6 @@ volatile bool isStreaming = false;
 uint16_t rtpSequence = 0;
 uint32_t rtpTimestamp = 0;
 uint32_t rtpSSRC = 0x43215678;
-uint64_t rtpNextSendDueUs = 0;
 unsigned long lastRTSPActivity = 0;
 RtspTransportMode activeRtspTransport = RTSP_TRANSPORT_TCP_INTERLEAVED;
 WiFiUDP rtpUdp;
@@ -779,11 +777,18 @@ static uint8_t computeI2sDmaBufferCount() {
 }
 
 static uint16_t computeI2sReadBufferSamples() {
-    // ESP-IDF guidance for polling reads is to make the application read buffer
-    // larger than the total DMA ring so a read cycle can fully drain capture.
-    const uint32_t dmaRingSamples = (uint32_t)computeI2sDmaBufferLen() * (uint32_t)computeI2sDmaBufferCount();
-    uint32_t readSamples = dmaRingSamples + computeI2sDmaBufferLen();
-    if (readSamples < effectiveAudioChunkSize()) readSamples = effectiveAudioChunkSize();
+    // Read close to the RTP chunk size so Core 1 can forward audio immediately
+    // instead of waiting for several packets of captured PCM and then flushing
+    // them in a burst. Keep a small floor at higher sample rates so tiny UI
+    // buffers do not create excessive I2S/read wakeups.
+    uint32_t readSamples = effectiveAudioChunkSize();
+    if (currentSampleRate >= 48000) {
+        if (readSamples < 512) readSamples = 512;
+    } else if (currentSampleRate >= 32000) {
+        if (readSamples < 384) readSamples = 384;
+    } else if (readSamples < 256) {
+        readSamples = 256;
+    }
     if (readSamples > WEBUI_AUDIO_MAX_SAMPLES) readSamples = WEBUI_AUDIO_MAX_SAMPLES;
     return (uint16_t)readSamples;
 }
@@ -1619,28 +1624,6 @@ static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len, unsign
 static uint32_t consecutiveWriteFailures = 0;
 static const uint32_t MAX_WRITE_FAILURES = 100;  // Allow ~5s of failures before disconnect
 
-static void paceRtpPacketSend(int packetSamples) {
-    if (packetSamples <= 0 || currentSampleRate == 0) return;
-
-    const uint64_t nowUs = (uint64_t)esp_timer_get_time();
-    if (rtpNextSendDueUs == 0 || nowUs > (rtpNextSendDueUs + 250000ULL)) {
-        rtpNextSendDueUs = nowUs;
-    }
-
-    if (rtpNextSendDueUs > nowUs) {
-        const uint64_t waitUs = rtpNextSendDueUs - nowUs;
-        if (waitUs >= 1000ULL) {
-            vTaskDelay(pdMS_TO_TICKS((waitUs + 999ULL) / 1000ULL));
-        }
-        while ((uint64_t)esp_timer_get_time() < rtpNextSendDueUs) {
-            delayMicroseconds(200);
-        }
-    }
-
-    const uint64_t packetDurationUs = ((uint64_t)packetSamples * 1000000ULL) / (uint64_t)currentSampleRate;
-    rtpNextSendDueUs += (packetDurationUs > 0ULL) ? packetDurationUs : 1ULL;
-}
-
 void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
     if (!client.connected()) {
         // Client disconnected — Core 1 owns the socket, close it
@@ -1682,11 +1665,6 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
             packetBuffer[12 + (i * 2)] = (uint8_t)((s >> 8) & 0xFF);
             packetBuffer[12 + (i * 2) + 1] = (uint8_t)(s & 0xFF);
         }
-
-        // Keep interleaved RTP emission close to real time instead of dumping
-        // multiple packets back-to-back after a larger I2S read. ffplay is
-        // especially sensitive to that burst pattern at 48 kHz PCM.
-        paceRtpPacketSend(packetSamples);
 
         bool success = false;
         if (activeRtspTransport == RTSP_TRANSPORT_UDP_UNICAST) {
@@ -1830,7 +1808,6 @@ void handleRTSPCommand(WiFiClient &client, String request) {
 
         rtpSequence = 0;
         rtpTimestamp = 0;
-        rtpNextSendDueUs = (uint64_t)esp_timer_get_time();
         audioPacketsSent = 0;
         audioPacketsDropped = 0;
         lastStatsReset = millis();

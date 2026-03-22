@@ -140,9 +140,10 @@ Focus on signal conditioning:
 - Restored Arduino OTA updates for direct PlatformIO uploads over Wi‑Fi
 - Added dual-slot OTA partition table and dedicated PlatformIO OTA environment
 
-### v2.6.1
-- Added wall-clock RTP packet pacing so 48 kHz PCM clients do not receive large back-to-back bursts after each I2S read
-- Reduces ffplay-style "starts fine, then stutters to a stop" behavior on RTSP/TCP playback
+### v2.6.2
+- Removed the extra RTP wall-clock pacing pass that double-counted capture time after the blocking `i2s_read()`
+- Switched the I2S application read size to stay near the RTP chunk size so Core 1 forwards audio promptly instead of batching several packets and then bursting them out
+- Reduces ffplay-style "starts fine, then stutters to a stop" behavior without pushing the capture loop into fallback/overrun
 
 ### v2.2.0
 - RTSP receive buffer drain on disconnect
