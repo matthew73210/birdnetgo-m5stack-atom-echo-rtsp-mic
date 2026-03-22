@@ -137,10 +137,10 @@ volatile uint32_t fftFrameSeq = 0;
 // -- Browser WebAudio diagnostics stream (latest processed PCM block)
 portMUX_TYPE webAudioMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint32_t webAudioFrameSeq = 0;
-volatile uint16_t webAudioFrameSamples[WEB_AUDIO_RING_LEN] = {0};
-volatile uint32_t webAudioSampleRate[WEB_AUDIO_RING_LEN] = {0};
-volatile uint32_t webAudioRingSeq[WEB_AUDIO_RING_LEN] = {0};
-int16_t webAudioFrame[WEB_AUDIO_RING_LEN][WEB_AUDIO_MAX_SAMPLES] = {{0}};
+volatile uint16_t webAudioFrameSamples[WEBUI_AUDIO_RING_LEN] = {0};
+volatile uint32_t webAudioSampleRate[WEBUI_AUDIO_RING_LEN] = {0};
+volatile uint32_t webAudioRingSeq[WEBUI_AUDIO_RING_LEN] = {0};
+int16_t webAudioFrame[WEBUI_AUDIO_RING_LEN][WEBUI_AUDIO_MAX_SAMPLES] = {{0}};
 
 // -- Lightweight telemetry history for Web UI graphs
 portMUX_TYPE telemetryMux = portMUX_INITIALIZER_UNLOCKED;
@@ -782,7 +782,7 @@ static uint16_t computeI2sReadBufferSamples() {
     const uint32_t dmaRingSamples = (uint32_t)computeI2sDmaBufferLen() * (uint32_t)computeI2sDmaBufferCount();
     uint32_t readSamples = dmaRingSamples + computeI2sDmaBufferLen();
     if (readSamples < effectiveAudioChunkSize()) readSamples = effectiveAudioChunkSize();
-    if (readSamples > WEB_AUDIO_MAX_SAMPLES) readSamples = WEB_AUDIO_MAX_SAMPLES;
+    if (readSamples > WEBUI_AUDIO_MAX_SAMPLES) readSamples = WEBUI_AUDIO_MAX_SAMPLES;
     return (uint16_t)readSamples;
 }
 
@@ -1298,10 +1298,10 @@ void audioCaptureTask(void* parameter) {
 
         // Publish latest processed frame for browser WebAudio endpoint
         uint16_t publishSamples = samplesRead;
-        if (publishSamples > WEB_AUDIO_MAX_SAMPLES) publishSamples = WEB_AUDIO_MAX_SAMPLES;
+        if (publishSamples > WEBUI_AUDIO_MAX_SAMPLES) publishSamples = WEBUI_AUDIO_MAX_SAMPLES;
         portENTER_CRITICAL(&webAudioMux);
         uint32_t nextWebAudioSeq = webAudioFrameSeq + 1U;
-        uint8_t webAudioSlot = (uint8_t)((nextWebAudioSeq - 1U) % WEB_AUDIO_RING_LEN);
+        uint8_t webAudioSlot = (uint8_t)((nextWebAudioSeq - 1U) % WEBUI_AUDIO_RING_LEN);
         memcpy(webAudioFrame[webAudioSlot], outputBuffer, publishSamples * sizeof(int16_t));
         webAudioFrameSamples[webAudioSlot] = publishSamples;
         webAudioSampleRate[webAudioSlot] = currentSampleRate;
