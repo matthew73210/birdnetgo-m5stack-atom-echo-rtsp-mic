@@ -37,12 +37,16 @@ volatile bool core1OwnsLED = false;          // LED ownership flag
 const char* FW_VERSION_STR = FW_VERSION;
 static const uint16_t OTA_PORT = 3232;
 
+#if !defined(BOARD_PROFILE_ATOM_ECHO)
+#define BOARD_PROFILE_ATOM_ECHO 0
+#endif
+
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
 #define DEFAULT_SAMPLE_RATE 16000  // Unit Mini PDM / BirdNET-Go preferred rate
 #define DEFAULT_GAIN_FACTOR 1.0f
 #define DEFAULT_BUFFER_SIZE 1024   // 64ms @ 16kHz - lower default latency while keeping WiFi headroom
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
-#if defined(ARDUINO_M5Stack_Atom)
+#if BOARD_PROFILE_ATOM_ECHO
 #define DEFAULT_NETWORK_HOSTNAME "atomechomic"
 #define OTA_ENV_NAME "m5stack-atom-echo-ota"
 #define DEVICE_BOARD_LABEL "M5Stack Atom Echo"
@@ -1576,7 +1580,7 @@ void setup_i2s_driver() {
     const uint8_t dma_buf_count = computeI2sDmaBufferCount();
 
     i2s_config_t i2s_config = {
-#if defined(ARDUINO_M5Stack_Atom)
+#if BOARD_PROFILE_ATOM_ECHO
         // Atom Echo profile: standard I2S RX microphone path
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
 #else
@@ -1585,7 +1589,7 @@ void setup_i2s_driver() {
 #endif
         .sample_rate = currentSampleRate,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,  // Match original demo exactly
-#if defined(ARDUINO_M5Stack_Atom)
+#if BOARD_PROFILE_ATOM_ECHO
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
 #else
         .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,   // Match M5 reference PDM example
@@ -1608,13 +1612,13 @@ void setup_i2s_driver() {
         .mck_io_num = I2S_PIN_NO_CHANGE,
 #endif
         .bck_io_num =
-#if defined(ARDUINO_M5Stack_Atom)
+#if BOARD_PROFILE_ATOM_ECHO
             I2S_BCK_PIN,
 #else
             I2S_PIN_NO_CHANGE,
 #endif
         .ws_io_num =
-#if defined(ARDUINO_M5Stack_Atom)
+#if BOARD_PROFILE_ATOM_ECHO
             I2S_WS_PIN,
 #else
             I2S_CLK_PIN,
@@ -1628,7 +1632,7 @@ void setup_i2s_driver() {
     i2s_set_clk(I2S_NUM_0, currentSampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
 
     simplePrintln(String("I2S ready (") +
-#if defined(ARDUINO_M5Stack_Atom)
+#if BOARD_PROFILE_ATOM_ECHO
                   "I2S mode"
 #else
                   "PDM mode"
