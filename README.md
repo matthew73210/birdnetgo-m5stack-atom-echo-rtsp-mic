@@ -29,10 +29,12 @@ pio run --target upload
 ```
 
 ### 1a. Enable OTA uploads from PlatformIO
-After the first USB flash, the firmware exposes Arduino OTA on `atoms3mic.local:3232`, so you can push new builds directly over Wi‑Fi from PlatformIO:
+After the first USB flash, the firmware exposes Arduino OTA on `atoms3mic.local:3232` (AtomS3 Lite profile) or `atomechomic.local:3232` (Atom Echo profile), so you can push new builds directly over Wi‑Fi from PlatformIO:
 
 ```bash
 pio run -e m5stack-atoms3-lite-ota -t upload
+# Atom Echo profile
+pio run -e m5stack-atom-echo-ota -t upload
 ```
 
 If you changed the device hostname, update `upload_port` in `platformio.ini` to match the new `.local` name or use the current IP address.
@@ -149,6 +151,7 @@ For Unit PDM wiring use **CLK=G1** and **DATA=G2**, plus GND and 3V3.
 pio run                      # Build
 pio run --target upload      # Flash
 pio run -e m5stack-atoms3-lite-ota -t upload # OTA upload over Wi-Fi
+pio run -e m5stack-atom-echo-ota -t upload   # OTA upload for Atom Echo profile
 pio device monitor -b 115200 # Serial monitor
 ```
 

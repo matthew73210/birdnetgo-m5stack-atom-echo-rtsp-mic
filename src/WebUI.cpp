@@ -178,7 +178,7 @@ static String htmlIndex() {
     h += F(
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>AtomS3 Lite + Unit Mini PDM - RTSP Microphone</title>"
+        "<title>M5 Atom RTSP Microphone</title>"
         "<style>:root{--bg:#0b1020;--fg:#e7ebf2;--muted:#9aa3b2;--card:#121a2e;--border:#1b2745;--acc:#4ea1f3;--acc2:#36d399;--warn:#f59e0b;--bad:#ef4444}"
         "body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:linear-gradient(180deg,#0b1020 0%,#0f1530 100%);color:var(--fg)}"
         ".page{max-width:1000px;margin:0 auto;padding:16px}"

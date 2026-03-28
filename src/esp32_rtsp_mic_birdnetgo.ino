@@ -37,12 +37,38 @@ volatile bool core1OwnsLED = false;          // LED ownership flag
 const char* FW_VERSION_STR = FW_VERSION;
 static const uint16_t OTA_PORT = 3232;
 
+// -- Board profile
+#if defined(ARDUINO_M5Stack_Atom)
+#define BOARD_PROFILE_ATOM_ECHO 1
+#else
+#define BOARD_PROFILE_ATOM_ECHO 0
+#endif
+
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
 #define DEFAULT_SAMPLE_RATE 16000  // Unit Mini PDM / BirdNET-Go preferred rate
 #define DEFAULT_GAIN_FACTOR 1.0f
 #define DEFAULT_BUFFER_SIZE 1024   // 64ms @ 16kHz - lower default latency while keeping WiFi headroom
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
+#if BOARD_PROFILE_ATOM_ECHO
+#define DEFAULT_NETWORK_HOSTNAME "atomechomic"
+#define OTA_ENV_NAME "m5stack-atom-echo-ota"
+#define DEVICE_BOARD_LABEL "M5Stack Atom Echo"
+#define DEVICE_INPUT_PROFILE_DEFAULT "I2S mic input profile (Atom Echo defaults)"
+// Atom Echo defaults (ESP32 classic + internal mic path)
+#define I2S_BCK_PIN      19
+#define I2S_WS_PIN       33
+#define I2S_DATA_IN_PIN  23
+#define WS2812_LED_PIN   27
+#else
 #define DEFAULT_NETWORK_HOSTNAME "atoms3mic"
+#define OTA_ENV_NAME "m5stack-atoms3-lite-ota"
+#define DEVICE_BOARD_LABEL "M5Stack AtomS3 Lite"
+#define DEVICE_INPUT_PROFILE_DEFAULT "PDM input profile (AtomS3 Lite + Unit Mini PDM tuned)"
+// M5's reference wiring for the PDM Unit is CLK=G1 and DATA=G2.
+#define I2S_CLK_PIN      1  // PDM CLK (G1)
+#define I2S_DATA_IN_PIN  2  // PDM DATA (G2)
+#define WS2812_LED_PIN  35  // AtomS3 Lite built-in RGB LED
+#endif
 // High-pass filter defaults (to remove low-frequency rumble)
 #define DEFAULT_HPF_ENABLED true
 #define DEFAULT_HPF_CUTOFF_HZ 450
@@ -53,12 +79,6 @@ static const uint16_t OTA_PORT = 3232;
 #define OVERHEAT_MIN_LIMIT_C 30
 #define OVERHEAT_MAX_LIMIT_C 95
 #define OVERHEAT_LIMIT_STEP_C 5
-
-// -- Pins (AtomS3 Lite + Unit Mini PDM)
-// M5's reference wiring for the PDM Unit is CLK=G1 and DATA=G2.
-#define I2S_CLK_PIN      1  // PDM CLK (G1)
-#define I2S_DATA_IN_PIN  2  // PDM DATA (G2)
-#define WS2812_LED_PIN  35  // AtomS3 Lite built-in RGB LED
 
 static CRGB statusLed[1];
 
@@ -185,7 +205,7 @@ const float NOISE_ENV_ATTACK = 0.010f;
 const float NOISE_ENV_RELEASE = 0.0012f;
 const uint16_t NOISE_GATE_HOLD_MS = 120;
 const char* DEVICE_TITLE = "M5 Atom RTSP Microphone";
-const char* DEVICE_INPUT_PROFILE = "PDM input profile (AtomS3 Lite + Unit Mini PDM tuned)";
+const char* DEVICE_INPUT_PROFILE = DEVICE_INPUT_PROFILE_DEFAULT;
 const char* FILTER_CHAIN_BASE = "Input normalize -> 2nd-order Butterworth high-pass -> adaptive noise bed suppressor -> manual gain -> limiter -> optional AGC";
 
 // -- High-pass filter (biquad) to cut low-frequency rumble
@@ -980,7 +1000,7 @@ static void setupArduinoOta() {
     });
 
     ArduinoOTA.begin();
-    simplePrintln("OTA ready: pio run -e m5stack-atoms3-lite-ota -t upload");
+    simplePrintln(String("OTA ready: pio run -e ") + OTA_ENV_NAME + " -t upload");
     simplePrintln("OTA target: " + networkHostname + ".local:" + String(OTA_PORT));
 }
 
@@ -1555,7 +1575,7 @@ bool requestStreamStop(const char* reason) {
     }
 }
 
-// I2S setup for AtomS3 Lite + Unit Mini PDM (PDM microphone mode)
+// I2S setup (board-profile aware)
 void setup_i2s_driver() {
     i2s_driver_uninstall(I2S_NUM_0);
 
@@ -1563,11 +1583,20 @@ void setup_i2s_driver() {
     const uint8_t dma_buf_count = computeI2sDmaBufferCount();
 
     i2s_config_t i2s_config = {
-        // PDM mode for Unit Mini PDM microphone
+#if BOARD_PROFILE_ATOM_ECHO
+        // Atom Echo profile: standard I2S RX microphone path
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+#else
+        // AtomS3 + Unit Mini PDM profile
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
+#endif
         .sample_rate = currentSampleRate,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,  // Match original demo exactly
+#if BOARD_PROFILE_ATOM_ECHO
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+#else
         .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,   // Match M5 reference PDM example
+#endif
 #if ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 1, 0)
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
 #else
@@ -1585,8 +1614,18 @@ void setup_i2s_driver() {
 #if (ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 3, 0))
         .mck_io_num = I2S_PIN_NO_CHANGE,
 #endif
-        .bck_io_num = I2S_PIN_NO_CHANGE,
-        .ws_io_num = I2S_CLK_PIN,
+        .bck_io_num =
+#if BOARD_PROFILE_ATOM_ECHO
+            I2S_BCK_PIN,
+#else
+            I2S_PIN_NO_CHANGE,
+#endif
+        .ws_io_num =
+#if BOARD_PROFILE_ATOM_ECHO
+            I2S_WS_PIN,
+#else
+            I2S_CLK_PIN,
+#endif
         .data_out_num = I2S_PIN_NO_CHANGE,
         .data_in_num = I2S_DATA_IN_PIN
     };
@@ -1595,7 +1634,8 @@ void setup_i2s_driver() {
     i2s_set_pin(I2S_NUM_0, &pin_config);
     i2s_set_clk(I2S_NUM_0, currentSampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
 
-    simplePrintln("I2S ready (PDM mode): " + String(currentSampleRate) + "Hz, gain " +
+    simplePrintln(String("I2S ready (") + (BOARD_PROFILE_ATOM_ECHO ? "I2S mode" : "PDM mode") + "): " +
+                  String(currentSampleRate) + "Hz, gain " +
                   String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
                   " (chunk " + String(effectiveAudioChunkSize()) + ")" +
                   ", dma " + String(dma_buf_count) + "x" + String(dma_buf_len) +
@@ -1907,7 +1947,8 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println("\n\n=== ESP32 RTSP Mic Starting ===");
-    Serial.println("Board: M5Stack AtomS3 Lite");
+    Serial.print("Board: ");
+    Serial.println(DEVICE_BOARD_LABEL);
 
     // Create task exit semaphore for confirmed Core 1 task shutdown
     taskExitSemaphore = xSemaphoreCreateBinary();
