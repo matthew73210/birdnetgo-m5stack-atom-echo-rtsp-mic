@@ -180,3 +180,5 @@ This firmware is now less hard-coded to the AtomS3 branding in the UI/API, but t
 ## If tapping is still present
 
 This firmware does **not** toggle a microphone-enable GPIO during normal capture. If you still hear tapping that lines up with meter drops, the more likely cause is a brief **I2S read gap / underrun**. This build now keeps RTP cadence alive with a short concealment block instead of skipping a packet, and the Web UI exposes fallback counts plus realtime load/temperature graphs so you can correlate the taps with capture stalls or CPU spikes.
+
+For **48 kHz PCM clients** such as `ffplay`, the streamer now reads audio in chunk-sized blocks that are much closer to the outgoing RTP packet size. That keeps Core 1 from accumulating multiple packets of PCM and then dumping them in a burst, without adding a second round of sleeps after the already-blocking `i2s_read()`.

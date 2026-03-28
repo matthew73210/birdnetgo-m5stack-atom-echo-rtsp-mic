@@ -32,7 +32,7 @@ SemaphoreHandle_t taskExitSemaphore = NULL;  // confirmed task exit
 volatile bool core1OwnsLED = false;          // LED ownership flag
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "2.6.0"
+#define FW_VERSION "2.6.2"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 static const uint16_t OTA_PORT = 3232;
@@ -777,11 +777,18 @@ static uint8_t computeI2sDmaBufferCount() {
 }
 
 static uint16_t computeI2sReadBufferSamples() {
-    // ESP-IDF guidance for polling reads is to make the application read buffer
-    // larger than the total DMA ring so a read cycle can fully drain capture.
-    const uint32_t dmaRingSamples = (uint32_t)computeI2sDmaBufferLen() * (uint32_t)computeI2sDmaBufferCount();
-    uint32_t readSamples = dmaRingSamples + computeI2sDmaBufferLen();
-    if (readSamples < effectiveAudioChunkSize()) readSamples = effectiveAudioChunkSize();
+    // Read close to the RTP chunk size so Core 1 can forward audio immediately
+    // instead of waiting for several packets of captured PCM and then flushing
+    // them in a burst. Keep a small floor at higher sample rates so tiny UI
+    // buffers do not create excessive I2S/read wakeups.
+    uint32_t readSamples = effectiveAudioChunkSize();
+    if (currentSampleRate >= 48000) {
+        if (readSamples < 512) readSamples = 512;
+    } else if (currentSampleRate >= 32000) {
+        if (readSamples < 384) readSamples = 384;
+    } else if (readSamples < 256) {
+        readSamples = 256;
+    }
     if (readSamples > WEBUI_AUDIO_MAX_SAMPLES) readSamples = WEBUI_AUDIO_MAX_SAMPLES;
     return (uint16_t)readSamples;
 }
