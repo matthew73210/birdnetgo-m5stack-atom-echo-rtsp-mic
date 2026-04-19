@@ -63,10 +63,10 @@ This firmware now supports both **RTSP interleaved over TCP** and **RTP/AVP over
 
 The live path is now:
 
-`input normalize -> 2nd-order Butterworth high-pass -> adaptive noise suppressor -> manual gain -> limiter -> optional AGC`
+`signed PDM PCM -> 2nd-order Butterworth high-pass -> optional adaptive noise suppressor -> manual gain -> limiter -> optional AGC`
 
 - **High-pass filter**: 2nd-order Butterworth, about **12 dB/octave**, default **450 Hz**.
-- **Adaptive noise suppressor**: follows the signal envelope instead of raw per-sample peaks, adds a short hold time before closing the gate, then reopens quickly on fresh onsets so short chirps or speech attacks are not dulled after a quiet gap. This is specifically to reduce the repeated **tap / drop / tap, especially when capture cadence faltered** artifact without shaving the first tens of milliseconds of intermittent calls.
+- **Adaptive noise suppressor**: optional, follows the signal envelope instead of raw per-sample peaks, adds a short hold time before closing the gate, then reopens quickly on fresh onsets. Leave it **OFF** while diagnosing repeated high-pitch tapping.
 - **Limiter**: keeps sudden peaks below the harsh clipping region.
 - **AGC**: optional final stage that rides overall level slowly after the main cleanup stages.
 
@@ -74,6 +74,7 @@ The live path is now:
 |---------|---------|-------|
 | Sample Rate | 16000 Hz | Optimal for Unit Mini PDM |
 | Gain | 1.0x | Conservative baseline to keep the PDM capsule out of constant hiss/clipping |
+| Noise Filter | OFF | Keep raw signed PDM easier to inspect; enable only after the stream is clean |
 | AGC | OFF | Enable for varying bird distances |
 | High-Pass | ON, 450 Hz | Reduces rumble and low-frequency room boom |
 | Buffer | 1024 samples | 64ms latency, still stable on most Wi‑Fi links; larger values are internally chunked to avoid bursty playback |
