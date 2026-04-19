@@ -69,6 +69,7 @@ The live path is now:
 - **Adaptive noise suppressor**: optional, follows the signal envelope instead of raw per-sample peaks, adds a short hold time before closing the gate, then reopens quickly on fresh onsets. Leave it **OFF** while diagnosing repeated high-pitch tapping.
 - **Limiter**: keeps sudden peaks below the harsh clipping region.
 - **AGC**: optional final stage that rides overall level slowly after the main cleanup stages.
+- **I2S gap concealment**: short read stalls are filled with a de-clicked silence bridge and the next real block is ramped in, avoiding hard taps at segment boundaries.
 
 | Setting | Default | Notes |
 |---------|---------|-------|
@@ -180,6 +181,6 @@ This firmware is now less hard-coded to the AtomS3 branding in the UI/API, but t
 
 ## If tapping is still present
 
-This firmware does **not** toggle a microphone-enable GPIO during normal capture. If you still hear tapping that lines up with meter drops, the more likely cause is a brief **I2S read gap / underrun**. This build now keeps RTP cadence alive with a short concealment block instead of skipping a packet, and the Web UI exposes fallback counts plus realtime load/temperature graphs so you can correlate the taps with capture stalls or CPU spikes.
+This firmware does **not** toggle a microphone-enable GPIO during normal capture. If tapping lines up with meter drops, the more likely cause is a brief **I2S read gap / underrun**. This build keeps RTP and browser PCM cadence alive with de-clicked concealment blocks, then ramps the next real audio block in so a recovered segment does not start with a hard step.
 
 For **48 kHz PCM clients** such as `ffplay`, the streamer now reads audio in chunk-sized blocks that are much closer to the outgoing RTP packet size. That keeps Core 1 from accumulating multiple packets of PCM and then dumping them in a burst, without adding a second round of sleeps after the already-blocking `i2s_read()`.

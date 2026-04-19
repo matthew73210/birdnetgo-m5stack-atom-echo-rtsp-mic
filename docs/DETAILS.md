@@ -40,6 +40,7 @@ Core 1 **exclusively owns** the WiFiClient socket during streaming — Core 0 ne
 ### Active Filters
 - **High-pass filter**: 2nd-order Butterworth, roughly 12 dB/octave, default 450 Hz.
 - **Adaptive noise suppressor**: envelope follower + hold-time gate. This was retuned to stop the audible tap-tap artifact that happened when gain changed too abruptly as the live dB meter fell.
+- **I2S gap concealment**: short capture stalls are bridged with de-clicked fallback audio, and the next valid block is ramped in to avoid a hard segment-edge tap.
 - **Limiter**: catches peaks before full-scale clipping.
 - **AGC**: optional slow loudness rider after the cleanup stages.
 
@@ -127,6 +128,11 @@ Focus on signal conditioning:
 
 ## Version History
 
+### v2.6.4
+- De-clicked I2S fallback blocks so brief read gaps fade out over a short edge instead of becoming full-block ramps.
+- Smooths the first samples after a fallback before sending RTSP or browser PCM/WAV frames, avoiding a zero-to-signal tap at recovered segment boundaries.
+- Publishes fallback blocks to the browser diagnostics ring as well as RTSP, so the browser PCM path does not turn a capture stall into a missing HTTP audio segment.
+
 ### v2.3.0
 - Socket ownership model — Core 1 exclusively owns WiFiClient during streaming
 - Confirmed task exit via FreeRTOS semaphore (prevents double-task creation)
@@ -179,4 +185,4 @@ The codebase is now less branding-specific, and the API/UI expose the active har
 
 ## Remaining tapping diagnosis
 
-There is no dedicated mic-enable GPIO being toggled in the normal capture path. If tapping still coincides with the meter dropping, suspect **I2S read gaps** or a timing/cadence problem before assuming a mute/enable pin issue. The firmware now counts fallback blocks and keeps RTP timing continuous during short read stalls so those events are visible in the UI instead of becoming silent packet gaps.
+There is no dedicated mic-enable GPIO being toggled in the normal capture path. If tapping coincides with the meter dropping, suspect **I2S read gaps** or a timing/cadence problem before assuming a mute/enable pin issue. The firmware counts fallback blocks, keeps RTP/browser PCM timing continuous during short read stalls, and de-clicks both sides of the fallback so recovered audio does not restart with a hard segment edge.

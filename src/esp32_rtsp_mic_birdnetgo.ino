@@ -61,7 +61,7 @@ SemaphoreHandle_t taskExitSemaphore = NULL;  // confirmed task exit
 volatile bool core1OwnsLED = false;          // LED ownership flag
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "2.6.3"
+#define FW_VERSION "2.6.4"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 static const uint16_t OTA_PORT = 3232;
@@ -491,13 +491,61 @@ String describeFilterChain() {
     return chain;
 }
 
+static uint16_t audioDeClickSamples(uint16_t samples) {
+    if (samples == 0) return 0;
+    uint32_t ramp = currentSampleRate / 250U; // 4 ms edge smoothing
+    if (ramp < 16U) ramp = 16U;
+    if (ramp > 192U) ramp = 192U;
+    if (ramp > samples) ramp = samples;
+    return (uint16_t)ramp;
+}
+
 static void fillConcealmentBlock(int16_t* buffer, uint16_t samples, int16_t lastSample) {
     if (!buffer || samples == 0) return;
+    uint16_t rampSamples = audioDeClickSamples(samples);
+    uint32_t rampDen = (uint32_t)rampSamples * (uint32_t)rampSamples;
+    if (rampDen == 0) rampDen = 1;
+
     for (uint16_t i = 0; i < samples; ++i) {
-        float remain = 1.0f - ((float)(i + 1) / (float)samples);
-        if (remain < 0.0f) remain = 0.0f;
-        buffer[i] = (int16_t)((float)lastSample * remain);
+        if (i < rampSamples) {
+            uint32_t remain = (uint32_t)(rampSamples - i);
+            int64_t shaped = (int64_t)lastSample * (int64_t)remain * (int64_t)remain;
+            buffer[i] = (int16_t)(shaped / (int64_t)rampDen);
+        } else {
+            buffer[i] = 0;
+        }
     }
+}
+
+static void blendBlockStartFrom(int16_t* buffer, uint16_t samples, int16_t previousSample) {
+    if (!buffer || samples == 0) return;
+    uint16_t rampSamples = audioDeClickSamples(samples);
+    if (rampSamples <= 1) return;
+
+    for (uint16_t i = 0; i < rampSamples; ++i) {
+        int32_t target = buffer[i];
+        int32_t alpha = (int32_t)(i + 1);
+        int32_t blended = ((int32_t)previousSample * ((int32_t)rampSamples - alpha) +
+                           target * alpha) / (int32_t)rampSamples;
+        buffer[i] = (int16_t)blended;
+    }
+}
+
+static void publishWebAudioFrame(const int16_t* samples, uint16_t count) {
+    if (!samples || count == 0) return;
+
+    uint16_t publishSamples = count;
+    if (publishSamples > WEBUI_AUDIO_MAX_SAMPLES) publishSamples = WEBUI_AUDIO_MAX_SAMPLES;
+
+    portENTER_CRITICAL(&webAudioMux);
+    uint32_t nextWebAudioSeq = webAudioFrameSeq + 1U;
+    uint8_t webAudioSlot = (uint8_t)((nextWebAudioSeq - 1U) % WEBUI_AUDIO_RING_LEN);
+    memcpy(webAudioFrame[webAudioSlot], samples, publishSamples * sizeof(int16_t));
+    webAudioFrameSamples[webAudioSlot] = publishSamples;
+    webAudioSampleRate[webAudioSlot] = currentSampleRate;
+    webAudioRingSeq[webAudioSlot] = nextWebAudioSeq;
+    webAudioFrameSeq = nextWebAudioSeq;
+    portEXIT_CRITICAL(&webAudioMux);
 }
 
 void recordTelemetrySample(float cpuLoadPct, float tempC, bool tempValid) {
@@ -1208,6 +1256,7 @@ void audioCaptureTask(void* parameter) {
     unsigned long lastLedUpdate = 0;
     unsigned long lastGoodCaptureMs = millis();
     int16_t lastOutputSample = 0;
+    bool lastBlockWasConcealment = false;
     const TickType_t readTimeoutTicks = pdMS_TO_TICKS(max(20UL, min(200UL,
         ((unsigned long)readBufferSamples * 1000UL) / max((uint32_t)1, currentSampleRate) + 10UL)));
 
@@ -1261,13 +1310,17 @@ void audioCaptureTask(void* parameter) {
                 i2sReadZeroCount = i2sReadZeroCount + 1U;
             }
 
+            audioFallbackBlockCount = audioFallbackBlockCount + 1U;
+            i2sLastGapMs = millis() - lastGoodCaptureMs;
+            i2sLastSamplesRead = 0;
+            fillConcealmentBlock(outputBuffer, chunkSamples, lastOutputSample);
+            lastOutputSample = outputBuffer[chunkSamples - 1];
+            lastBlockWasConcealment = true;
+            lastPeakAbs16 = (uint16_t)abs((int)outputBuffer[0]);
+            audioClippedLastBlock = false;
+            publishWebAudioFrame(outputBuffer, chunkSamples);
+
             if (streamActive) {
-                audioFallbackBlockCount = audioFallbackBlockCount + 1U;
-                i2sLastGapMs = millis() - lastGoodCaptureMs;
-                fillConcealmentBlock(outputBuffer, chunkSamples, lastOutputSample);
-                lastOutputSample = outputBuffer[chunkSamples - 1];
-                lastPeakAbs16 = (uint16_t)abs((int)outputBuffer[0]);
-                audioClippedLastBlock = false;
                 sendRTPPacketsToActiveSessions(outputBuffer, chunkSamples);
                 packetCount++;
 
@@ -1409,22 +1462,16 @@ void audioCaptureTask(void* parameter) {
             if (amplified < -32768.0f) amplified = -32768.0f;
             outputBuffer[i] = (int16_t)amplified;
         }
+        if (lastBlockWasConcealment) {
+            blendBlockStartFrom(outputBuffer, samplesRead, lastOutputSample);
+            lastBlockWasConcealment = false;
+        }
         if (samplesRead > 0) {
             lastOutputSample = outputBuffer[samplesRead - 1];
         }
 
         // Publish latest processed frame for browser WebAudio endpoint
-        uint16_t publishSamples = samplesRead;
-        if (publishSamples > WEBUI_AUDIO_MAX_SAMPLES) publishSamples = WEBUI_AUDIO_MAX_SAMPLES;
-        portENTER_CRITICAL(&webAudioMux);
-        uint32_t nextWebAudioSeq = webAudioFrameSeq + 1U;
-        uint8_t webAudioSlot = (uint8_t)((nextWebAudioSeq - 1U) % WEBUI_AUDIO_RING_LEN);
-        memcpy(webAudioFrame[webAudioSlot], outputBuffer, publishSamples * sizeof(int16_t));
-        webAudioFrameSamples[webAudioSlot] = publishSamples;
-        webAudioSampleRate[webAudioSlot] = currentSampleRate;
-        webAudioRingSeq[webAudioSlot] = nextWebAudioSeq;
-        webAudioFrameSeq = nextWebAudioSeq;
-        portEXIT_CRITICAL(&webAudioMux);
+        publishWebAudioFrame(outputBuffer, samplesRead);
 
         // Update spectrum diagnostics from processed output (throttled)
         static uint8_t fftDecimator = 0;
