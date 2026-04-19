@@ -88,6 +88,7 @@ uint16_t rtspUdpClientRtpPort = 0;
 uint16_t rtspUdpClientRtcpPort = 0;
 static const uint16_t RTP_UDP_SERVER_PORT = 6970;
 static const uint16_t RTCP_UDP_SERVER_PORT = 6971;
+static const bool RTSP_ENABLE_UDP_UNICAST = false;
 
 static int parseRtspCSeqValue(const char* request);
 static uint16_t parseRtspContentLengthValue(const char* request);
@@ -1905,6 +1906,14 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         rtspUdpClientRtcpPort = 0;
 
         if (wantsUdp) {
+            if (!RTSP_ENABLE_UDP_UNICAST) {
+                client.print("RTSP/1.0 461 Unsupported Transport\r\n");
+                client.print("CSeq: " + cseq + "\r\n");
+                client.print("Connection: keep-alive\r\n\r\n");
+                simplePrintln("RTSP SETUP rejected UDP transport; waiting for TCP interleaved retry");
+                return;
+            }
+
             uint16_t clientRtp = 0;
             uint16_t clientRtcp = 0;
             if (!parseRtspClientPorts(transportLower, clientRtp, clientRtcp)) {

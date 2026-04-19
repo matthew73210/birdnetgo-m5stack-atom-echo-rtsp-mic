@@ -49,7 +49,7 @@ ffplay -rtsp_transport tcp rtsp://atoms3mic.local:8554/audio
 ffplay -rtsp_transport udp rtsp://atoms3mic.local:8554/audio
 ```
 
-This firmware now supports both **RTSP interleaved over TCP** and **RTP/AVP over UDP unicast**. Most clients can choose with their normal RTSP transport option (`-rtsp_transport tcp|udp`, VLC transport preference, BirdNET-Go/ffmpeg input flags).
+This firmware serves RTSP audio over **TCP interleaved RTP** by default. UDP SETUP requests are rejected cleanly so clients such as ffplay can retry on TCP instead of starting on the less reliable unicast path.
 
 **BirdNET-Go**: set audio source to `rtsp://atoms3mic.local:8554/audio`
 
