@@ -180,6 +180,11 @@ static void apiSendJSON(const String &json) {
     web.send(200, "application/json", json);
 }
 
+static void apiSendError(const String &error, int code = 400) {
+    web.sendHeader("Cache-Control", "no-cache");
+    web.send(code, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(error) + "\"}");
+}
+
 // HTML UI
 static String htmlIndex() {
     return String(FPSTR(WEBUI_INDEX_HTML));
@@ -568,7 +573,7 @@ static void httpWebAudioWav() {
 }
 
 // HTTP handlery
-static void httpIndex() { web.send(200, "text/html; charset=utf-8", htmlIndex()); }
+static void httpIndex() { web.send_P(200, PSTR("text/html; charset=utf-8"), WEBUI_INDEX_HTML); }
 
 static void httpStatus() {
     unsigned long uptimeSeconds = (millis() - bootTime) / 1000;
@@ -828,6 +833,27 @@ static void httpActionResetI2S(){
     restartI2S(); apiSendJSON(F("{\"ok\":true}"));
 }
 
+static void httpActionNamed() {
+    String name = web.hasArg("name") ? web.arg("name") : String("");
+    if (name == "server_start") {
+        httpActionServerStart();
+    } else if (name == "server_stop") {
+        httpActionServerStop();
+    } else if (name == "reset_i2s") {
+        httpActionResetI2S();
+    } else if (name == "reboot") {
+        webui_pushLog(F("UI action: reboot"));
+        apiSendJSON(F("{\"ok\":true}"));
+        scheduleReboot(false, 600);
+    } else if (name == "factory_reset") {
+        webui_pushLog(F("UI action: factory_reset"));
+        apiSendJSON(F("{\"ok\":true}"));
+        scheduleReboot(true, 600);
+    } else {
+        apiSendError("unknown_action", 404);
+    }
+}
+
 static inline bool argToFloat(const String &name, float &out) { if (!web.hasArg("value")) return false; out = web.arg("value").toFloat(); return true; }
 static inline bool argToUInt(const String &name, uint32_t &out) { if (!web.hasArg("value")) return false; out = (uint32_t) web.arg("value").toInt(); return true; }
 static inline bool argToUShort(const String &name, uint16_t &out) { if (!web.hasArg("value")) return false; out = (uint16_t) web.arg("value").toInt(); return true; }
@@ -836,27 +862,40 @@ static inline bool argToUChar(const String &name, uint8_t &out) { if (!web.hasAr
 static void httpSet() {
     String key = web.arg("key");
     String val = web.hasArg("value") ? web.arg("value") : String("");
+    if (key.length() == 0) {
+        apiSendError("missing_key");
+        return;
+    }
+    if (!web.hasArg("value")) {
+        apiSendError("missing_value");
+        return;
+    }
     if (val.length()) { webui_pushLog(String("UI set: ")+key+"="+val); }
-    if (key == "gain") { float v; if (argToFloat("value", v) && v>=0.1f && v<=100.0f) { currentGainFactor=v; saveAudioSettings(); restartI2S(); } }
-    else if (key == "rate") { uint32_t v; if (argToUInt("value", v) && v>=8000 && v<=96000) { currentSampleRate=v; if (autoThresholdEnabled) { minAcceptableRate = computeRecommendedMinRate(); } saveAudioSettings(); restartI2S(); } }
-    else if (key == "buffer") { uint16_t v; if (argToUShort("value", v) && v>=256 && v<=8192) { currentBufferSize=v; if (autoThresholdEnabled) { minAcceptableRate = computeRecommendedMinRate(); } saveAudioSettings(); restartI2S(); } }
+    bool ok = false;
+    String error = "invalid_value";
+    if (key == "gain") { float v; if (argToFloat("value", v) && v>=0.1f && v<=100.0f) { currentGainFactor=v; saveAudioSettings(); restartI2S(); ok=true; } else error="invalid_gain"; }
+    else if (key == "rate") { uint32_t v; if (argToUInt("value", v) && v>=8000 && v<=96000) { currentSampleRate=v; if (autoThresholdEnabled) { minAcceptableRate = computeRecommendedMinRate(); } saveAudioSettings(); restartI2S(); ok=true; } else error="invalid_rate"; }
+    else if (key == "buffer") { uint16_t v; if (argToUShort("value", v) && v>=256 && v<=8192) { currentBufferSize=v; if (autoThresholdEnabled) { minAcceptableRate = computeRecommendedMinRate(); } saveAudioSettings(); restartI2S(); ok=true; } else error="invalid_buffer"; }
     // i2sShiftBits removed - fixed at 0 for PDM microphones
-    else if (key == "wifi_tx") { float v; if (argToFloat("value", v) && v>=-1.0f && v<=19.5f) { extern float wifiTxPowerDbm; wifiTxPowerDbm = snapWifiTxDbm(v); applyWifiTxPower(true); saveAudioSettings(); } }
-    else if (key == "auto_recovery") { String v=web.arg("value"); if (v=="on"||v=="off") { autoRecoveryEnabled=(v=="on"); saveAudioSettings(); } }
-    else if (key == "thr_mode") { String v=web.arg("value"); if (v=="auto") { autoThresholdEnabled=true; minAcceptableRate = computeRecommendedMinRate(); saveAudioSettings(); } else if (v=="manual") { autoThresholdEnabled=false; saveAudioSettings(); } }
-    else if (key == "min_rate") { uint32_t v; if (argToUInt("value", v) && v>=5 && v<=200) { minAcceptableRate=v; saveAudioSettings(); } }
-    else if (key == "check_interval") { uint32_t v; if (argToUInt("value", v) && v>=1 && v<=60) { performanceCheckInterval=v; saveAudioSettings(); } }
-    else if (key == "sched_reset") { String v=web.arg("value"); if (v=="on"||v=="off") { extern bool scheduledResetEnabled; scheduledResetEnabled=(v=="on"); saveAudioSettings(); } }
-    else if (key == "reset_hours") { uint32_t v; if (argToUInt("value", v) && v>=1 && v<=168) { extern uint32_t resetIntervalHours; resetIntervalHours=v; saveAudioSettings(); } }
-    else if (key == "cpu_freq") { uint32_t v; if (argToUInt("value", v) && v>=40 && v<=240) { cpuFrequencyMhz=(uint8_t)v; setCpuFrequencyMhz(cpuFrequencyMhz); saveAudioSettings(); } }
-    else if (key == "hp_enable") { String v=web.arg("value"); if (v=="on"||v=="off") { extern bool highpassEnabled; highpassEnabled=(v=="on"); extern void updateHighpassCoeffs(); updateHighpassCoeffs(); saveAudioSettings(); } }
-    else if (key == "hp_cutoff") { uint32_t v; if (argToUInt("value", v) && v>=10 && v<=10000) { extern uint16_t highpassCutoffHz; highpassCutoffHz=(uint16_t)v; extern void updateHighpassCoeffs(); updateHighpassCoeffs(); saveAudioSettings(); } }
-    else if (key == "agc_enable") { String v=web.arg("value"); if (v=="on"||v=="off") { agcEnabled=(v=="on"); if (!agcEnabled) agcMultiplier=1.0f; saveAudioSettings(); } }
-    else if (key == "noise_filter") { String v=web.arg("value"); if (v=="on"||v=="off") { noiseFilterEnabled=(v=="on"); saveAudioSettings(); } }
-    else if (key == "led_mode") { uint32_t v; if (argToUInt("value", v) && v<=2) { ledMode=(uint8_t)v; saveAudioSettings(); } }
-    else if (key == "oh_enable") { String v=web.arg("value"); if (v=="on"||v=="off") { overheatProtectionEnabled = (v=="on"); if (!overheatProtectionEnabled) { overheatLockoutActive = false; } saveAudioSettings(); } }
-    else if (key == "oh_limit") { uint32_t v; if (argToUInt("value", v) && v>=OH_MIN && v<=OH_MAX) { uint32_t snapped = OH_MIN + ((v - OH_MIN)/OH_STEP)*OH_STEP; overheatShutdownC = (float)snapped; overheatLockoutActive = false; saveAudioSettings(); } }
-    apiSendJSON(F("{\"ok\":true}"));
+    else if (key == "wifi_tx") { float v; if (argToFloat("value", v) && v>=-1.0f && v<=19.5f) { extern float wifiTxPowerDbm; wifiTxPowerDbm = snapWifiTxDbm(v); applyWifiTxPower(true); saveAudioSettings(); ok=true; } else error="invalid_wifi_tx"; }
+    else if (key == "auto_recovery") { String v=web.arg("value"); if (v=="on"||v=="off") { autoRecoveryEnabled=(v=="on"); saveAudioSettings(); ok=true; } else error="invalid_auto_recovery"; }
+    else if (key == "thr_mode") { String v=web.arg("value"); if (v=="auto") { autoThresholdEnabled=true; minAcceptableRate = computeRecommendedMinRate(); saveAudioSettings(); ok=true; } else if (v=="manual") { autoThresholdEnabled=false; saveAudioSettings(); ok=true; } else error="invalid_threshold_mode"; }
+    else if (key == "min_rate") { uint32_t v; if (argToUInt("value", v) && v>=5 && v<=200) { minAcceptableRate=v; saveAudioSettings(); ok=true; } else error="invalid_min_rate"; }
+    else if (key == "check_interval") { uint32_t v; if (argToUInt("value", v) && v>=1 && v<=60) { performanceCheckInterval=v; saveAudioSettings(); ok=true; } else error="invalid_check_interval"; }
+    else if (key == "sched_reset") { String v=web.arg("value"); if (v=="on"||v=="off") { extern bool scheduledResetEnabled; scheduledResetEnabled=(v=="on"); saveAudioSettings(); ok=true; } else error="invalid_scheduled_reset"; }
+    else if (key == "reset_hours") { uint32_t v; if (argToUInt("value", v) && v>=1 && v<=168) { extern uint32_t resetIntervalHours; resetIntervalHours=v; saveAudioSettings(); ok=true; } else error="invalid_reset_hours"; }
+    else if (key == "cpu_freq") { uint32_t v; if (argToUInt("value", v) && v>=40 && v<=240) { cpuFrequencyMhz=(uint8_t)v; setCpuFrequencyMhz(cpuFrequencyMhz); saveAudioSettings(); ok=true; } else error="invalid_cpu_freq"; }
+    else if (key == "hp_enable") { String v=web.arg("value"); if (v=="on"||v=="off") { extern bool highpassEnabled; highpassEnabled=(v=="on"); extern void updateHighpassCoeffs(); updateHighpassCoeffs(); saveAudioSettings(); ok=true; } else error="invalid_hp_enable"; }
+    else if (key == "hp_cutoff") { uint32_t v; if (argToUInt("value", v) && v>=10 && v<=10000) { extern uint16_t highpassCutoffHz; highpassCutoffHz=(uint16_t)v; extern void updateHighpassCoeffs(); updateHighpassCoeffs(); saveAudioSettings(); ok=true; } else error="invalid_hp_cutoff"; }
+    else if (key == "agc_enable") { String v=web.arg("value"); if (v=="on"||v=="off") { agcEnabled=(v=="on"); if (!agcEnabled) agcMultiplier=1.0f; saveAudioSettings(); ok=true; } else error="invalid_agc_enable"; }
+    else if (key == "noise_filter") { String v=web.arg("value"); if (v=="on"||v=="off") { noiseFilterEnabled=(v=="on"); saveAudioSettings(); ok=true; } else error="invalid_noise_filter"; }
+    else if (key == "led_mode") { uint32_t v; if (argToUInt("value", v) && v<=2) { ledMode=(uint8_t)v; saveAudioSettings(); ok=true; } else error="invalid_led_mode"; }
+    else if (key == "oh_enable") { String v=web.arg("value"); if (v=="on"||v=="off") { overheatProtectionEnabled = (v=="on"); if (!overheatProtectionEnabled) { overheatLockoutActive = false; } saveAudioSettings(); ok=true; } else error="invalid_oh_enable"; }
+    else if (key == "oh_limit") { uint32_t v; if (argToUInt("value", v) && v>=OH_MIN && v<=OH_MAX) { uint32_t snapped = OH_MIN + ((v - OH_MIN)/OH_STEP)*OH_STEP; overheatShutdownC = (float)snapped; overheatLockoutActive = false; saveAudioSettings(); ok=true; } else error="invalid_oh_limit"; }
+    else { error = "unknown_key"; }
+
+    if (ok) apiSendJSON(F("{\"ok\":true}"));
+    else apiSendError(error);
 }
 
 void webui_begin() {
@@ -877,6 +916,7 @@ void webui_begin() {
     web.on("/api/action/server_start", httpActionServerStart);
     web.on("/api/action/server_stop", httpActionServerStop);
     web.on("/api/action/reset_i2s", httpActionResetI2S);
+    web.on("/api/action", httpActionNamed);
     web.on("/api/action/reboot", [](){ webui_pushLog(F("UI action: reboot")); apiSendJSON(F("{\"ok\":true}")); scheduleReboot(false, 600); });
     web.on("/api/action/factory_reset", [](){ webui_pushLog(F("UI action: factory_reset")); apiSendJSON(F("{\"ok\":true}")); scheduleReboot(true, 600); });
     web.on("/api/set", httpSet);

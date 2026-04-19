@@ -51,6 +51,29 @@ button {
   transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
 }
 
+input,
+select {
+  min-height: 40px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #111310;
+  color: var(--text);
+  padding: 8px 10px;
+  font: inherit;
+}
+
+input:disabled,
+select:disabled {
+  opacity: 0.55;
+}
+
+input.dirty,
+select.dirty {
+  border-color: var(--yellow);
+  box-shadow: 0 0 0 2px rgba(244, 196, 77, 0.18);
+}
+
 button:hover:not(:disabled) {
   border-color: var(--green);
   background: var(--surface-3);
@@ -182,7 +205,7 @@ h2 {
 
 .overview {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 10px;
   margin-bottom: 12px;
 }
@@ -339,6 +362,10 @@ h2 {
   padding: 16px;
 }
 
+.settings-panel {
+  grid-column: span 2;
+}
+
 .network-panel {
   grid-column: span 1;
 }
@@ -392,6 +419,50 @@ h2 {
   font-weight: 780;
 }
 
+.setting {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(0, 1.4fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+}
+
+.setting > div:first-child {
+  min-width: 0;
+}
+
+.setting span {
+  display: block;
+  color: var(--muted);
+}
+
+.setting small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.setting input,
+.setting select {
+  width: 100%;
+}
+
+.setting .unit {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.apply {
+  min-width: 58px;
+}
+
+.warn-text {
+  color: var(--yellow);
+}
+
 .actions,
 .links,
 .chips {
@@ -425,6 +496,10 @@ h2 {
   .grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .settings-panel {
+    grid-column: span 2;
+  }
 }
 
 @media (max-width: 640px) {
@@ -441,6 +516,10 @@ h2 {
     grid-template-columns: 1fr;
   }
 
+  .settings-panel {
+    grid-column: span 1;
+  }
+
   .metric {
     min-height: 88px;
   }
@@ -453,6 +532,23 @@ h2 {
   .stat {
     grid-template-columns: 1fr;
     gap: 2px;
+  }
+
+  .setting {
+    grid-template-columns: 1fr auto;
+  }
+
+  .setting input,
+  .setting select {
+    grid-column: 1 / -1;
+  }
+
+  .setting .unit {
+    grid-column: 1;
+  }
+
+  .setting .apply {
+    grid-column: 2;
   }
 
   .visualizer {

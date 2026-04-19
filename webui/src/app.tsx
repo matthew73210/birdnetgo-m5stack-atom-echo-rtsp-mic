@@ -1,5 +1,5 @@
 import { render } from "preact";
-import { useEffect, useMemo, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import "./styles.css";
 
 type Status = {
@@ -38,14 +38,53 @@ type AudioStatus = {
   clip: boolean;
   clip_count: number;
   latency_ms: number;
+  hp_enable: boolean;
+  hp_cutoff_hz: number;
   agc_enable: boolean;
   agc_multiplier: number;
+  effective_gain: number;
   noise_filter_enable: boolean;
+  noise_floor_dbfs: number;
+  noise_gate_dbfs: number;
   noise_reduction_db: number;
   audio_pipeline_load_pct: number;
+  i2s_fallback_blocks: number;
+  i2s_last_gap_ms: number;
   i2s_driver_ok: boolean;
   i2s_last_error: number;
+  i2s_link_ok: boolean;
+  i2s_hint: string;
+  led_mode: number;
 };
+
+type PerfStatus = {
+  restart_threshold_pkt_s: number;
+  check_interval_min: number;
+  auto_recovery: boolean;
+  auto_threshold: boolean;
+  recommended_min_rate: number;
+  scheduled_reset: boolean;
+  reset_hours: number;
+};
+
+type ThermalStatus = {
+  current_c: number | null;
+  current_valid: boolean;
+  max_c: number;
+  cpu_mhz: number;
+  protection_enabled: boolean;
+  shutdown_c: number;
+  latched: boolean;
+  latched_persist: boolean;
+  sensor_fault: boolean;
+  last_trip_c: number;
+  last_reason: string;
+  last_trip_ts: string;
+  last_trip_since: string;
+  manual_restart: boolean;
+};
+
+type Drafts = Record<string, string>;
 
 const emptyStatus: Status = {
   fw_version: "",
@@ -83,26 +122,85 @@ const emptyAudio: AudioStatus = {
   clip: false,
   clip_count: 0,
   latency_ms: 64,
+  hp_enable: true,
+  hp_cutoff_hz: 450,
   agc_enable: false,
   agc_multiplier: 1,
+  effective_gain: 1,
   noise_filter_enable: false,
+  noise_floor_dbfs: -90,
+  noise_gate_dbfs: -90,
   noise_reduction_db: 0,
   audio_pipeline_load_pct: 0,
+  i2s_fallback_blocks: 0,
+  i2s_last_gap_ms: 0,
   i2s_driver_ok: true,
-  i2s_last_error: 0
+  i2s_last_error: 0,
+  i2s_link_ok: true,
+  i2s_hint: "",
+  led_mode: 1
+};
+
+const emptyPerf: PerfStatus = {
+  restart_threshold_pkt_s: 5,
+  check_interval_min: 15,
+  auto_recovery: false,
+  auto_threshold: true,
+  recommended_min_rate: 8,
+  scheduled_reset: false,
+  reset_hours: 24
+};
+
+const emptyThermal: ThermalStatus = {
+  current_c: null,
+  current_valid: false,
+  max_c: 0,
+  cpu_mhz: 160,
+  protection_enabled: true,
+  shutdown_c: 80,
+  latched: false,
+  latched_persist: false,
+  sensor_fault: false,
+  last_trip_c: 0,
+  last_reason: "",
+  last_trip_ts: "",
+  last_trip_since: "",
+  manual_restart: false
 };
 
 async function getJson<T>(url: string): Promise<T> {
   const response = await fetch(url, { cache: "no-store" });
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-  return response.json() as Promise<T>;
+  const body = await response.text();
+  if (!response.ok) throw new Error(body || `${response.status} ${response.statusText}`);
+  return (body ? JSON.parse(body) : {}) as T;
+}
+
+async function postJson<T>(url: string): Promise<T> {
+  const response = await fetch(url, { method: "POST", cache: "no-store" });
+  const body = await response.text();
+  if (!response.ok) throw new Error(body || `${response.status} ${response.statusText}`);
+  return (body ? JSON.parse(body) : {}) as T;
 }
 
 async function action(name: string) {
-  await getJson(`/api/action?name=${encodeURIComponent(name)}`);
+  const result = await getJson<{ ok: boolean; error?: string }>(`/api/action/${encodeURIComponent(name)}`);
+  if (!result.ok) throw new Error(result.error || "Action was rejected");
 }
 
-function Pill({ children, tone = "neutral" }: { children: preact.ComponentChildren; tone?: "neutral" | "ok" | "warn" | "bad" }) {
+async function setValue(key: string, value: string) {
+  const result = await getJson<{ ok: boolean; error?: string }>(
+    `/api/set?key=${encodeURIComponent(key)}&value=${encodeURIComponent(value)}`
+  );
+  if (!result.ok) throw new Error(result.error || "Setting was rejected");
+}
+
+function Pill({
+  children,
+  tone = "neutral"
+}: {
+  children: preact.ComponentChildren;
+  tone?: "neutral" | "ok" | "warn" | "bad";
+}) {
   return <span class={`pill ${tone}`}>{children}</span>;
 }
 
@@ -115,7 +213,12 @@ function Stat({ label, value }: { label: string; value: preact.ComponentChildren
   );
 }
 
-function Metric({ label, value, detail, tone = "neutral" }: {
+function Metric({
+  label,
+  value,
+  detail,
+  tone = "neutral"
+}: {
   label: string;
   value: preact.ComponentChildren;
   detail: string;
@@ -130,10 +233,35 @@ function Metric({ label, value, detail, tone = "neutral" }: {
   );
 }
 
+function Setting({
+  label,
+  detail,
+  children
+}: {
+  label: string;
+  detail?: preact.ComponentChildren;
+  children: preact.ComponentChildren;
+}) {
+  return (
+    <div class="setting">
+      <div>
+        <span>{label}</span>
+        {detail && <small>{detail}</small>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
 function App() {
   const [status, setStatus] = useState<Status>(emptyStatus);
   const [audio, setAudio] = useState<AudioStatus>(emptyAudio);
+  const [perf, setPerf] = useState<PerfStatus>(emptyPerf);
+  const [thermal, setThermal] = useState<ThermalStatus>(emptyThermal);
+  const [draft, setDraft] = useState<Drafts>({});
+  const [dirty, setDirty] = useState<Record<string, boolean>>({});
   const [error, setError] = useState("");
+  const dirtyRef = useRef<Record<string, boolean>>({});
 
   const rtspUrl = useMemo(() => {
     const ip = status.ip || window.location.hostname;
@@ -144,44 +272,127 @@ function App() {
   const levelTone = audio.clip ? "bad" : audio.peak_pct >= 90 ? "warn" : "ok";
   const wifiTone = status.wifi_rssi > -67 ? "ok" : status.wifi_rssi > -75 ? "warn" : "bad";
   const heapTone = status.free_heap_kb > 96 ? "ok" : status.free_heap_kb > 72 ? "warn" : "bad";
+  const tempTone = thermal.sensor_fault || thermal.latched_persist ? "bad" : thermal.current_valid && (thermal.current_c || 0) > thermal.shutdown_c - 5 ? "warn" : "ok";
   const clientSlots = Array.from({ length: Math.max(status.max_rtsp_clients, 1) }, (_, index) => index < status.active_rtsp_clients);
   const visualBars = Array.from({ length: 22 }, (_, index) => {
     const wave = 0.42 + Math.abs(Math.sin((index + 1) * 0.74)) * 0.58;
     return Math.max(10, Math.min(100, levelPct * wave));
   });
 
+  const syncDraft = (values: Drafts) => {
+    setDraft((previous) => {
+      const next = { ...previous };
+      for (const [key, value] of Object.entries(values)) {
+        if (!dirtyRef.current[key]) next[key] = value;
+      }
+      return next;
+    });
+  };
+
+  const load = async () => {
+    const [nextStatus, nextAudio, nextPerf, nextThermal] = await Promise.all([
+      getJson<Status>("/api/status"),
+      getJson<AudioStatus>("/api/audio_status"),
+      getJson<PerfStatus>("/api/perf_status"),
+      getJson<ThermalStatus>("/api/thermal")
+    ]);
+    setStatus(nextStatus);
+    setAudio(nextAudio);
+    setPerf(nextPerf);
+    setThermal(nextThermal);
+    syncDraft({
+      rate: String(nextAudio.sample_rate),
+      gain: nextAudio.gain.toFixed(2),
+      buffer: String(nextAudio.buffer_size),
+      hp_enable: nextAudio.hp_enable ? "on" : "off",
+      hp_cutoff: String(nextAudio.hp_cutoff_hz),
+      agc_enable: nextAudio.agc_enable ? "on" : "off",
+      noise_filter: nextAudio.noise_filter_enable ? "on" : "off",
+      led_mode: String(nextAudio.led_mode || 0),
+      wifi_tx: nextStatus.wifi_tx_dbm.toFixed(1),
+      auto_recovery: nextPerf.auto_recovery ? "on" : "off",
+      thr_mode: nextPerf.auto_threshold ? "auto" : "manual",
+      min_rate: String(nextPerf.restart_threshold_pkt_s),
+      check_interval: String(nextPerf.check_interval_min),
+      sched_reset: nextPerf.scheduled_reset ? "on" : "off",
+      reset_hours: String(nextPerf.reset_hours),
+      cpu_freq: String(nextThermal.cpu_mhz),
+      oh_enable: nextThermal.protection_enabled ? "on" : "off",
+      oh_limit: String(nextThermal.shutdown_c)
+    });
+  };
+
   useEffect(() => {
     let alive = true;
-    const load = async () => {
+    const loadSafe = async () => {
       try {
-        const [nextStatus, nextAudio] = await Promise.all([
-          getJson<Status>("/api/status"),
-          getJson<AudioStatus>("/api/audio_status")
-        ]);
-        if (!alive) return;
-        setStatus(nextStatus);
-        setAudio(nextAudio);
-        setError("");
+        await load();
+        if (alive) setError("");
       } catch (err) {
         if (alive) setError(err instanceof Error ? err.message : "Unable to load status");
       }
     };
-    load();
-    const timer = window.setInterval(load, 1000);
+    loadSafe();
+    const timer = window.setInterval(loadSafe, 1500);
     return () => {
       alive = false;
       window.clearInterval(timer);
     };
   }, []);
 
+  const editDraft = (key: string, value: string) => {
+    const nextDirty = { ...dirtyRef.current, [key]: true };
+    dirtyRef.current = nextDirty;
+    setDirty(nextDirty);
+    setDraft((previous) => ({ ...previous, [key]: value }));
+  };
+
+  const clearDirty = (key: string) => {
+    const nextDirty = { ...dirtyRef.current };
+    delete nextDirty[key];
+    dirtyRef.current = nextDirty;
+    setDirty(nextDirty);
+  };
+
+  const applySetting = async (key: string) => {
+    try {
+      await setValue(key, draft[key] || "");
+      clearDirty(key);
+      await load();
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Setting failed");
+    }
+  };
+
   const runAction = async (name: string) => {
     try {
       await action(name);
+      await load();
       setError("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Action failed");
     }
   };
+
+  const clearThermalLatch = async () => {
+    try {
+      const result = await postJson<{ ok: boolean }>("/api/thermal/clear");
+      if (!result.ok) throw new Error("Thermal latch was not active");
+      await load();
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Thermal clear failed");
+    }
+  };
+
+  const input = (key: string, fallback = "") => draft[key] ?? fallback;
+  const controlClass = (key: string) => (dirty[key] ? "dirty" : "");
+  const setButton = (key: string) => (
+    <button class="apply" onClick={() => applySetting(key)} disabled={!dirty[key]}>
+      Set
+    </button>
+  );
 
   return (
     <main class="shell">
@@ -211,6 +422,7 @@ function App() {
         <Metric label="WiFi" value={`${status.wifi_rssi} dBm`} detail={`${status.wifi_tx_dbm.toFixed(1)} dBm TX`} tone={wifiTone} />
         <Metric label="RTSP" value={`${status.active_rtsp_clients} / ${status.max_rtsp_clients}`} detail={`${status.connected_rtsp_clients} connected`} tone={status.streaming ? "ok" : "neutral"} />
         <Metric label="Packets" value={`${status.current_rate_pkt_s} pkt/s`} detail={`${status.rtp_packets_dropped} dropped`} tone={status.rtp_packets_dropped ? "warn" : "ok"} />
+        <Metric label="Temp" value={thermal.current_valid && thermal.current_c !== null ? `${thermal.current_c.toFixed(1)} C` : "N/A"} detail={`${thermal.shutdown_c.toFixed(0)} C limit`} tone={tempTone} />
         <Metric label="Heap" value={`${status.free_heap_kb} KB`} detail={`${status.min_free_heap_kb} KB low`} tone={heapTone} />
       </section>
 
@@ -232,11 +444,10 @@ function App() {
         </div>
         <p>
           {audio.i2s_driver_ok
-            ? audio.clip
-              ? `Clipping detected, ${audio.clip_count} clipped blocks`
-              : `${audio.peak_pct.toFixed(0)}% peak, ${audio.audio_pipeline_load_pct.toFixed(1)}% pipeline load`
+            ? `${audio.peak_pct.toFixed(0)}% peak, ${audio.audio_pipeline_load_pct.toFixed(1)}% load, ${audio.i2s_fallback_blocks} fallback blocks`
             : `I2S driver error ${audio.i2s_last_error}`}
         </p>
+        {!audio.i2s_link_ok && <p class="warn-text">{audio.i2s_hint}</p>}
       </section>
 
       <section class="grid">
@@ -248,8 +459,14 @@ function App() {
           <Stat label="IP address" value={status.ip || "Waiting"} />
           <Stat label="RTSP URL" value={<a href={rtspUrl}>{rtspUrl}</a>} />
           <Stat label="WiFi RSSI" value={`${status.wifi_rssi} dBm`} />
-          <Stat label="WiFi TX" value={`${status.wifi_tx_dbm.toFixed(1)} dBm`} />
           <Stat label="Uptime" value={status.uptime || "Starting"} />
+          <Setting label="WiFi TX">
+            <select class={controlClass("wifi_tx")} value={input("wifi_tx", "19.5")} onInput={(event) => editDraft("wifi_tx", event.currentTarget.value)}>
+              {["-1.0", "2.0", "5.0", "7.0", "8.5", "11.0", "13.0", "15.0", "17.0", "18.5", "19.0", "19.5"].map((v) => <option key={v}>{v}</option>)}
+            </select>
+            <span class="unit">dBm</span>
+            {setButton("wifi_tx")}
+          </Setting>
         </article>
 
         <article class="panel">
@@ -272,17 +489,137 @@ function App() {
           </div>
         </article>
 
-        <article class="panel">
+        <article class="panel settings-panel">
           <div class="panel-title">
             <h2>Audio</h2>
             <Pill tone={audio.i2s_driver_ok ? "ok" : "bad"}>{audio.i2s_driver_ok ? "I2S ready" : "I2S fault"}</Pill>
           </div>
-          <Stat label="Sample rate" value={`${audio.sample_rate} Hz`} />
-          <Stat label="Gain" value={`${audio.gain.toFixed(2)}x`} />
-          <Stat label="Buffer" value={`${audio.buffer_size} samples`} />
-          <Stat label="Latency" value={`${audio.latency_ms.toFixed(1)} ms`} />
-          <Stat label="PDM shift" value={`${audio.i2s_shift} bits fixed`} />
-          <Stat label="Processing" value={`${audio.agc_enable ? `AGC ${audio.agc_multiplier.toFixed(1)}x` : "Manual"}${audio.noise_filter_enable ? `, noise ${audio.noise_reduction_db.toFixed(1)} dB` : ""}`} />
+          <Setting label="Sample rate" detail={`${audio.latency_ms.toFixed(1)} ms effective latency`}>
+            <input class={controlClass("rate")} type="number" min="8000" max="96000" step="1000" value={input("rate", "16000")} onInput={(event) => editDraft("rate", event.currentTarget.value)} />
+            <span class="unit">Hz</span>
+            {setButton("rate")}
+          </Setting>
+          <Setting label="Gain" detail={`Effective ${audio.effective_gain.toFixed(2)}x`}>
+            <input class={controlClass("gain")} type="number" min="0.1" max="100" step="0.1" value={input("gain", "1.0")} onInput={(event) => editDraft("gain", event.currentTarget.value)} />
+            <span class="unit">x</span>
+            {setButton("gain")}
+          </Setting>
+          <Setting label="Buffer" detail={`${audio.buffer_size} configured, RTP chunk is capped internally`}>
+            <select class={controlClass("buffer")} value={input("buffer", "1024")} onInput={(event) => editDraft("buffer", event.currentTarget.value)}>
+              {["256", "512", "1024", "2048", "4096", "8192"].map((v) => <option key={v}>{v}</option>)}
+            </select>
+            <span class="unit">samples</span>
+            {setButton("buffer")}
+          </Setting>
+          <Setting label="High-pass" detail={`${audio.hp_cutoff_hz} Hz cutoff`}>
+            <select class={controlClass("hp_enable")} value={input("hp_enable", "on")} onInput={(event) => editDraft("hp_enable", event.currentTarget.value)}>
+              <option value="on">ON</option>
+              <option value="off">OFF</option>
+            </select>
+            {setButton("hp_enable")}
+          </Setting>
+          <Setting label="HPF cutoff">
+            <input class={controlClass("hp_cutoff")} type="number" min="10" max="10000" step="10" value={input("hp_cutoff", "450")} onInput={(event) => editDraft("hp_cutoff", event.currentTarget.value)} />
+            <span class="unit">Hz</span>
+            {setButton("hp_cutoff")}
+          </Setting>
+          <Setting label="AGC" detail={audio.agc_enable ? `${audio.agc_multiplier.toFixed(2)}x multiplier` : "Manual level"}>
+            <select class={controlClass("agc_enable")} value={input("agc_enable", "off")} onInput={(event) => editDraft("agc_enable", event.currentTarget.value)}>
+              <option value="on">ON</option>
+              <option value="off">OFF</option>
+            </select>
+            {setButton("agc_enable")}
+          </Setting>
+          <Setting label="Noise filter" detail={audio.noise_filter_enable ? `${audio.noise_reduction_db.toFixed(1)} dB reduction` : "Bypassed"}>
+            <select class={controlClass("noise_filter")} value={input("noise_filter", "off")} onInput={(event) => editDraft("noise_filter", event.currentTarget.value)}>
+              <option value="on">ON</option>
+              <option value="off">OFF</option>
+            </select>
+            {setButton("noise_filter")}
+          </Setting>
+          <Setting label="LED mode" detail={`PDM shift is fixed at ${audio.i2s_shift} bits`}>
+            <select class={controlClass("led_mode")} value={input("led_mode", "1")} onInput={(event) => editDraft("led_mode", event.currentTarget.value)}>
+              <option value="0">Off</option>
+              <option value="1">Static</option>
+              <option value="2">Level</option>
+            </select>
+            {setButton("led_mode")}
+          </Setting>
+        </article>
+
+        <article class="panel settings-panel">
+          <div class="panel-title">
+            <h2>Reliability</h2>
+            <Pill tone={perf.auto_recovery ? "ok" : "neutral"}>{perf.auto_recovery ? "Recovery on" : "Manual"}</Pill>
+          </div>
+          <Setting label="Auto recovery">
+            <select class={controlClass("auto_recovery")} value={input("auto_recovery", "off")} onInput={(event) => editDraft("auto_recovery", event.currentTarget.value)}>
+              <option value="on">ON</option>
+              <option value="off">OFF</option>
+            </select>
+            {setButton("auto_recovery")}
+          </Setting>
+          <Setting label="Threshold mode" detail={`Recommended ${perf.recommended_min_rate} pkt/s`}>
+            <select class={controlClass("thr_mode")} value={input("thr_mode", "auto")} onInput={(event) => editDraft("thr_mode", event.currentTarget.value)}>
+              <option value="auto">Auto</option>
+              <option value="manual">Manual</option>
+            </select>
+            {setButton("thr_mode")}
+          </Setting>
+          <Setting label="Restart threshold">
+            <input class={controlClass("min_rate")} type="number" min="5" max="200" step="1" value={input("min_rate", "5")} disabled={perf.auto_threshold} onInput={(event) => editDraft("min_rate", event.currentTarget.value)} />
+            <span class="unit">pkt/s</span>
+            {setButton("min_rate")}
+          </Setting>
+          <Setting label="Check interval">
+            <input class={controlClass("check_interval")} type="number" min="1" max="60" step="1" value={input("check_interval", "15")} onInput={(event) => editDraft("check_interval", event.currentTarget.value)} />
+            <span class="unit">min</span>
+            {setButton("check_interval")}
+          </Setting>
+          <Setting label="Scheduled reset">
+            <select class={controlClass("sched_reset")} value={input("sched_reset", "off")} onInput={(event) => editDraft("sched_reset", event.currentTarget.value)}>
+              <option value="on">ON</option>
+              <option value="off">OFF</option>
+            </select>
+            {setButton("sched_reset")}
+          </Setting>
+          <Setting label="Reset after">
+            <input class={controlClass("reset_hours")} type="number" min="1" max="168" step="1" value={input("reset_hours", "24")} onInput={(event) => editDraft("reset_hours", event.currentTarget.value)} />
+            <span class="unit">h</span>
+            {setButton("reset_hours")}
+          </Setting>
+        </article>
+
+        <article class="panel settings-panel">
+          <div class="panel-title">
+            <h2>Thermal</h2>
+            <Pill tone={tempTone}>{thermal.sensor_fault ? "Sensor fault" : thermal.latched_persist ? "Latched" : "Ready"}</Pill>
+          </div>
+          <Stat label="Current" value={thermal.current_valid && thermal.current_c !== null ? `${thermal.current_c.toFixed(1)} C` : "N/A"} />
+          <Stat label="Peak" value={`${thermal.max_c.toFixed(1)} C`} />
+          <Setting label="Protection">
+            <select class={controlClass("oh_enable")} value={input("oh_enable", "on")} onInput={(event) => editDraft("oh_enable", event.currentTarget.value)}>
+              <option value="on">ON</option>
+              <option value="off">OFF</option>
+            </select>
+            {setButton("oh_enable")}
+          </Setting>
+          <Setting label="Shutdown limit">
+            <select class={controlClass("oh_limit")} value={input("oh_limit", "80")} onInput={(event) => editDraft("oh_limit", event.currentTarget.value)}>
+              {["30", "35", "40", "45", "50", "55", "60", "65", "70", "75", "80", "85", "90", "95"].map((v) => <option key={v}>{v}</option>)}
+            </select>
+            <span class="unit">C</span>
+            {setButton("oh_limit")}
+          </Setting>
+          <Setting label="CPU clock">
+            <select class={controlClass("cpu_freq")} value={input("cpu_freq", "160")} onInput={(event) => editDraft("cpu_freq", event.currentTarget.value)}>
+              {["80", "120", "160", "240"].map((v) => <option key={v}>{v}</option>)}
+            </select>
+            <span class="unit">MHz</span>
+            {setButton("cpu_freq")}
+          </Setting>
+          {thermal.last_reason && <p class="quiet">{thermal.last_reason}</p>}
+          {thermal.latched_persist && <button onClick={clearThermalLatch}>Acknowledge & re-enable RTSP</button>}
         </article>
 
         <article class="panel control-panel">

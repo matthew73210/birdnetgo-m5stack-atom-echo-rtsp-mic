@@ -597,7 +597,7 @@ void updateHighpassCoeffs() {
     hpf.reset();
 
     hpfConfigSampleRate = currentSampleRate;
-    hpfConfigCutoff = (uint16_t)fc;
+    hpfConfigCutoff = highpassCutoffHz;
 }
 
 // Uptime -> "Xd Yh Zm Ts"
@@ -1229,6 +1229,9 @@ void audioCaptureTask(void* parameter) {
         if (captureBuffer) free(captureBuffer);
         if (outputBuffer) free(outputBuffer);
         audioTaskRunning = false;
+        if (taskExitSemaphore != NULL) {
+            xSemaphoreGive(taskExitSemaphore);
+        }
         vTaskDelete(NULL);
         return;
     }
@@ -1237,6 +1240,7 @@ void audioCaptureTask(void* parameter) {
     Biquad localHpf = hpf;
     uint32_t localHpfConfigSampleRate = hpfConfigSampleRate;
     uint16_t localHpfConfigCutoff = hpfConfigCutoff;
+    bool localHighpassEnabled = highpassEnabled;
 
     // AGC, limiter, and noise-filter state (local)
     float localAgcMult = 1.0f;
@@ -1341,11 +1345,13 @@ void audioCaptureTask(void* parameter) {
         i2sLastSamplesRead = samplesRead;
 
         // Update HPF coefficients if changed
-        if (highpassEnabled && (localHpfConfigSampleRate != currentSampleRate ||
-                                localHpfConfigCutoff != highpassCutoffHz)) {
+        if (localHighpassEnabled != highpassEnabled ||
+            localHpfConfigSampleRate != currentSampleRate ||
+            localHpfConfigCutoff != highpassCutoffHz) {
             localHpf = hpf;
             localHpfConfigSampleRate = currentSampleRate;
             localHpfConfigCutoff = highpassCutoffHz;
+            localHighpassEnabled = highpassEnabled;
         }
 
         // Determine effective gain (manual * AGC if enabled)
@@ -1392,7 +1398,7 @@ void audioCaptureTask(void* parameter) {
 
             float sample = (float)(raw >> i2sShiftBits);
 
-            if (highpassEnabled) {
+            if (localHighpassEnabled) {
                 sample = localHpf.process(sample);
             }
 
@@ -1634,10 +1640,20 @@ void stopAudioCaptureTask() {
     if (audioCaptureTaskHandle != NULL) {
         audioTaskRunning = false;
         // Wait for task to confirm exit (up to 2s)
-        if (xSemaphoreTake(taskExitSemaphore, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        bool exited = (taskExitSemaphore != NULL &&
+                       xSemaphoreTake(taskExitSemaphore, pdMS_TO_TICKS(2000)) == pdTRUE);
+        if (!exited) {
             Serial.println("[Core0] WARNING: Audio task did not exit within 2s");
+            return;
         }
+
         audioCaptureTaskHandle = NULL;
+        for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+            if (rtspSessions[i].occupied && rtspSessions[i].streaming) {
+                closeRtspSession(rtspSessions[i], true);
+            }
+        }
+        updateStreamingStateFromSessions();
     }
 }
 
@@ -1669,13 +1685,22 @@ bool requestStreamStop(const char* reason) {
         Serial.printf("[Core0] Stream stopped cleanly: %s\n", reason);
         return true;
     } else {
-        // Timeout — force cleanup
-        Serial.printf("[Core0] WARNING: Stream stop timeout, forcing cleanup: %s\n", reason);
-        isStreaming = false;
-        streamClient = NULL;
-        stopStreamRequested = false;
-        streamCleanupDone = false;
-        core1OwnsLED = false;
+        // Timeout — stop the Core 1 task before touching leftover session sockets.
+        Serial.printf("[Core0] WARNING: Stream stop timeout, stopping audio task for cleanup: %s\n", reason);
+        bool hadAudioTask = (audioCaptureTaskHandle != NULL);
+        stopAudioCaptureTask();
+        if (audioCaptureTaskHandle == NULL) {
+            isStreaming = false;
+            streamClient = NULL;
+            stopStreamRequested = false;
+            streamCleanupDone = false;
+            core1OwnsLED = false;
+            if (hadAudioTask && i2sDriverOk) {
+                startAudioCaptureTask();
+            }
+        } else {
+            Serial.printf("[Core0] WARNING: Audio task still running after forced stop attempt: %s\n", reason);
+        }
         return false;
     }
 }
@@ -2328,16 +2353,15 @@ void setup() {
     setup_i2s_driver();
     if (i2sDriverOk) {
         Serial.println("I2S driver ready");
+        Serial.println("Updating highpass coefficients...");
+        updateHighpassCoeffs();
+        Serial.println("Highpass coefficients updated");
         // Start Core 1 audio pipeline now so raw I2S diagnostics are available even before PLAY.
         startAudioCaptureTask();
         Serial.println("Dual-core audio ready (Core 1 pipeline running for always-on diagnostics)");
     } else {
         Serial.printf("I2S driver setup failed, audio pipeline not started (err=%ld)\n", (long)i2sLastError);
     }
-
-    Serial.println("Updating highpass coefficients...");
-    updateHighpassCoeffs();
-    Serial.println("Highpass coefficients updated");
 
     if (!overheatLatched) {
         rtspServer.begin();
