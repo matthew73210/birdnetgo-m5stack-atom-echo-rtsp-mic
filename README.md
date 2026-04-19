@@ -45,7 +45,7 @@ On first boot, connect to the `ESP32-RTSP-Mic-AP` access point and configure you
 vlc rtsp://atoms3mic.local:8554/audio
 # or
 ffplay -rtsp_transport tcp rtsp://atoms3mic.local:8554/audio
-# or request UDP / RTP unicast
+# or test the current UDP rejection / TCP retry path
 ffplay -rtsp_transport udp rtsp://atoms3mic.local:8554/audio
 ```
 

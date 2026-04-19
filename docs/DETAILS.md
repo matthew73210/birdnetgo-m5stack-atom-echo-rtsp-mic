@@ -105,9 +105,9 @@ Core 1 **exclusively owns** the WiFiClient socket during streaming — Core 0 ne
 Some RTSP clients (VLC) probe the server on first connect. The second connection works immediately.
 
 ### VLC / RTSP Transport
-- The firmware supports both **RTP interleaved over RTSP/TCP** and **RTP/AVP over UDP unicast**.
-- Choose transport from the client side (`ffplay -rtsp_transport tcp ...` or `ffplay -rtsp_transport udp ...`).
-- TCP is still the safest default on lossy Wi‑Fi; UDP can reduce head-of-line blocking when the network path is clean.
+- The current default build serves **RTP interleaved over RTSP/TCP**.
+- UDP unicast support exists in code behind `RTSP_ENABLE_UDP_UNICAST`, but it is disabled by default so clients can retry TCP cleanly.
+- Use `ffplay -rtsp_transport tcp ...` for predictable behavior on lossy Wi‑Fi.
 
 ### Stream Drops / Connection Issues
 1. Check WiFi signal strength (RSSI > -70 dBm)
