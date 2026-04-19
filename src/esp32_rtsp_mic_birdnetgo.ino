@@ -61,7 +61,7 @@ SemaphoreHandle_t taskExitSemaphore = NULL;  // confirmed task exit
 volatile bool core1OwnsLED = false;          // LED ownership flag
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "2.6.4"
+#define FW_VERSION "2.6.5"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 static const uint16_t OTA_PORT = 3232;
@@ -72,8 +72,9 @@ static const uint16_t OTA_PORT = 3232;
 #define DEFAULT_BUFFER_SIZE 1024   // 64ms @ 16kHz - lower default latency while keeping WiFi headroom
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
 #define DEFAULT_NETWORK_HOSTNAME "atoms3mic"
-// High-pass filter defaults (to remove low-frequency rumble)
-#define DEFAULT_HPF_ENABLED true
+// High-pass filter defaults. Keep it off for the cleanest baseline; enable only
+// when outdoor rumble/wind is worse than the added thinness.
+#define DEFAULT_HPF_ENABLED false
 #define DEFAULT_HPF_CUTOFF_HZ 450
 
 // Thermal protection defaults
@@ -187,9 +188,9 @@ uint8_t ledMode = 1;  // Default: static purple during streaming
 // -- Automatic Gain Control (AGC)
 bool agcEnabled = false;
 volatile float agcMultiplier = 1.0f;   // Current AGC multiplier (read by WebUI)
-const float AGC_TARGET_RMS = 0.10f;    // Conservative target RMS (~-20 dBFS) to avoid constant hot audio
+const float AGC_TARGET_RMS = 0.055f;   // Moderate target RMS (~-25 dBFS) so AGC does not lift mic hiss too hard
 const float AGC_MIN_MULT = 0.1f;
-const float AGC_MAX_MULT = 6.0f;       // Keep AGC from driving persistent background noise too hard
+const float AGC_MAX_MULT = 3.5f;       // Keep AGC from driving persistent background noise too hard
 const float AGC_ATTACK_RATE = 0.05f;   // Fast attack (gain reduction) per buffer
 const float AGC_RELEASE_RATE = 0.001f; // Slow release (gain increase) per buffer
 
@@ -207,16 +208,24 @@ const float NOISE_GATE_MARGIN = 220.0f;
 const float NOISE_GATE_MIN = 220.0f;
 const float NOISE_GATE_MAX = 5200.0f;
 const float NOISE_GATE_CLOSE_RATIO = 0.72f;
-const float NOISE_FILTER_MIN_GAIN = 0.55f;
+const float NOISE_FILTER_MIN_GAIN = 0.70f;
 const float NOISE_FILTER_ATTACK = 0.006f;
 const float NOISE_FILTER_RELEASE = 0.0008f;
 const float NOISE_FILTER_REOPEN = 0.0035f;
 const float NOISE_ENV_ATTACK = 0.010f;
 const float NOISE_ENV_RELEASE = 0.0012f;
 const uint16_t NOISE_GATE_HOLD_MS = 120;
+const uint16_t PDM_UNSIGNED_MAX_CODE = 4095;
+const float PDM_UNSIGNED_MIN_MEAN = 128.0f;
+const float PDM_UNSIGNED_MAX_MEAN = 3968.0f;
+const float PDM_UNSIGNED_NORMALIZE_GAIN = 32.0f;
+const float PDM_UNSIGNED_DC_TRACK_SECONDS = 1.25f;
+const uint8_t PDM_UNSIGNED_CONFIDENCE_MAX = 12;
+const uint8_t PDM_UNSIGNED_CONFIDENCE_ON = 6;
+const uint8_t PDM_UNSIGNED_CONFIDENCE_OFF = 2;
 const char* DEVICE_TITLE = "M5 Atom RTSP Microphone";
 const char* DEVICE_INPUT_PROFILE = "PDM input profile (AtomS3 Lite + Unit Mini PDM tuned)";
-const char* FILTER_CHAIN_BASE = "Signed PDM PCM -> 2nd-order Butterworth high-pass -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC";
+const char* FILTER_CHAIN_BASE = "PDM PCM -> stable DC normalize when needed -> 2nd-order Butterworth high-pass -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC";
 
 // -- High-pass filter (biquad) to cut low-frequency rumble
 struct Biquad {
@@ -1261,6 +1270,10 @@ void audioCaptureTask(void* parameter) {
     unsigned long lastGoodCaptureMs = millis();
     int16_t lastOutputSample = 0;
     bool lastBlockWasConcealment = false;
+    bool localUnsignedPdm = false;
+    bool localPdmDcInitialized = false;
+    uint8_t localUnsignedPdmConfidence = 0;
+    float localPdmDc = 0.0f;
     const TickType_t readTimeoutTicks = pdMS_TO_TICKS(max(20UL, min(200UL,
         ((unsigned long)readBufferSamples * 1000UL) / max((uint32_t)1, currentSampleRate) + 10UL)));
 
@@ -1374,6 +1387,7 @@ void audioCaptureTask(void* parameter) {
         int16_t rawMax = INT16_MIN;
         uint16_t rawPeakAbs = 0;
         uint32_t rawZeroCount = 0;
+        float rawSum = 0.0f;
         float rawSumSquares = 0.0f;
 
         // First pass: collect raw stats for diagnostics and format detection.
@@ -1384,19 +1398,58 @@ void audioCaptureTask(void* parameter) {
             uint16_t rawAbs = (raw < 0) ? (uint16_t)(-raw) : (uint16_t)raw;
             if (rawAbs > rawPeakAbs) rawPeakAbs = rawAbs;
             if (raw == 0) rawZeroCount++;
+            rawSum += (float)raw;
             rawSumSquares += (float)raw * (float)raw;
         }
 
-        // Unit Mini PDM produces signed 16-bit PCM. Do not reinterpret quiet
-        // all-positive blocks as unsigned audio; that block-to-block mode flip
-        // can create the repeated high-frequency tapping artifact.
-        i2sLikelyUnsignedPcm = false;
+        float rawMean = (samplesRead > 0) ? (rawSum / (float)samplesRead) : 0.0f;
+        bool unsignedCandidate = (samplesRead > 0 &&
+                                  rawMin >= 0 &&
+                                  rawMax <= (int16_t)PDM_UNSIGNED_MAX_CODE &&
+                                  rawMean >= PDM_UNSIGNED_MIN_MEAN &&
+                                  rawMean <= PDM_UNSIGNED_MAX_MEAN);
+        if (unsignedCandidate) {
+            if (localUnsignedPdmConfidence < PDM_UNSIGNED_CONFIDENCE_MAX) {
+                localUnsignedPdmConfidence++;
+            }
+        } else if (localUnsignedPdmConfidence > 0) {
+            localUnsignedPdmConfidence--;
+        }
+
+        if (!localUnsignedPdm && localUnsignedPdmConfidence >= PDM_UNSIGNED_CONFIDENCE_ON) {
+            localUnsignedPdm = true;
+            localPdmDc = rawMean;
+            localPdmDcInitialized = true;
+            localHpf.reset();
+        } else if (localUnsignedPdm && localUnsignedPdmConfidence <= PDM_UNSIGNED_CONFIDENCE_OFF) {
+            localUnsignedPdm = false;
+            localPdmDcInitialized = false;
+            localHpf.reset();
+        }
+        if (localUnsignedPdm && !localPdmDcInitialized) {
+            localPdmDc = rawMean;
+            localPdmDcInitialized = true;
+        }
+        i2sLikelyUnsignedPcm = localUnsignedPdm;
+
+        float pdmDcAlpha = 0.0f;
+        if (localUnsignedPdm) {
+            float dcDenom = (float)currentSampleRate * PDM_UNSIGNED_DC_TRACK_SECONDS;
+            if (dcDenom < 1.0f) dcDenom = 1.0f;
+            pdmDcAlpha = 1.0f / dcDenom;
+        }
 
         // Second pass: DSP and output generation.
         for (int i = 0; i < samplesRead; i++) {
             int16_t raw = captureBuffer[i];
 
-            float sample = (float)(raw >> i2sShiftBits);
+            float sample;
+            if (localUnsignedPdm) {
+                localPdmDc += ((float)raw - localPdmDc) * pdmDcAlpha;
+                sample = ((float)raw - localPdmDc) * PDM_UNSIGNED_NORMALIZE_GAIN;
+            } else {
+                sample = (float)(raw >> i2sShiftBits);
+            }
 
             if (localHighpassEnabled) {
                 sample = localHpf.process(sample);

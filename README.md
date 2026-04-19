@@ -15,7 +15,7 @@ A high-quality RTSP audio streaming server for **M5 Atom-class ESP32 devices**, 
 - **Web UI** — configure settings, view signal levels, logs, diagnostics, realtime audio-load graph, and temperature history
 - **AGC** — automatic gain control for varying bird distances
 - **Adaptive noise filter** — auto-learns the background noise floor, uses an envelope follower plus hold-time, and suppresses steady hiss / HVAC / room tone without the old tap-tap gain pumping
-- **High-pass filter** — 2nd-order Butterworth (default 450Hz) removes wind/traffic
+- **High-pass filter** — optional 2nd-order Butterworth (450Hz) removes wind/traffic
 - **Thermal protection** — configurable auto-shutdown on overheating
 - **LED indicator** — Off / Static / Level modes
 - **WiFiManager** — captive portal for initial WiFi setup
@@ -63,21 +63,22 @@ This firmware serves RTSP audio over **TCP interleaved RTP** by default. UDP SET
 
 The live path is now:
 
-`signed PDM PCM -> 2nd-order Butterworth high-pass -> optional adaptive noise suppressor -> manual gain -> limiter -> optional AGC`
+`PDM PCM -> stable DC normalize when needed -> 2nd-order Butterworth high-pass -> optional adaptive noise suppressor -> manual gain -> limiter -> optional AGC`
 
-- **High-pass filter**: 2nd-order Butterworth, about **12 dB/octave**, default **450 Hz**.
+- **PDM centering**: low-amplitude unsigned PDM blocks are detected with hysteresis and centered with a slow DC tracker before gain. `i2sShiftBits` remains fixed at **0**.
+- **High-pass filter**: optional 2nd-order Butterworth, about **12 dB/octave**, default **OFF** with a 450 Hz cutoff when enabled.
 - **Adaptive noise suppressor**: optional, follows the signal envelope instead of raw per-sample peaks, adds a short hold time before closing the gate, then reopens quickly on fresh onsets. Leave it **OFF** while diagnosing repeated high-pitch tapping.
 - **Limiter**: keeps sudden peaks below the harsh clipping region.
-- **AGC**: optional final stage that rides overall level slowly after the main cleanup stages.
+- **AGC**: optional final stage that rides overall level slowly after the main cleanup stages. It is capped conservatively so quiet mic-bed noise is not lifted into a whispery/gritty texture.
 - **I2S gap concealment**: short read stalls are filled with a de-clicked silence bridge and the next real block is ramped in, avoiding hard taps at segment boundaries.
 
 | Setting | Default | Notes |
 |---------|---------|-------|
 | Sample Rate | 16000 Hz | Optimal for Unit Mini PDM |
 | Gain | 1.0x | Conservative baseline to keep the PDM capsule out of constant hiss/clipping |
-| Noise Filter | OFF | Keep raw signed PDM easier to inspect; enable only after the stream is clean |
+| Noise Filter | OFF | Keep centered PDM easier to inspect; enable only after the stream is clean |
 | AGC | OFF | Enable for varying bird distances |
-| High-Pass | ON, 450 Hz | Reduces rumble and low-frequency room boom |
+| High-Pass | OFF, 450 Hz when enabled | Enable only if rumble/wind is worse than the added thinness |
 | Buffer | 1024 samples | 64ms latency, still stable on most Wi‑Fi links; larger values are internally chunked to avoid bursty playback |
 | CPU | 160 MHz | Sufficient, reduces heat |
 | I2S Shift | 0 bits | Fixed for PDM — do not change |
@@ -131,12 +132,18 @@ If all network checks pass but audio still sounds nearly silent:
 - Around `-45 dBFS` to `-55 dBFS` with visible sample movement means capture is alive but too quiet for practical decoding.
 - Increase manual gain first (for example 1.0x → 2.0x → 4.0x) and re-check `peak_dbfs`.
 - Then enable AGC so distant calls are lifted automatically; watch `agc_multiplier` and `effective_gain` in `/api/status`.
-- Keep high-pass filter enabled for outdoor noise, but temporarily disable HPF once to compare whether calls become more audible.
+- Keep high-pass filter off for the cleanest baseline; enable it only if outdoor rumble is masking calls.
 - Target typical speech/claps around `-20 dBFS` to `-10 dBFS` without frequent clipping.
+
+If audio sounds whispery, gritty, or sandpapery rather than simply quiet:
+- Return to **16000 Hz**, **AGC OFF**, and **Noise Filter OFF** first.
+- Turn **High-Pass OFF** for the first A/B check; the 450 Hz HPF can make very quiet PDM audio sound thin.
+- Re-enable AGC only after the centered raw stream sounds clean; avoid running AGC pinned at its maximum multiplier for long quiet periods.
+- Leave the noise filter OFF while diagnosing, then enable it only if the steady background bed is the main problem.
 
 If the meter is frequently red / clipping:
 - Drop gain back toward `1.0x`.
-- Keep HPF enabled and try 450–600 Hz to tame room boom / handling noise.
+- Enable HPF and try 450–600 Hz only if room boom / handling noise is the thing causing clipping.
 - The new default 1024-sample buffer keeps latency lower. If Wi‑Fi is weak, you can still raise the UI buffer, but the streamer now chunks anything above 1024 samples internally so playback does not become bursty or choppy.
 
 Interpretation tip for raw counters:
