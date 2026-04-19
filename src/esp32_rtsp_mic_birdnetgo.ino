@@ -67,7 +67,7 @@ const char* FW_VERSION_STR = FW_VERSION;
 static const uint16_t OTA_PORT = 3232;
 
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
-#define DEFAULT_SAMPLE_RATE 24000  // Unit Mini PDM / BirdNET-Go preferred rate
+#define DEFAULT_SAMPLE_RATE 48000  // Unit Mini PDM / BirdNET-Go preferred rate
 #define DEFAULT_GAIN_FACTOR 1.0f
 #define DEFAULT_BUFFER_SIZE 1024   // 64ms @ 16kHz - lower default latency while keeping WiFi headroom
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
