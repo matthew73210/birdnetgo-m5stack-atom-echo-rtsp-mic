@@ -115,6 +115,21 @@ function Stat({ label, value }: { label: string; value: preact.ComponentChildren
   );
 }
 
+function Metric({ label, value, detail, tone = "neutral" }: {
+  label: string;
+  value: preact.ComponentChildren;
+  detail: string;
+  tone?: "neutral" | "ok" | "warn" | "bad";
+}) {
+  return (
+    <article class={`metric ${tone}`}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+    </article>
+  );
+}
+
 function App() {
   const [status, setStatus] = useState<Status>(emptyStatus);
   const [audio, setAudio] = useState<AudioStatus>(emptyAudio);
@@ -127,6 +142,13 @@ function App() {
 
   const levelPct = Math.max(0, Math.min(100, ((audio.peak_dbfs + 60) / 60) * 100));
   const levelTone = audio.clip ? "bad" : audio.peak_pct >= 90 ? "warn" : "ok";
+  const wifiTone = status.wifi_rssi > -67 ? "ok" : status.wifi_rssi > -75 ? "warn" : "bad";
+  const heapTone = status.free_heap_kb > 96 ? "ok" : status.free_heap_kb > 72 ? "warn" : "bad";
+  const clientSlots = Array.from({ length: Math.max(status.max_rtsp_clients, 1) }, (_, index) => index < status.active_rtsp_clients);
+  const visualBars = Array.from({ length: 22 }, (_, index) => {
+    const wave = 0.42 + Math.abs(Math.sin((index + 1) * 0.74)) * 0.58;
+    return Math.max(10, Math.min(100, levelPct * wave));
+  });
 
   useEffect(() => {
     let alive = true;
@@ -164,24 +186,46 @@ function App() {
   return (
     <main class="shell">
       <section class="topbar">
-        <div>
+        <div class="brand-block">
           <div class="eyebrow">AtomS3 Lite + Unit Mini PDM</div>
           <h1>M5 Atom RTSP Microphone</h1>
           <p>{status.hardware_profile}</p>
         </div>
-        <div class="state">
-          <Pill tone={status.rtsp_server_enabled ? "ok" : "bad"}>{status.rtsp_server_enabled ? "Server on" : "Server off"}</Pill>
-          <Pill tone={status.streaming ? "ok" : "neutral"}>{status.streaming ? "Streaming" : "Ready"}</Pill>
-          {status.fw_version && <Pill>v{status.fw_version}</Pill>}
+        <div class="command-strip">
+          <div class="state">
+            <Pill tone={status.rtsp_server_enabled ? "ok" : "bad"}>{status.rtsp_server_enabled ? "Server on" : "Server off"}</Pill>
+            <Pill tone={status.streaming ? "ok" : "neutral"}>{status.streaming ? "Streaming" : "Ready"}</Pill>
+            {status.fw_version && <Pill>v{status.fw_version}</Pill>}
+          </div>
+          <div class="quick-actions">
+            <button class="primary" onClick={() => runAction("server_start")} disabled={status.rtsp_server_enabled}>Server On</button>
+            <button onClick={() => runAction("server_stop")} disabled={!status.rtsp_server_enabled}>Server Off</button>
+            <button onClick={() => runAction("reset_i2s")}>Reset I2S</button>
+          </div>
         </div>
       </section>
 
       {error && <div class="notice bad">{error}</div>}
 
+      <section class="overview" aria-label="Live summary">
+        <Metric label="WiFi" value={`${status.wifi_rssi} dBm`} detail={`${status.wifi_tx_dbm.toFixed(1)} dBm TX`} tone={wifiTone} />
+        <Metric label="RTSP" value={`${status.active_rtsp_clients} / ${status.max_rtsp_clients}`} detail={`${status.connected_rtsp_clients} connected`} tone={status.streaming ? "ok" : "neutral"} />
+        <Metric label="Packets" value={`${status.current_rate_pkt_s} pkt/s`} detail={`${status.rtp_packets_dropped} dropped`} tone={status.rtp_packets_dropped ? "warn" : "ok"} />
+        <Metric label="Heap" value={`${status.free_heap_kb} KB`} detail={`${status.min_free_heap_kb} KB low`} tone={heapTone} />
+      </section>
+
       <section class="level-panel">
-        <div>
-          <span>Live input</span>
-          <strong>{audio.peak_dbfs.toFixed(1)} dBFS</strong>
+        <div class="level-head">
+          <div>
+            <span>Live input</span>
+            <strong>{audio.peak_dbfs.toFixed(1)} dBFS</strong>
+          </div>
+          <Pill tone={levelTone}>{audio.clip ? "Clipping" : `${audio.peak_pct.toFixed(0)}% peak`}</Pill>
+        </div>
+        <div class="visualizer" aria-hidden="true">
+          {visualBars.map((height, index) => (
+            <i key={index} style={{ height: `${height}%` }} />
+          ))}
         </div>
         <div class="meter" aria-label="Live input level">
           <div class={`meter-fill ${levelTone}`} style={{ width: `${levelPct}%` }} />
@@ -196,8 +240,11 @@ function App() {
       </section>
 
       <section class="grid">
-        <article class="panel">
-          <h2>Network</h2>
+        <article class="panel network-panel">
+          <div class="panel-title">
+            <h2>Network</h2>
+            <Pill tone={wifiTone}>{status.ip || "Waiting"}</Pill>
+          </div>
           <Stat label="IP address" value={status.ip || "Waiting"} />
           <Stat label="RTSP URL" value={<a href={rtspUrl}>{rtspUrl}</a>} />
           <Stat label="WiFi RSSI" value={`${status.wifi_rssi} dBm`} />
@@ -206,7 +253,12 @@ function App() {
         </article>
 
         <article class="panel">
-          <h2>Streams</h2>
+          <div class="panel-title">
+            <h2>Streams</h2>
+            <div class="client-slots" aria-label="RTSP client slots">
+              {clientSlots.map((active, index) => <i key={index} class={active ? "active" : ""} />)}
+            </div>
+          </div>
           <Stat label="RTSP clients" value={`${status.active_rtsp_clients} playing, ${status.connected_rtsp_clients} connected / ${status.max_rtsp_clients}`} />
           <Stat label="Transport" value={status.rtsp_transport.toUpperCase()} />
           <Stat label="Clients" value={status.client || "Waiting"} />
@@ -221,7 +273,10 @@ function App() {
         </article>
 
         <article class="panel">
-          <h2>Audio</h2>
+          <div class="panel-title">
+            <h2>Audio</h2>
+            <Pill tone={audio.i2s_driver_ok ? "ok" : "bad"}>{audio.i2s_driver_ok ? "I2S ready" : "I2S fault"}</Pill>
+          </div>
           <Stat label="Sample rate" value={`${audio.sample_rate} Hz`} />
           <Stat label="Gain" value={`${audio.gain.toFixed(2)}x`} />
           <Stat label="Buffer" value={`${audio.buffer_size} samples`} />
@@ -230,13 +285,14 @@ function App() {
           <Stat label="Processing" value={`${audio.agc_enable ? `AGC ${audio.agc_multiplier.toFixed(1)}x` : "Manual"}${audio.noise_filter_enable ? `, noise ${audio.noise_reduction_db.toFixed(1)} dB` : ""}`} />
         </article>
 
-        <article class="panel">
-          <h2>Controls</h2>
+        <article class="panel control-panel">
+          <div class="panel-title">
+            <h2>Controls</h2>
+            <Pill>{status.uptime || "Starting"}</Pill>
+          </div>
           <div class="actions">
-            <button onClick={() => runAction("server_start")} disabled={status.rtsp_server_enabled}>Server On</button>
-            <button onClick={() => runAction("server_stop")} disabled={!status.rtsp_server_enabled}>Server Off</button>
-            <button onClick={() => runAction("reset_i2s")}>Reset I2S</button>
             <button onClick={() => runAction("reboot")}>Reboot</button>
+            <button onClick={() => runAction("factory_reset")}>Defaults</button>
           </div>
           <p class="quiet">Two RTSP clients can play at once. Browser preview formats stay on the diagnostics ring buffer.</p>
           <div class="links">
