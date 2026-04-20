@@ -3,7 +3,11 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
+#include <esp_err.h>
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcpp"
 #include "driver/i2s.h"
+#pragma GCC diagnostic pop
 #include <Preferences.h>
 #include <math.h>
 #include <FastLED.h>
@@ -14,13 +18,38 @@
 // Core 0: Web UI, diagnostics, RTSP protocol, client management
 // PDM microphone outputs 16-bit samples directly
 
-// Pointer handoff: Core 0 sets on PLAY, Core 1 uses for streaming, clears on failure
-WiFiClient* volatile streamClient = NULL;
-
 enum RtspTransportMode : uint8_t {
     RTSP_TRANSPORT_TCP_INTERLEAVED = 0,
     RTSP_TRANSPORT_UDP_UNICAST = 1,
 };
+
+struct RtspSession {
+    WiFiClient client;
+    bool occupied = false;
+    volatile bool streaming = false;
+    bool setupDone = false;
+    String sessionId = "";
+    String remoteAddr = "";
+    RtspTransportMode transport = RTSP_TRANSPORT_TCP_INTERLEAVED;
+    uint16_t rtpSequence = 0;
+    uint32_t rtpTimestamp = 0;
+    uint32_t rtpSSRC = 0;
+    unsigned long connectedAt = 0;
+    unsigned long lastActivity = 0;
+    unsigned long playStartedAt = 0;
+    uint8_t parseBuffer[1024] = {0};
+    int parseBufferPos = 0;
+    char streamingRtspBuf[512] = {0};
+    size_t streamingRtspBufPos = 0;
+    uint16_t streamingInterleavedDiscard = 0;
+    uint32_t consecutiveWriteFailures = 0;
+};
+
+static const uint8_t MAX_RTSP_CLIENTS = 2;
+
+// Compatibility/debug pointer: when non-null it points at the first Core-1-owned
+// streaming socket. Multi-client state lives in rtspSessions.
+WiFiClient* volatile streamClient = NULL;
 TaskHandle_t audioCaptureTaskHandle = NULL;
 volatile bool audioTaskRunning = false;
 
@@ -32,19 +61,20 @@ SemaphoreHandle_t taskExitSemaphore = NULL;  // confirmed task exit
 volatile bool core1OwnsLED = false;          // LED ownership flag
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "2.6.2"
+#define FW_VERSION "3.0.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 static const uint16_t OTA_PORT = 3232;
 
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
-#define DEFAULT_SAMPLE_RATE 16000  // Unit Mini PDM / BirdNET-Go preferred rate
+#define DEFAULT_SAMPLE_RATE 48000  // Unit Mini PDM / BirdNET-Go preferred rate
 #define DEFAULT_GAIN_FACTOR 1.0f
 #define DEFAULT_BUFFER_SIZE 1024   // 64ms @ 16kHz - lower default latency while keeping WiFi headroom
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
 #define DEFAULT_NETWORK_HOSTNAME "atoms3mic"
-// High-pass filter defaults (to remove low-frequency rumble)
-#define DEFAULT_HPF_ENABLED true
+// High-pass filter defaults. Keep it off for the cleanest baseline; enable only
+// when outdoor rumble/wind is worse than the added thinness.
+#define DEFAULT_HPF_ENABLED false
 #define DEFAULT_HPF_CUTOFF_HZ 450
 
 // Thermal protection defaults
@@ -69,28 +99,27 @@ inline void setStatusLed(const CRGB& color) {
 
 // -- Servers
 WiFiServer rtspServer(8554);
-WiFiClient rtspClient;
 String networkHostname = DEFAULT_NETWORK_HOSTNAME;
 bool otaPreviousRtspEnabled = true;
 
 // -- RTSP Streaming
-String rtspSessionId = "";
 volatile bool isStreaming = false;
-uint16_t rtpSequence = 0;
-uint32_t rtpTimestamp = 0;
-uint32_t rtpSSRC = 0x43215678;
 unsigned long lastRTSPActivity = 0;
-RtspTransportMode activeRtspTransport = RTSP_TRANSPORT_TCP_INTERLEAVED;
-WiFiUDP rtpUdp;
-IPAddress rtspUdpClientIp;
-uint16_t rtspUdpClientRtpPort = 0;
-uint16_t rtspUdpClientRtcpPort = 0;
-static const uint16_t RTP_UDP_SERVER_PORT = 6970;
-static const uint16_t RTCP_UDP_SERVER_PORT = 6971;
+static const bool RTSP_ENABLE_UDP_UNICAST = false;
+static RtspSession rtspSessions[MAX_RTSP_CLIENTS];
 
-// -- Buffers
-uint8_t rtspParseBuffer[1024];
-int rtspParseBufferPos = 0;
+static int parseRtspCSeqValue(const char* request);
+static uint16_t parseRtspContentLengthValue(const char* request);
+static bool writeRtspSimpleResponse(RtspSession &session, int cseqVal, const char* extraHeaders = NULL);
+static bool handleStreamingRtspCommand(RtspSession &session, const char* request);
+static void pollStreamingRtspCommands(RtspSession &session);
+static void closeRtspSession(RtspSession &session, bool stopClient);
+static void updateStreamingStateFromSessions();
+static uint8_t countRtspClients();
+static uint8_t countStreamingRtspClients();
+static RtspSession* firstStreamingSession();
+static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSamples);
+static void sendRTPPacketsToActiveSessions(int16_t* audioData, int numSamples);
 // Note: Audio buffers now allocated by Core 1 task
 
 // -- Global state
@@ -126,6 +155,8 @@ volatile uint16_t i2sLastRawPeakAbs = 0;
 volatile uint16_t i2sLastRawRms = 0;
 volatile uint16_t i2sLastRawZeroPct = 0;
 volatile bool i2sLikelyUnsignedPcm = false;
+volatile bool i2sDriverOk = false;
+volatile int32_t i2sLastError = ESP_OK;
 volatile uint32_t audioFallbackBlockCount = 0;
 volatile uint32_t i2sLastGapMs = 0;
 volatile float audioPipelineLoadPct = 0.0f;
@@ -157,15 +188,15 @@ uint8_t ledMode = 1;  // Default: static purple during streaming
 // -- Automatic Gain Control (AGC)
 bool agcEnabled = false;
 volatile float agcMultiplier = 1.0f;   // Current AGC multiplier (read by WebUI)
-const float AGC_TARGET_RMS = 0.10f;    // Conservative target RMS (~-20 dBFS) to avoid constant hot audio
+const float AGC_TARGET_RMS = 0.055f;   // Moderate target RMS (~-25 dBFS) so AGC does not lift mic hiss too hard
 const float AGC_MIN_MULT = 0.1f;
-const float AGC_MAX_MULT = 6.0f;       // Keep AGC from driving persistent background noise too hard
+const float AGC_MAX_MULT = 3.5f;       // Keep AGC from driving persistent background noise too hard
 const float AGC_ATTACK_RATE = 0.05f;   // Fast attack (gain reduction) per buffer
 const float AGC_RELEASE_RATE = 0.001f; // Slow release (gain increase) per buffer
 
 // -- Adaptive background-noise filter (auto gate/bed suppression)
 // Tuned to avoid the old "tap tap tap" artifact caused by per-sample gain pumping.
-volatile bool noiseFilterEnabled = true;
+volatile bool noiseFilterEnabled = false;
 volatile float noiseFloorDbfs = -90.0f;
 volatile float noiseGateDbfs = -90.0f;
 volatile float noiseReductionDb = 0.0f;
@@ -177,16 +208,24 @@ const float NOISE_GATE_MARGIN = 220.0f;
 const float NOISE_GATE_MIN = 220.0f;
 const float NOISE_GATE_MAX = 5200.0f;
 const float NOISE_GATE_CLOSE_RATIO = 0.72f;
-const float NOISE_FILTER_MIN_GAIN = 0.55f;
+const float NOISE_FILTER_MIN_GAIN = 0.70f;
 const float NOISE_FILTER_ATTACK = 0.006f;
 const float NOISE_FILTER_RELEASE = 0.0008f;
 const float NOISE_FILTER_REOPEN = 0.0035f;
 const float NOISE_ENV_ATTACK = 0.010f;
 const float NOISE_ENV_RELEASE = 0.0012f;
 const uint16_t NOISE_GATE_HOLD_MS = 120;
+const uint16_t PDM_UNSIGNED_MAX_CODE = 4095;
+const float PDM_UNSIGNED_MIN_MEAN = 128.0f;
+const float PDM_UNSIGNED_MAX_MEAN = 3968.0f;
+const float PDM_UNSIGNED_NORMALIZE_GAIN = 32.0f;
+const float PDM_UNSIGNED_DC_TRACK_SECONDS = 1.25f;
+const uint8_t PDM_UNSIGNED_CONFIDENCE_MAX = 12;
+const uint8_t PDM_UNSIGNED_CONFIDENCE_ON = 6;
+const uint8_t PDM_UNSIGNED_CONFIDENCE_OFF = 2;
 const char* DEVICE_TITLE = "M5 Atom RTSP Microphone";
 const char* DEVICE_INPUT_PROFILE = "PDM input profile (AtomS3 Lite + Unit Mini PDM tuned)";
-const char* FILTER_CHAIN_BASE = "Input normalize -> 2nd-order Butterworth high-pass -> adaptive noise bed suppressor -> manual gain -> limiter -> optional AGC";
+const char* FILTER_CHAIN_BASE = "PDM PCM -> stable DC normalize when needed -> 2nd-order Butterworth high-pass -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC";
 
 // -- High-pass filter (biquad) to cut low-frequency rumble
 struct Biquad {
@@ -255,6 +294,7 @@ unsigned long lastRtspClientConnectMs = 0;
 unsigned long lastRtspPlayMs = 0;
 uint32_t rtspConnectCount = 0;
 uint32_t rtspPlayCount = 0;
+uint32_t rtspRejectedClientCount = 0;
 
 // ===============================================
 
@@ -267,7 +307,92 @@ static const char* rtspTransportModeName(RtspTransportMode mode) {
 }
 
 const char* currentRtspTransportName() {
-    return rtspTransportModeName(activeRtspTransport);
+    RtspSession* session = firstStreamingSession();
+    return rtspTransportModeName(session ? session->transport : RTSP_TRANSPORT_TCP_INTERLEAVED);
+}
+
+static uint8_t countRtspClients() {
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+        if (rtspSessions[i].occupied) count++;
+    }
+    return count;
+}
+
+static uint8_t countStreamingRtspClients() {
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+        if (rtspSessions[i].occupied && rtspSessions[i].streaming) count++;
+    }
+    return count;
+}
+
+static RtspSession* firstStreamingSession() {
+    for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+        if (rtspSessions[i].occupied && rtspSessions[i].streaming) return &rtspSessions[i];
+    }
+    return NULL;
+}
+
+static int findFreeRtspSession() {
+    for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+        if (!rtspSessions[i].occupied) return i;
+    }
+    return -1;
+}
+
+static void updateStreamingStateFromSessions() {
+    RtspSession* first = firstStreamingSession();
+    streamClient = first ? &first->client : NULL;
+    isStreaming = (first != NULL);
+    core1OwnsLED = isStreaming;
+}
+
+static void closeRtspSession(RtspSession &session, bool stopClient) {
+    if (stopClient && session.client) {
+        session.client.stop();
+    }
+    session.occupied = false;
+    session.streaming = false;
+    session.setupDone = false;
+    session.sessionId = "";
+    session.remoteAddr = "";
+    session.transport = RTSP_TRANSPORT_TCP_INTERLEAVED;
+    session.rtpSequence = 0;
+    session.rtpTimestamp = 0;
+    session.rtpSSRC = 0;
+    session.connectedAt = 0;
+    session.lastActivity = 0;
+    session.playStartedAt = 0;
+    session.parseBufferPos = 0;
+    session.streamingRtspBufPos = 0;
+    session.streamingInterleavedDiscard = 0;
+    session.consecutiveWriteFailures = 0;
+    updateStreamingStateFromSessions();
+}
+
+uint8_t getConnectedRtspClientCount() {
+    return countRtspClients();
+}
+
+uint8_t getActiveRtspClientCount() {
+    return countStreamingRtspClients();
+}
+
+uint8_t getMaxRtspClientCount() {
+    return MAX_RTSP_CLIENTS;
+}
+
+String getRtspClientSummary() {
+    String out;
+    for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+        RtspSession &session = rtspSessions[i];
+        if (!session.occupied) continue;
+        if (out.length() > 0) out += ", ";
+        out += session.remoteAddr.length() ? session.remoteAddr : String("client");
+        out += session.streaming ? " (play)" : " (setup)";
+    }
+    return out;
 }
 
 static String extractRtspHeader(const String &request, const char* headerName) {
@@ -375,13 +500,61 @@ String describeFilterChain() {
     return chain;
 }
 
+static uint16_t audioDeClickSamples(uint16_t samples) {
+    if (samples == 0) return 0;
+    uint32_t ramp = currentSampleRate / 250U; // 4 ms edge smoothing
+    if (ramp < 16U) ramp = 16U;
+    if (ramp > 192U) ramp = 192U;
+    if (ramp > samples) ramp = samples;
+    return (uint16_t)ramp;
+}
+
 static void fillConcealmentBlock(int16_t* buffer, uint16_t samples, int16_t lastSample) {
     if (!buffer || samples == 0) return;
+    uint16_t rampSamples = audioDeClickSamples(samples);
+    uint32_t rampDen = (uint32_t)rampSamples * (uint32_t)rampSamples;
+    if (rampDen == 0) rampDen = 1;
+
     for (uint16_t i = 0; i < samples; ++i) {
-        float remain = 1.0f - ((float)(i + 1) / (float)samples);
-        if (remain < 0.0f) remain = 0.0f;
-        buffer[i] = (int16_t)((float)lastSample * remain);
+        if (i < rampSamples) {
+            uint32_t remain = (uint32_t)(rampSamples - i);
+            int64_t shaped = (int64_t)lastSample * (int64_t)remain * (int64_t)remain;
+            buffer[i] = (int16_t)(shaped / (int64_t)rampDen);
+        } else {
+            buffer[i] = 0;
+        }
     }
+}
+
+static void blendBlockStartFrom(int16_t* buffer, uint16_t samples, int16_t previousSample) {
+    if (!buffer || samples == 0) return;
+    uint16_t rampSamples = audioDeClickSamples(samples);
+    if (rampSamples <= 1) return;
+
+    for (uint16_t i = 0; i < rampSamples; ++i) {
+        int32_t target = buffer[i];
+        int32_t alpha = (int32_t)(i + 1);
+        int32_t blended = ((int32_t)previousSample * ((int32_t)rampSamples - alpha) +
+                           target * alpha) / (int32_t)rampSamples;
+        buffer[i] = (int16_t)blended;
+    }
+}
+
+static void publishWebAudioFrame(const int16_t* samples, uint16_t count) {
+    if (!samples || count == 0) return;
+
+    uint16_t publishSamples = count;
+    if (publishSamples > WEBUI_AUDIO_MAX_SAMPLES) publishSamples = WEBUI_AUDIO_MAX_SAMPLES;
+
+    portENTER_CRITICAL(&webAudioMux);
+    uint32_t nextWebAudioSeq = webAudioFrameSeq + 1U;
+    uint8_t webAudioSlot = (uint8_t)((nextWebAudioSeq - 1U) % WEBUI_AUDIO_RING_LEN);
+    memcpy(webAudioFrame[webAudioSlot], samples, publishSamples * sizeof(int16_t));
+    webAudioFrameSamples[webAudioSlot] = publishSamples;
+    webAudioSampleRate[webAudioSlot] = currentSampleRate;
+    webAudioRingSeq[webAudioSlot] = nextWebAudioSeq;
+    webAudioFrameSeq = nextWebAudioSeq;
+    portEXIT_CRITICAL(&webAudioMux);
 }
 
 void recordTelemetrySample(float cpuLoadPct, float tempC, bool tempValid) {
@@ -394,7 +567,7 @@ void recordTelemetrySample(float cpuLoadPct, float tempC, bool tempValid) {
     telemetryTempDeciC[telemetryHistoryHead] = tempDeci;
     telemetryHistoryHead = (telemetryHistoryHead + 1) % TELEMETRY_HISTORY_LEN;
     if (telemetryHistoryCount < TELEMETRY_HISTORY_LEN) telemetryHistoryCount++;
-    telemetryHistorySeq++;
+    telemetryHistorySeq = telemetryHistorySeq + 1U;
     portEXIT_CRITICAL(&telemetryMux);
 }
 
@@ -433,7 +606,7 @@ void updateHighpassCoeffs() {
     hpf.reset();
 
     hpfConfigSampleRate = currentSampleRate;
-    hpfConfigCutoff = (uint16_t)fc;
+    hpfConfigCutoff = highpassCutoffHz;
 }
 
 // Uptime -> "Xd Yh Zm Ts"
@@ -667,7 +840,7 @@ void loadAudioSettings() {
     highpassEnabled = audioPrefs.getBool("hpEnable", DEFAULT_HPF_ENABLED);
     highpassCutoffHz = (uint16_t)audioPrefs.getUInt("hpCutoff", DEFAULT_HPF_CUTOFF_HZ);
     agcEnabled = audioPrefs.getBool("agcEnable", false);
-    noiseFilterEnabled = audioPrefs.getBool("noiseFilter", true);
+    noiseFilterEnabled = audioPrefs.getBool("noiseFilter", false);
     if (!hasSampleRatePref) currentSampleRate = DEFAULT_SAMPLE_RATE;
     if (!hasGainPref) currentGainFactor = DEFAULT_GAIN_FACTOR;
     if (!hasBufferPref) currentBufferSize = DEFAULT_BUFFER_SIZE;
@@ -829,7 +1002,7 @@ void resetToDefaultSettings() {
     highpassCutoffHz = DEFAULT_HPF_CUTOFF_HZ;
     agcEnabled = false;
     agcMultiplier = 1.0f;
-    noiseFilterEnabled = true;
+    noiseFilterEnabled = false;
     noiseFloorDbfs = -90.0f;
     noiseGateDbfs = -90.0f;
     noiseReductionDb = 0.0f;
@@ -874,14 +1047,17 @@ void restartI2S() {
     maxPacketRate = 0;
     minPacketRate = 0xFFFFFFFF;
 
-    // If we were streaming, restart the pipeline with the existing client
-    if (wasStreaming && rtspClient && rtspClient.connected()) {
-        streamClient = &rtspClient;
-        isStreaming = true;
-        startAudioCaptureTask();
-        simplePrintln("I2S restarted, streaming resumed");
+    if (!i2sDriverOk) {
+        simplePrintln("I2S restart failed; audio pipeline remains stopped");
+        return;
+    }
+
+    updateStreamingStateFromSessions();
+    startAudioCaptureTask();
+    if (wasStreaming) {
+        simplePrintln("I2S restarted; RTSP clients should reconnect");
     } else {
-        simplePrintln("I2S restarted");
+        simplePrintln("I2S restarted, diagnostics resumed");
     }
 }
 
@@ -972,7 +1148,9 @@ static void setupArduinoOta() {
             default: break;
         }
         simplePrintln("OTA error: " + reason);
-        startAudioCaptureTask();
+        if (i2sDriverOk) {
+            startAudioCaptureTask();
+        }
         rtspServerEnabled = otaPreviousRtspEnabled;
         resumeRtspServerAfterOtaFailure();
         if (ledMode > 0) setStatusLed(CRGB(0, 0, 128));
@@ -1034,7 +1212,7 @@ static void updateFftFromBlock(const int16_t* samples, uint16_t count) {
         if (norm > 1.0f) norm = 1.0f;
         fftBins[k] = (uint8_t)(norm * 255.0f);
     }
-    fftFrameSeq++;
+    fftFrameSeq = fftFrameSeq + 1U;
 }
 
 // ================== CORE 1: FULL AUDIO PIPELINE ==================
@@ -1060,6 +1238,9 @@ void audioCaptureTask(void* parameter) {
         if (captureBuffer) free(captureBuffer);
         if (outputBuffer) free(outputBuffer);
         audioTaskRunning = false;
+        if (taskExitSemaphore != NULL) {
+            xSemaphoreGive(taskExitSemaphore);
+        }
         vTaskDelete(NULL);
         return;
     }
@@ -1068,6 +1249,7 @@ void audioCaptureTask(void* parameter) {
     Biquad localHpf = hpf;
     uint32_t localHpfConfigSampleRate = hpfConfigSampleRate;
     uint16_t localHpfConfigCutoff = hpfConfigCutoff;
+    bool localHighpassEnabled = highpassEnabled;
 
     // AGC, limiter, and noise-filter state (local)
     float localAgcMult = 1.0f;
@@ -1087,20 +1269,23 @@ void audioCaptureTask(void* parameter) {
     unsigned long lastLedUpdate = 0;
     unsigned long lastGoodCaptureMs = millis();
     int16_t lastOutputSample = 0;
+    bool lastBlockWasConcealment = false;
+    bool localUnsignedPdm = false;
+    bool localPdmDcInitialized = false;
+    uint8_t localUnsignedPdmConfidence = 0;
+    float localPdmDc = 0.0f;
     const TickType_t readTimeoutTicks = pdMS_TO_TICKS(max(20UL, min(200UL,
         ((unsigned long)readBufferSamples * 1000UL) / max((uint32_t)1, currentSampleRate) + 10UL)));
 
     while (audioTaskRunning) {
         // Check if Core 0 requested us to stop streaming
         if (stopStreamRequested) {
-            WiFiClient* client = streamClient;
-            if (client) {
-                client->stop();
+            for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+                if (rtspSessions[i].occupied && rtspSessions[i].streaming) {
+                    closeRtspSession(rtspSessions[i], true);
+                }
             }
-            rtpUdp.stop();
-            streamClient = NULL;
-            isStreaming = false;
-            core1OwnsLED = false;
+            updateStreamingStateFromSessions();
             streamCleanupDone = true;
             __asm__ __volatile__("memw" ::: "memory");
             // Wait for Core 0 to clear stopStreamRequested
@@ -1112,8 +1297,7 @@ void audioCaptureTask(void* parameter) {
 
         // Keep I2S capture running even when no RTSP client is active,
         // so /api/audio_status can show live raw-mic diagnostics.
-        WiFiClient* client = streamClient;
-        bool streamActive = (isStreaming && client != NULL);
+        bool streamActive = (countStreamingRtspClients() > 0);
 
         // Periodic stats (every 30s) — Serial.printf only, no heap alloc
         if (millis() - lastStatsLog > 30000) {
@@ -1133,24 +1317,28 @@ void audioCaptureTask(void* parameter) {
             if (result != ESP_OK) {
                 consecutiveErrors++;
                 i2sErrors++;
-                i2sReadErrCount++;
+                i2sReadErrCount = i2sReadErrCount + 1U;
                 if (consecutiveErrors >= MAX_ERRORS) {
                     Serial.println("[Core1] Too many I2S errors, pausing");
                     vTaskDelay(pdMS_TO_TICKS(100));
                     consecutiveErrors = 0;
                 }
             } else {
-                i2sReadZeroCount++;
+                i2sReadZeroCount = i2sReadZeroCount + 1U;
             }
 
+            audioFallbackBlockCount = audioFallbackBlockCount + 1U;
+            i2sLastGapMs = millis() - lastGoodCaptureMs;
+            i2sLastSamplesRead = 0;
+            fillConcealmentBlock(outputBuffer, chunkSamples, lastOutputSample);
+            lastOutputSample = outputBuffer[chunkSamples - 1];
+            lastBlockWasConcealment = true;
+            lastPeakAbs16 = (uint16_t)abs((int)outputBuffer[0]);
+            audioClippedLastBlock = false;
+            publishWebAudioFrame(outputBuffer, chunkSamples);
+
             if (streamActive) {
-                audioFallbackBlockCount++;
-                i2sLastGapMs = millis() - lastGoodCaptureMs;
-                fillConcealmentBlock(outputBuffer, chunkSamples, lastOutputSample);
-                lastOutputSample = outputBuffer[chunkSamples - 1];
-                lastPeakAbs16 = (uint16_t)abs((int)outputBuffer[0]);
-                audioClippedLastBlock = false;
-                sendRTPPacket(*client, outputBuffer, chunkSamples);
+                sendRTPPacketsToActiveSessions(outputBuffer, chunkSamples);
                 packetCount++;
 
                 float blockMs = (1000.0f * (float)chunkSamples) / max((float)currentSampleRate, 1.0f);
@@ -1163,18 +1351,20 @@ void audioCaptureTask(void* parameter) {
         }
 
         consecutiveErrors = 0;
-        i2sReadOkCount++;
+        i2sReadOkCount = i2sReadOkCount + 1U;
         lastGoodCaptureMs = millis();
         i2sLastGapMs = 0;
         uint16_t samplesRead = bytesRead / sizeof(int16_t);
         i2sLastSamplesRead = samplesRead;
 
         // Update HPF coefficients if changed
-        if (highpassEnabled && (localHpfConfigSampleRate != currentSampleRate ||
-                                localHpfConfigCutoff != highpassCutoffHz)) {
+        if (localHighpassEnabled != highpassEnabled ||
+            localHpfConfigSampleRate != currentSampleRate ||
+            localHpfConfigCutoff != highpassCutoffHz) {
             localHpf = hpf;
             localHpfConfigSampleRate = currentSampleRate;
             localHpfConfigCutoff = highpassCutoffHz;
+            localHighpassEnabled = highpassEnabled;
         }
 
         // Determine effective gain (manual * AGC if enabled)
@@ -1197,6 +1387,7 @@ void audioCaptureTask(void* parameter) {
         int16_t rawMax = INT16_MIN;
         uint16_t rawPeakAbs = 0;
         uint32_t rawZeroCount = 0;
+        float rawSum = 0.0f;
         float rawSumSquares = 0.0f;
 
         // First pass: collect raw stats for diagnostics and format detection.
@@ -1207,29 +1398,60 @@ void audioCaptureTask(void* parameter) {
             uint16_t rawAbs = (raw < 0) ? (uint16_t)(-raw) : (uint16_t)raw;
             if (rawAbs > rawPeakAbs) rawPeakAbs = rawAbs;
             if (raw == 0) rawZeroCount++;
+            rawSum += (float)raw;
             rawSumSquares += (float)raw * (float)raw;
         }
 
-        // Some PDM front-ends return unsigned low-amplitude PCM (e.g. around 1024)
-        // instead of signed 16-bit centered at 0. Detect and normalize per block.
-        bool likelyUnsignedPdm = (rawMin >= 0 && rawMax <= 4095);
-        i2sLikelyUnsignedPcm = likelyUnsignedPdm;
-        float pdmCenter = 0.0f;
-        float pdmScale = 1.0f;
-        if (likelyUnsignedPdm) {
-            pdmCenter = (rawMax > 2047) ? 2048.0f : 1024.0f;
-            pdmScale = (rawMax > 2047) ? 16.0f : 32.0f;
+        float rawMean = (samplesRead > 0) ? (rawSum / (float)samplesRead) : 0.0f;
+        bool unsignedCandidate = (samplesRead > 0 &&
+                                  rawMin >= 0 &&
+                                  rawMax <= (int16_t)PDM_UNSIGNED_MAX_CODE &&
+                                  rawMean >= PDM_UNSIGNED_MIN_MEAN &&
+                                  rawMean <= PDM_UNSIGNED_MAX_MEAN);
+        if (unsignedCandidate) {
+            if (localUnsignedPdmConfidence < PDM_UNSIGNED_CONFIDENCE_MAX) {
+                localUnsignedPdmConfidence++;
+            }
+        } else if (localUnsignedPdmConfidence > 0) {
+            localUnsignedPdmConfidence--;
+        }
+
+        if (!localUnsignedPdm && localUnsignedPdmConfidence >= PDM_UNSIGNED_CONFIDENCE_ON) {
+            localUnsignedPdm = true;
+            localPdmDc = rawMean;
+            localPdmDcInitialized = true;
+            localHpf.reset();
+        } else if (localUnsignedPdm && localUnsignedPdmConfidence <= PDM_UNSIGNED_CONFIDENCE_OFF) {
+            localUnsignedPdm = false;
+            localPdmDcInitialized = false;
+            localHpf.reset();
+        }
+        if (localUnsignedPdm && !localPdmDcInitialized) {
+            localPdmDc = rawMean;
+            localPdmDcInitialized = true;
+        }
+        i2sLikelyUnsignedPcm = localUnsignedPdm;
+
+        float pdmDcAlpha = 0.0f;
+        if (localUnsignedPdm) {
+            float dcDenom = (float)currentSampleRate * PDM_UNSIGNED_DC_TRACK_SECONDS;
+            if (dcDenom < 1.0f) dcDenom = 1.0f;
+            pdmDcAlpha = 1.0f / dcDenom;
         }
 
         // Second pass: DSP and output generation.
         for (int i = 0; i < samplesRead; i++) {
             int16_t raw = captureBuffer[i];
 
-            float sample = likelyUnsignedPdm
-                ? ((float)raw - pdmCenter) * pdmScale
-                : (float)(raw >> i2sShiftBits);
+            float sample;
+            if (localUnsignedPdm) {
+                localPdmDc += ((float)raw - localPdmDc) * pdmDcAlpha;
+                sample = ((float)raw - localPdmDc) * PDM_UNSIGNED_NORMALIZE_GAIN;
+            } else {
+                sample = (float)(raw >> i2sShiftBits);
+            }
 
-            if (highpassEnabled) {
+            if (localHighpassEnabled) {
                 sample = localHpf.process(sample);
             }
 
@@ -1299,22 +1521,16 @@ void audioCaptureTask(void* parameter) {
             if (amplified < -32768.0f) amplified = -32768.0f;
             outputBuffer[i] = (int16_t)amplified;
         }
+        if (lastBlockWasConcealment) {
+            blendBlockStartFrom(outputBuffer, samplesRead, lastOutputSample);
+            lastBlockWasConcealment = false;
+        }
         if (samplesRead > 0) {
             lastOutputSample = outputBuffer[samplesRead - 1];
         }
 
         // Publish latest processed frame for browser WebAudio endpoint
-        uint16_t publishSamples = samplesRead;
-        if (publishSamples > WEBUI_AUDIO_MAX_SAMPLES) publishSamples = WEBUI_AUDIO_MAX_SAMPLES;
-        portENTER_CRITICAL(&webAudioMux);
-        uint32_t nextWebAudioSeq = webAudioFrameSeq + 1U;
-        uint8_t webAudioSlot = (uint8_t)((nextWebAudioSeq - 1U) % WEBUI_AUDIO_RING_LEN);
-        memcpy(webAudioFrame[webAudioSlot], outputBuffer, publishSamples * sizeof(int16_t));
-        webAudioFrameSamples[webAudioSlot] = publishSamples;
-        webAudioSampleRate[webAudioSlot] = currentSampleRate;
-        webAudioRingSeq[webAudioSlot] = nextWebAudioSeq;
-        webAudioFrameSeq = nextWebAudioSeq;
-        portEXIT_CRITICAL(&webAudioMux);
+        publishWebAudioFrame(outputBuffer, samplesRead);
 
         // Update spectrum diagnostics from processed output (throttled)
         static uint8_t fftDecimator = 0;
@@ -1416,7 +1632,7 @@ void audioCaptureTask(void* parameter) {
 
         if (streamActive) {
             // Send RTP packet
-            sendRTPPacket(*client, outputBuffer, samplesRead);
+            sendRTPPacketsToActiveSessions(outputBuffer, samplesRead);
             packetCount++;
         }
 
@@ -1426,46 +1642,14 @@ void audioCaptureTask(void* parameter) {
         if (instLoad > 100.0f) instLoad = 100.0f;
         audioPipelineLoadPct += (instLoad - audioPipelineLoadPct) * 0.15f;
 
-        // Process incoming RTSP commands during streaming (~every 200ms)
+        // Process incoming RTSP commands during streaming (~every 50ms)
         // Keeps all socket I/O on Core 1 during streaming
         static unsigned long lastRtspCheck = 0;
-        if (streamActive && (millis() - lastRtspCheck > 200)) {
+        if (streamActive && (millis() - lastRtspCheck > 50)) {
             lastRtspCheck = millis();
-            if (client->available() > 0) {
-                char rtspBuf[512];
-                int avail = client->available();
-                if (avail > (int)sizeof(rtspBuf) - 1) avail = sizeof(rtspBuf) - 1;
-                int n = client->read((uint8_t*)rtspBuf, avail);
-                if (n > 0) {
-                    rtspBuf[n] = '\0';
-                    // Parse for RTSP commands
-                    if (strstr(rtspBuf, "TEARDOWN") != NULL) {
-                        // Extract CSeq
-                        const char* cseqStr = strstr(rtspBuf, "CSeq: ");
-                        int cseqVal = 1;
-                        if (cseqStr) cseqVal = atoi(cseqStr + 6);
-                        // Send response (Core 1 owns the socket)
-                        char resp[128];
-                        int rlen = snprintf(resp, sizeof(resp),
-                            "RTSP/1.0 200 OK\r\nCSeq: %d\r\n\r\n", cseqVal);
-                        client->write((uint8_t*)resp, rlen);
-                        // Close and clean up
-                        client->stop();
-                        streamClient = NULL;
-                        isStreaming = false;
-                        core1OwnsLED = false;
-                        Serial.println("[Core1] TEARDOWN received, stream stopped");
-                    } else if (strstr(rtspBuf, "GET_PARAMETER") != NULL) {
-                        const char* cseqStr = strstr(rtspBuf, "CSeq: ");
-                        int cseqVal = 1;
-                        if (cseqStr) cseqVal = atoi(cseqStr + 6);
-                        char resp[128];
-                        int rlen = snprintf(resp, sizeof(resp),
-                            "RTSP/1.0 200 OK\r\nCSeq: %d\r\n\r\n", cseqVal);
-                        client->write((uint8_t*)resp, rlen);
-                        lastRTSPActivity = millis();
-                    }
-                    // Other commands silently discarded
+            for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+                if (rtspSessions[i].occupied && rtspSessions[i].streaming) {
+                    pollStreamingRtspCommands(rtspSessions[i]);
                 }
             }
         }
@@ -1509,10 +1693,20 @@ void stopAudioCaptureTask() {
     if (audioCaptureTaskHandle != NULL) {
         audioTaskRunning = false;
         // Wait for task to confirm exit (up to 2s)
-        if (xSemaphoreTake(taskExitSemaphore, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        bool exited = (taskExitSemaphore != NULL &&
+                       xSemaphoreTake(taskExitSemaphore, pdMS_TO_TICKS(2000)) == pdTRUE);
+        if (!exited) {
             Serial.println("[Core0] WARNING: Audio task did not exit within 2s");
+            return;
         }
+
         audioCaptureTaskHandle = NULL;
+        for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+            if (rtspSessions[i].occupied && rtspSessions[i].streaming) {
+                closeRtspSession(rtspSessions[i], true);
+            }
+        }
+        updateStreamingStateFromSessions();
     }
 }
 
@@ -1544,20 +1738,35 @@ bool requestStreamStop(const char* reason) {
         Serial.printf("[Core0] Stream stopped cleanly: %s\n", reason);
         return true;
     } else {
-        // Timeout — force cleanup
-        Serial.printf("[Core0] WARNING: Stream stop timeout, forcing cleanup: %s\n", reason);
-        isStreaming = false;
-        streamClient = NULL;
-        stopStreamRequested = false;
-        streamCleanupDone = false;
-        core1OwnsLED = false;
+        // Timeout — stop the Core 1 task before touching leftover session sockets.
+        Serial.printf("[Core0] WARNING: Stream stop timeout, stopping audio task for cleanup: %s\n", reason);
+        bool hadAudioTask = (audioCaptureTaskHandle != NULL);
+        stopAudioCaptureTask();
+        if (audioCaptureTaskHandle == NULL) {
+            isStreaming = false;
+            streamClient = NULL;
+            stopStreamRequested = false;
+            streamCleanupDone = false;
+            core1OwnsLED = false;
+            if (hadAudioTask && i2sDriverOk) {
+                startAudioCaptureTask();
+            }
+        } else {
+            Serial.printf("[Core0] WARNING: Audio task still running after forced stop attempt: %s\n", reason);
+        }
         return false;
     }
 }
 
 // I2S setup for AtomS3 Lite + Unit Mini PDM (PDM microphone mode)
 void setup_i2s_driver() {
-    i2s_driver_uninstall(I2S_NUM_0);
+    i2sDriverOk = false;
+    i2sLastError = ESP_OK;
+
+    esp_err_t err = i2s_driver_uninstall(I2S_NUM_0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        simplePrintln("WARNING: I2S uninstall returned " + String(esp_err_to_name(err)));
+    }
 
     const uint16_t dma_buf_len = computeI2sDmaBufferLen();
     const uint8_t dma_buf_count = computeI2sDmaBufferCount();
@@ -1591,10 +1800,31 @@ void setup_i2s_driver() {
         .data_in_num = I2S_DATA_IN_PIN
     };
 
-    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-    i2s_set_pin(I2S_NUM_0, &pin_config);
-    i2s_set_clk(I2S_NUM_0, currentSampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+    err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+    if (err != ESP_OK) {
+        i2sLastError = err;
+        simplePrintln("ERROR: I2S driver_install failed: " + String(esp_err_to_name(err)));
+        return;
+    }
 
+    err = i2s_set_pin(I2S_NUM_0, &pin_config);
+    if (err != ESP_OK) {
+        i2sLastError = err;
+        simplePrintln("ERROR: I2S set_pin failed: " + String(esp_err_to_name(err)));
+        i2s_driver_uninstall(I2S_NUM_0);
+        return;
+    }
+
+    err = i2s_set_clk(I2S_NUM_0, currentSampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+    if (err != ESP_OK) {
+        i2sLastError = err;
+        simplePrintln("ERROR: I2S set_clk failed: " + String(esp_err_to_name(err)));
+        i2s_driver_uninstall(I2S_NUM_0);
+        return;
+    }
+
+    i2sDriverOk = true;
+    i2sLastError = ESP_OK;
     simplePrintln("I2S ready (PDM mode): " + String(currentSampleRate) + "Hz, gain " +
                   String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
                   " (chunk " + String(effectiveAudioChunkSize()) + ")" +
@@ -1621,17 +1851,146 @@ static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len, unsign
     return true;
 }
 
-static uint32_t consecutiveWriteFailures = 0;
+static int parseRtspCSeqValue(const char* request) {
+    if (!request) return 1;
+    const char* cseqStr = strstr(request, "CSeq:");
+    if (!cseqStr) cseqStr = strstr(request, "Cseq:");
+    if (!cseqStr) cseqStr = strstr(request, "cseq:");
+    if (!cseqStr) return 1;
+    cseqStr += 5;
+    while (*cseqStr == ' ' || *cseqStr == '\t') cseqStr++;
+    int cseqVal = atoi(cseqStr);
+    return (cseqVal > 0) ? cseqVal : 1;
+}
+
+static uint16_t parseRtspContentLengthValue(const char* request) {
+    if (!request) return 0;
+    const char* lenStr = strstr(request, "Content-Length:");
+    if (!lenStr) lenStr = strstr(request, "Content-length:");
+    if (!lenStr) lenStr = strstr(request, "content-length:");
+    if (!lenStr) return 0;
+    lenStr += 15;
+    while (*lenStr == ' ' || *lenStr == '\t') lenStr++;
+    long len = atol(lenStr);
+    if (len <= 0) return 0;
+    if (len > 2048) return 2048;
+    return (uint16_t)len;
+}
+
+static bool writeRtspSimpleResponse(RtspSession &session, int cseqVal, const char* extraHeaders) {
+    char resp[256];
+    int rlen = snprintf(resp, sizeof(resp),
+                        "RTSP/1.0 200 OK\r\n"
+                        "CSeq: %d\r\n"
+                        "Session: %s\r\n"
+                        "Connection: keep-alive\r\n"
+                        "%s"
+                        "\r\n",
+                        cseqVal,
+                        session.sessionId.length() ? session.sessionId.c_str() : "1",
+                        extraHeaders ? extraHeaders : "");
+    if (rlen <= 0) return false;
+    if (rlen >= (int)sizeof(resp)) rlen = (int)sizeof(resp) - 1;
+    return writeAll(session.client, (const uint8_t*)resp, (size_t)rlen, 80);
+}
+
+static bool handleStreamingRtspCommand(RtspSession &session, const char* request) {
+    if (!request || request[0] == '\0') return true;
+
+    // Some desktop clients send OPTIONS or SET_PARAMETER as keepalive during
+    // PLAY. A missed response can make them abandon a stream that is still
+    // carrying RTP, which presents as "spectrogram starts, then goes silent".
+    int cseqVal = parseRtspCSeqValue(request);
+    if (strstr(request, "TEARDOWN") != NULL) {
+        writeRtspSimpleResponse(session, cseqVal);
+        closeRtspSession(session, true);
+        Serial.println("[Core1] TEARDOWN received, stream stopped");
+        return false;
+    }
+
+    if (strstr(request, "GET_PARAMETER") != NULL) {
+        writeRtspSimpleResponse(session, cseqVal);
+        lastRTSPActivity = millis();
+        session.lastActivity = millis();
+    } else if (strstr(request, "OPTIONS") != NULL) {
+        writeRtspSimpleResponse(session, cseqVal,
+            "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, SET_PARAMETER\r\n");
+        lastRTSPActivity = millis();
+        session.lastActivity = millis();
+    } else if (strstr(request, "SET_PARAMETER") != NULL) {
+        writeRtspSimpleResponse(session, cseqVal);
+        lastRTSPActivity = millis();
+        session.lastActivity = millis();
+    }
+
+    return true;
+}
+
+static void pollStreamingRtspCommands(RtspSession &session) {
+    WiFiClient &client = session.client;
+    char* rtspBuf = session.streamingRtspBuf;
+    size_t rtspBufSize = sizeof(session.streamingRtspBuf);
+    size_t &rtspBufPos = session.streamingRtspBufPos;
+    uint16_t &interleavedDiscardRemaining = session.streamingInterleavedDiscard;
+    if (!rtspBuf || rtspBufSize < 8) return;
+
+    uint8_t discardBuf[64];
+    while (client.connected() && client.available() > 0) {
+        if (interleavedDiscardRemaining > 0) {
+            int toRead = min((int)sizeof(discardBuf), min(client.available(), (int)interleavedDiscardRemaining));
+            int n = client.read(discardBuf, toRead);
+            if (n <= 0) return;
+            interleavedDiscardRemaining -= (uint16_t)n;
+            continue;
+        }
+
+        if (rtspBufPos == 0 && client.peek() == '$') {
+            if (client.available() < 4) return;
+            uint8_t hdr[4];
+            int n = client.read(hdr, sizeof(hdr));
+            if (n != (int)sizeof(hdr)) return;
+            interleavedDiscardRemaining = ((uint16_t)hdr[2] << 8) | (uint16_t)hdr[3];
+            continue;
+        }
+
+        int c = client.read();
+        if (c < 0) return;
+
+        if (rtspBufPos >= rtspBufSize - 1) {
+            rtspBufPos = 0;
+            rtspBuf[0] = '\0';
+            Serial.println("[Core1] Streaming RTSP buffer overflow, reset parser");
+            return;
+        }
+
+        rtspBuf[rtspBufPos++] = (char)c;
+        rtspBuf[rtspBufPos] = '\0';
+
+        if (rtspBufPos >= 4 &&
+            rtspBuf[rtspBufPos - 4] == '\r' &&
+            rtspBuf[rtspBufPos - 3] == '\n' &&
+            rtspBuf[rtspBufPos - 2] == '\r' &&
+            rtspBuf[rtspBufPos - 1] == '\n') {
+            rtspBuf[rtspBufPos - 4] = '\0';
+            uint16_t bodyBytes = parseRtspContentLengthValue(rtspBuf);
+            bool keepOpen = handleStreamingRtspCommand(session, rtspBuf);
+            rtspBufPos = 0;
+            rtspBuf[0] = '\0';
+            if (bodyBytes > 0) {
+                interleavedDiscardRemaining = bodyBytes;
+            }
+            if (!keepOpen) return;
+        }
+    }
+}
+
 static const uint32_t MAX_WRITE_FAILURES = 100;  // Allow ~5s of failures before disconnect
 
-void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
+static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSamples) {
+    WiFiClient &client = session.client;
     if (!client.connected()) {
         // Client disconnected — Core 1 owns the socket, close it
-        client.stop();
-        rtpUdp.stop();
-        streamClient = NULL;
-        isStreaming = false;
-        core1OwnsLED = false;
+        closeRtspSession(session, true);
         return;
     }
 
@@ -1647,16 +2006,16 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
         // RTP header (12 bytes) + network-order PCM payload in one contiguous buffer.
         packetBuffer[0] = 0x80;      // V=2, P=0, X=0, CC=0
         packetBuffer[1] = 96;        // M=0, PT=96 (dynamic)
-        packetBuffer[2] = (uint8_t)((rtpSequence >> 8) & 0xFF);
-        packetBuffer[3] = (uint8_t)(rtpSequence & 0xFF);
-        packetBuffer[4] = (uint8_t)((rtpTimestamp >> 24) & 0xFF);
-        packetBuffer[5] = (uint8_t)((rtpTimestamp >> 16) & 0xFF);
-        packetBuffer[6] = (uint8_t)((rtpTimestamp >> 8) & 0xFF);
-        packetBuffer[7] = (uint8_t)(rtpTimestamp & 0xFF);
-        packetBuffer[8]  = (uint8_t)((rtpSSRC >> 24) & 0xFF);
-        packetBuffer[9]  = (uint8_t)((rtpSSRC >> 16) & 0xFF);
-        packetBuffer[10] = (uint8_t)((rtpSSRC >> 8) & 0xFF);
-        packetBuffer[11] = (uint8_t)(rtpSSRC & 0xFF);
+        packetBuffer[2] = (uint8_t)((session.rtpSequence >> 8) & 0xFF);
+        packetBuffer[3] = (uint8_t)(session.rtpSequence & 0xFF);
+        packetBuffer[4] = (uint8_t)((session.rtpTimestamp >> 24) & 0xFF);
+        packetBuffer[5] = (uint8_t)((session.rtpTimestamp >> 16) & 0xFF);
+        packetBuffer[6] = (uint8_t)((session.rtpTimestamp >> 8) & 0xFF);
+        packetBuffer[7] = (uint8_t)(session.rtpTimestamp & 0xFF);
+        packetBuffer[8]  = (uint8_t)((session.rtpSSRC >> 24) & 0xFF);
+        packetBuffer[9]  = (uint8_t)((session.rtpSSRC >> 16) & 0xFF);
+        packetBuffer[10] = (uint8_t)((session.rtpSSRC >> 8) & 0xFF);
+        packetBuffer[11] = (uint8_t)(session.rtpSSRC & 0xFF);
 
         const int16_t* packetAudio = audioData + offsetSamples;
         // Host->network: 16-bit PCM L16 big-endian payload immediately after the header.
@@ -1667,13 +2026,7 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
         }
 
         bool success = false;
-        if (activeRtspTransport == RTSP_TRANSPORT_UDP_UNICAST) {
-            success = (rtspUdpClientRtpPort != 0) && rtpUdp.beginPacket(rtspUdpClientIp, rtspUdpClientRtpPort) == 1;
-            if (success) {
-                success = (rtpUdp.write(packetBuffer, packetSize) == packetSize) &&
-                          rtpUdp.endPacket() == 1;
-            }
-        } else {
+        if (session.transport == RTSP_TRANSPORT_TCP_INTERLEAVED) {
             // RTSP interleaved header: '$' 0x24, channel 0, length
             uint8_t inter[4];
             inter[0] = 0x24;
@@ -1685,26 +2038,30 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
         }
 
         if (success) {
-            rtpSequence++;
-            rtpTimestamp += (uint32_t)packetSamples;
+            session.rtpSequence++;
+            session.rtpTimestamp += (uint32_t)packetSamples;
             audioPacketsSent++;
-            consecutiveWriteFailures = 0;  // Reset on success
+            session.consecutiveWriteFailures = 0;  // Reset on success
             offsetSamples += packetSamples;
         } else {
             audioPacketsDropped++;
-            consecutiveWriteFailures++;
+            session.consecutiveWriteFailures++;
 
-            if (consecutiveWriteFailures >= MAX_WRITE_FAILURES) {
+            if (session.consecutiveWriteFailures >= MAX_WRITE_FAILURES) {
                 // Sustained failure — Core 1 owns the socket, close it
-                Serial.printf("[Core1] %u consecutive write failures, disconnecting\n", consecutiveWriteFailures);
-                consecutiveWriteFailures = 0;
-                client.stop();
-                rtpUdp.stop();
-                streamClient = NULL;
-                isStreaming = false;
-                core1OwnsLED = false;
+                Serial.printf("[Core1] %u consecutive write failures, disconnecting %s\n",
+                              session.consecutiveWriteFailures, session.remoteAddr.c_str());
+                closeRtspSession(session, true);
             }
             return;
+        }
+    }
+}
+
+static void sendRTPPacketsToActiveSessions(int16_t* audioData, int numSamples) {
+    for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+        if (rtspSessions[i].occupied && rtspSessions[i].streaming) {
+            sendRTPPacket(rtspSessions[i], audioData, numSamples);
         }
     }
 }
@@ -1715,7 +2072,8 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
 // (streamAudio function removed - handled by Core 1 audioCaptureTask)
 
 // RTSP handling
-void handleRTSPCommand(WiFiClient &client, String request) {
+void handleRTSPCommand(RtspSession &session, String request) {
+    WiFiClient &client = session.client;
     String cseq = "1";
     int cseqPos = request.indexOf("CSeq: ");
     if (cseqPos >= 0) {
@@ -1724,11 +2082,12 @@ void handleRTSPCommand(WiFiClient &client, String request) {
     }
 
     lastRTSPActivity = millis();
+    session.lastActivity = millis();
 
     if (request.startsWith("OPTIONS")) {
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
-        client.print("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n");
+        client.print("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, SET_PARAMETER\r\n\r\n");
 
     } else if (request.startsWith("DESCRIBE")) {
         String ip = WiFi.localIP().toString();
@@ -1750,8 +2109,11 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         client.print(sdp);
 
     } else if (request.startsWith("SETUP")) {
-        if (rtspSessionId.length() == 0) {
-            rtspSessionId = String(random(100000000, 999999999));
+        if (session.sessionId.length() == 0) {
+            session.sessionId = String(random(100000000, 999999999));
+        }
+        if (session.rtpSSRC == 0) {
+            session.rtpSSRC = (uint32_t)random(1, 0x7FFFFFFF);
         }
 
         String transport = extractRtspHeader(request, "Transport");
@@ -1760,24 +2122,16 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         bool wantsTcp = transportLower.indexOf("rtp/avp/tcp") >= 0 || transportLower.indexOf("interleaved=") >= 0;
         bool wantsUdp = transportLower.indexOf("rtp/avp") >= 0 && transportLower.indexOf("client_port=") >= 0 && transportLower.indexOf("rtp/avp/tcp") < 0;
 
-        activeRtspTransport = RTSP_TRANSPORT_TCP_INTERLEAVED;
-        rtspUdpClientIp = client.remoteIP();
-        rtspUdpClientRtpPort = 0;
-        rtspUdpClientRtcpPort = 0;
+        session.transport = RTSP_TRANSPORT_TCP_INTERLEAVED;
 
         if (wantsUdp) {
-            uint16_t clientRtp = 0;
-            uint16_t clientRtcp = 0;
-            if (!parseRtspClientPorts(transportLower, clientRtp, clientRtcp)) {
+            if (!RTSP_ENABLE_UDP_UNICAST) {
                 client.print("RTSP/1.0 461 Unsupported Transport\r\n");
-                client.print("CSeq: " + cseq + "\r\n\r\n");
+                client.print("CSeq: " + cseq + "\r\n");
+                client.print("Connection: keep-alive\r\n\r\n");
+                simplePrintln("RTSP SETUP rejected UDP transport; waiting for TCP interleaved retry");
                 return;
             }
-            activeRtspTransport = RTSP_TRANSPORT_UDP_UNICAST;
-            rtspUdpClientRtpPort = clientRtp;
-            rtspUdpClientRtcpPort = clientRtcp;
-            rtpUdp.stop();
-            rtpUdp.begin(RTP_UDP_SERVER_PORT);
         } else if (!wantsTcp && transport.length() > 0) {
             client.print("RTSP/1.0 461 Unsupported Transport\r\n");
             client.print("CSeq: " + cseq + "\r\n\r\n");
@@ -1787,32 +2141,37 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
         // Large timeout reduces ffmpeg keepalive frequency (keepalive sent at timeout/2)
-        client.print("Session: " + rtspSessionId + ";timeout=86400\r\n");
-        if (activeRtspTransport == RTSP_TRANSPORT_UDP_UNICAST) {
-            client.print("Transport: RTP/AVP;unicast;client_port=" + String(rtspUdpClientRtpPort) + "-" +
-                         String(rtspUdpClientRtcpPort) + ";server_port=" + String(RTP_UDP_SERVER_PORT) + "-" +
-                         String(RTCP_UDP_SERVER_PORT) + ";ssrc=" + String(rtpSSRC, HEX) + ";mode=\"PLAY\"\r\n\r\n");
-            simplePrintln("RTSP SETUP using UDP transport to " + rtspUdpClientIp.toString() + ":" + String(rtspUdpClientRtpPort));
-        } else {
-            client.print("Transport: RTP/AVP/TCP;unicast;interleaved=0-1;mode=\"PLAY\";ssrc=" +
-                         String(rtpSSRC, HEX) + "\r\n\r\n");
-            simplePrintln("RTSP SETUP using TCP interleaved transport");
-        }
+        client.print("Session: " + session.sessionId + ";timeout=86400\r\n");
+        client.print("Transport: RTP/AVP/TCP;unicast;interleaved=0-1;mode=\"PLAY\";ssrc=" +
+                     String(session.rtpSSRC, HEX) + "\r\n\r\n");
+        session.setupDone = true;
+        simplePrintln("RTSP SETUP using TCP interleaved transport for " + session.remoteAddr);
 
     } else if (request.startsWith("PLAY")) {
-        // Send PLAY response FIRST (still on Core 0, Core 1 not started yet)
-        client.print("RTSP/1.0 200 OK\r\n");
-        client.print("CSeq: " + cseq + "\r\n");
-        client.print("Session: " + rtspSessionId + "\r\n");
-        client.print("Range: npt=0.000-\r\n\r\n");
+        if (!i2sDriverOk) {
+            client.print("RTSP/1.0 503 Service Unavailable\r\n");
+            client.print("CSeq: " + cseq + "\r\n");
+            client.print("Connection: close\r\n\r\n");
+            simplePrintln("PLAY rejected: I2S driver is not ready");
+            delay(5);
+            client.stop();
+            return;
+        }
 
-        rtpSequence = 0;
-        rtpTimestamp = 0;
-        audioPacketsSent = 0;
-        audioPacketsDropped = 0;
+        session.rtpSequence = 0;
+        session.rtpTimestamp = 0;
+        session.consecutiveWriteFailures = 0;
         lastStatsReset = millis();
         lastRtspPlayMs = millis();
         rtspPlayCount++;
+
+        // Send PLAY response FIRST (still on Core 0, Core 1 not started yet)
+        String playUrl = "rtsp://" + WiFi.localIP().toString() + ":8554/audio/track1";
+        client.print("RTSP/1.0 200 OK\r\n");
+        client.print("CSeq: " + cseq + "\r\n");
+        client.print("Session: " + session.sessionId + "\r\n");
+        client.print("Range: npt=0.000-\r\n");
+        client.print("RTP-Info: url=" + playUrl + ";seq=0;rtptime=0\r\n\r\n");
 
         // Initialize stream stop flags before handing off
         stopStreamRequested = false;
@@ -1820,26 +2179,22 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         core1OwnsLED = true;
         __asm__ __volatile__("memw" ::: "memory");
 
-        // Hand off client to Core 1 via pointer
-        streamClient = &rtspClient;
-        isStreaming = true;
+        session.streaming = true;
+        session.playStartedAt = millis();
+        updateStreamingStateFromSessions();
 
         // Start audio capture task
         startAudioCaptureTask();
 
         // Core 1 now owns LED during streaming
-        simplePrintln("STREAMING STARTED via " + String(rtspTransportModeName(activeRtspTransport)));
+        simplePrintln("STREAMING STARTED for " + session.remoteAddr + " via " +
+                      String(rtspTransportModeName(session.transport)));
 
     } else if (request.startsWith("TEARDOWN")) {
-        // Stop streaming FIRST — Core 1 owns the socket during streaming
-        if (isStreaming) {
-            requestStreamStop("TEARDOWN");
-        }
-
-        // Now Core 0 owns the socket again, safe to send response
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
-        client.print("Session: " + rtspSessionId + "\r\n\r\n");
+        client.print("Session: " + session.sessionId + "\r\n\r\n");
+        closeRtspSession(session, true);
 
         if (!core1OwnsLED) {
             if (ledMode > 0) setStatusLed(CRGB(0, 0, 128));
@@ -1850,16 +2205,20 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         // Many RTSP clients send GET_PARAMETER as keep-alive.
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n\r\n");
+    } else if (request.startsWith("SET_PARAMETER")) {
+        client.print("RTSP/1.0 200 OK\r\n");
+        client.print("CSeq: " + cseq + "\r\n\r\n");
     }
 }
 
-// RTSP processing (runs on Core 0, only called when !isStreaming)
-void processRTSP(WiFiClient &client) {
+// RTSP processing for sessions that are still owned by Core 0.
+void processRTSP(RtspSession &session) {
+    WiFiClient &client = session.client;
     if (!client.connected()) return;
 
     if (client.available()) {
         int available = client.available();
-        int spaceLeft = sizeof(rtspParseBuffer) - rtspParseBufferPos - 1;
+        int spaceLeft = sizeof(session.parseBuffer) - session.parseBufferPos - 1;
 
         if (available > spaceLeft) {
             available = spaceLeft;
@@ -1871,29 +2230,79 @@ void processRTSP(WiFiClient &client) {
                 simplePrintln("RTSP buffer full - resetting");
                 lastOverflowWarning = millis();
             }
-            rtspParseBufferPos = 0;
+            session.parseBufferPos = 0;
             return;
         }
 
-        client.read(rtspParseBuffer + rtspParseBufferPos, available);
-        rtspParseBufferPos += available;
-        rtspParseBuffer[rtspParseBufferPos] = '\0';
+        client.read(session.parseBuffer + session.parseBufferPos, available);
+        session.parseBufferPos += available;
+        session.parseBuffer[session.parseBufferPos] = '\0';
 
-        char* endOfHeader = strstr((char*)rtspParseBuffer, "\r\n\r\n");
+        char* endOfHeader = strstr((char*)session.parseBuffer, "\r\n\r\n");
         if (endOfHeader != nullptr) {
+            int headerLen = (endOfHeader - (char*)session.parseBuffer) + 4;
             *endOfHeader = '\0';
-            String request = String((char*)rtspParseBuffer);
+            String request = String((char*)session.parseBuffer);
 
-            handleRTSPCommand(client, request);
-
-            int headerLen = (endOfHeader - (char*)rtspParseBuffer) + 4;
-            int remaining = rtspParseBufferPos - headerLen;
-            if (remaining > 0) {
-                memmove(rtspParseBuffer, rtspParseBuffer + headerLen, remaining);
+            handleRTSPCommand(session, request);
+            if (!session.occupied || session.streaming) {
+                return;
             }
-            rtspParseBufferPos = remaining;
+
+            int remaining = session.parseBufferPos - headerLen;
+            if (remaining > 0) {
+                memmove(session.parseBuffer, session.parseBuffer + headerLen, remaining);
+            }
+            session.parseBufferPos = max(0, remaining);
         }
     }
+}
+
+static void rejectBusyRtspClient(WiFiClient &client) {
+    if (!client) return;
+    client.setNoDelay(true);
+
+    char req[256];
+    int n = 0;
+    unsigned long deadline = millis() + 120UL;
+    while (client.connected() && client.available() == 0 && millis() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    if (client.available() > 0) {
+        int avail = client.available();
+        if (avail > (int)sizeof(req) - 1) avail = sizeof(req) - 1;
+        n = client.read((uint8_t*)req, avail);
+    }
+    if (n < 0) n = 0;
+    req[n] = '\0';
+
+    char cseq[16] = "1";
+    const char* cseqStart = strstr(req, "CSeq:");
+    if (cseqStart) {
+        cseqStart += 5;
+        while (*cseqStart == ' ' || *cseqStart == '\t') cseqStart++;
+        size_t i = 0;
+        while (i < sizeof(cseq) - 1 && cseqStart[i] >= '0' && cseqStart[i] <= '9') {
+            cseq[i] = cseqStart[i];
+            i++;
+        }
+        cseq[i] = '\0';
+        if (i == 0) strcpy(cseq, "1");
+    }
+
+    char resp[160];
+    int len = snprintf(resp, sizeof(resp),
+                       "RTSP/1.0 453 Not Enough Bandwidth\r\n"
+                       "CSeq: %s\r\n"
+                       "Connection: close\r\n\r\n",
+                       cseq);
+    if (len > 0) {
+        client.write((const uint8_t*)resp, (size_t)len);
+    }
+    delay(5);
+    client.stop();
+    rtspRejectedClientCount++;
+    simplePrintln("Rejected extra RTSP client while stream is busy");
 }
 
 
@@ -1922,7 +2331,6 @@ void setup() {
     }
 
     bootTime = millis(); // Store boot time
-    rtpSSRC = (uint32_t)random(1, 0x7FFFFFFF);
     Serial.println("Random seed initialized");
 
     // Enable external antenna (for XIAO ESP32-C6).
@@ -1996,15 +2404,17 @@ void setup() {
 
     Serial.println("Setting up I2S driver...");
     setup_i2s_driver();
-    Serial.println("I2S driver ready");
-
-    // Start Core 1 audio pipeline now so raw I2S diagnostics are available even before PLAY.
-    startAudioCaptureTask();
-    Serial.println("Dual-core audio ready (Core 1 pipeline running for always-on diagnostics)");
-
-    Serial.println("Updating highpass coefficients...");
-    updateHighpassCoeffs();
-    Serial.println("Highpass coefficients updated");
+    if (i2sDriverOk) {
+        Serial.println("I2S driver ready");
+        Serial.println("Updating highpass coefficients...");
+        updateHighpassCoeffs();
+        Serial.println("Highpass coefficients updated");
+        // Start Core 1 audio pipeline now so raw I2S diagnostics are available even before PLAY.
+        startAudioCaptureTask();
+        Serial.println("Dual-core audio ready (Core 1 pipeline running for always-on diagnostics)");
+    } else {
+        Serial.printf("I2S driver setup failed, audio pipeline not started (err=%ld)\n", (long)i2sLastError);
+    }
 
     if (!overheatLatched) {
         rtspServer.begin();
@@ -2094,16 +2504,6 @@ void loop() {
 
     checkScheduledReset();
 
-    // RTSP idle timeout — disconnect clients that connect but never stream (60s)
-    if (rtspClient && rtspClient.connected() && !isStreaming) {
-        if (millis() - lastRTSPActivity > 60000) {
-            simplePrintln("RTSP idle timeout — disconnecting");
-            rtspClient.stop();
-            rtpUdp.stop();
-            rtspParseBufferPos = 0;
-        }
-    }
-
     // RTSP client management (Core 0) — clear phase separation
     static bool wasStreaming = false;
     if (rtspServerEnabled) {
@@ -2120,24 +2520,58 @@ void loop() {
         }
         wasStreaming = isStreaming;
 
-        // Phase: accept new client (only when not streaming)
-        if (!isStreaming) {
-            if (!rtspClient || !rtspClient.connected()) {
-                WiFiClient newClient = rtspServer.available();
-                if (newClient) {
-                    rtspClient = newClient;
-                    rtspClient.setNoDelay(true);
-                    rtspParseBufferPos = 0;
-                    lastRTSPActivity = millis();
-                    lastRtspClientConnectMs = millis();
-                    rtspConnectCount++;
-                    simplePrintln("New RTSP client connected");
+        // Disconnect idle clients that connected but never entered PLAY.
+        for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+            RtspSession &session = rtspSessions[i];
+            if (session.occupied && !session.streaming) {
+                if (!session.client || !session.client.connected()) {
+                    closeRtspSession(session, false);
+                } else if (millis() - session.lastActivity > 60000) {
+                    simplePrintln("RTSP idle timeout — disconnecting " + session.remoteAddr);
+                    closeRtspSession(session, true);
                 }
             }
+        }
 
-            // Phase: RTSP negotiation (only when not streaming)
-            if (rtspClient && rtspClient.connected()) {
-                processRTSP(rtspClient);
+        // Phase: accept new RTSP clients while preserving Core 1 ownership of
+        // already-playing sockets.
+        WiFiClient newClient = rtspServer.accept();
+        if (newClient) {
+            int slot = findFreeRtspSession();
+            if (slot < 0) {
+                rejectBusyRtspClient(newClient);
+            } else {
+                RtspSession &session = rtspSessions[slot];
+                session.client = newClient;
+                session.client.setNoDelay(true);
+                session.occupied = true;
+                session.streaming = false;
+                session.setupDone = false;
+                session.sessionId = "";
+                session.remoteAddr = session.client.remoteIP().toString();
+                session.transport = RTSP_TRANSPORT_TCP_INTERLEAVED;
+                session.rtpSequence = 0;
+                session.rtpTimestamp = 0;
+                session.rtpSSRC = (uint32_t)random(1, 0x7FFFFFFF);
+                session.connectedAt = millis();
+                session.lastActivity = millis();
+                session.playStartedAt = 0;
+                session.parseBufferPos = 0;
+                session.streamingRtspBufPos = 0;
+                session.streamingInterleavedDiscard = 0;
+                session.consecutiveWriteFailures = 0;
+                lastRTSPActivity = millis();
+                lastRtspClientConnectMs = millis();
+                rtspConnectCount++;
+                simplePrintln("New RTSP client connected: " + session.remoteAddr);
+            }
+        }
+
+        // Phase: RTSP negotiation for sockets not yet handed to Core 1.
+        for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+            RtspSession &session = rtspSessions[i];
+            if (session.occupied && !session.streaming) {
+                processRTSP(session);
             }
         }
     } else {
@@ -2145,6 +2579,11 @@ void loop() {
         if (isStreaming) {
             requestStreamStop("server disabled");
             stopAudioCaptureTask();
+        }
+        for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+            if (rtspSessions[i].occupied && !rtspSessions[i].streaming) {
+                closeRtspSession(rtspSessions[i], true);
+            }
         }
         if (!core1OwnsLED) {
             if (overheatLatched) {

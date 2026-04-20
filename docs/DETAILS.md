@@ -38,8 +38,9 @@ Core 1 **exclusively owns** the WiFiClient socket during streaming — Core 0 ne
 ## Audio Tuning
 
 ### Active Filters
-- **High-pass filter**: 2nd-order Butterworth, roughly 12 dB/octave, default 450 Hz.
+- **High-pass filter**: optional 2nd-order Butterworth, roughly 12 dB/octave, default OFF with a 450 Hz cutoff when enabled.
 - **Adaptive noise suppressor**: envelope follower + hold-time gate. This was retuned to stop the audible tap-tap artifact that happened when gain changed too abruptly as the live dB meter fell.
+- **I2S gap concealment**: short capture stalls are bridged with de-clicked fallback audio, and the next valid block is ramped in to avoid a hard segment-edge tap.
 - **Limiter**: catches peaks before full-scale clipping.
 - **AGC**: optional slow loudness rider after the cleanup stages.
 
@@ -93,7 +94,7 @@ Core 1 **exclusively owns** the WiFiClient socket during streaming — Core 0 ne
 1. Check signal level in Web UI
 2. Enable AGC (auto-adjusts gain)
 3. Increase gain (try 5.0–10.0x)
-4. Disable high-pass filter temporarily to test
+4. Keep high-pass filter off for the cleanest baseline; enable it only to test rumble/wind cleanup
 
 ### Audio Clipping / Distortion
 1. Decrease gain
@@ -105,9 +106,9 @@ Core 1 **exclusively owns** the WiFiClient socket during streaming — Core 0 ne
 Some RTSP clients (VLC) probe the server on first connect. The second connection works immediately.
 
 ### VLC / RTSP Transport
-- The firmware supports both **RTP interleaved over RTSP/TCP** and **RTP/AVP over UDP unicast**.
-- Choose transport from the client side (`ffplay -rtsp_transport tcp ...` or `ffplay -rtsp_transport udp ...`).
-- TCP is still the safest default on lossy Wi‑Fi; UDP can reduce head-of-line blocking when the network path is clean.
+- The current default build serves **RTP interleaved over RTSP/TCP**.
+- UDP unicast support exists in code behind `RTSP_ENABLE_UDP_UNICAST`, but it is disabled by default so clients can retry TCP cleanly.
+- Use `ffplay -rtsp_transport tcp ...` for predictable behavior on lossy Wi‑Fi.
 
 ### Stream Drops / Connection Issues
 1. Check WiFi signal strength (RSSI > -70 dBm)
@@ -122,10 +123,22 @@ Focus on signal conditioning:
 1. Check `peak_dbfs` in Web UI while speaking/clapping near the mic.
 2. If levels stay around `-45 dBFS` to `-55 dBFS`, raise manual gain and re-test.
 3. Enable AGC and verify `agc_multiplier`/`effective_gain` increase when quiet.
-4. Keep HPF enabled for wind/rumble, but briefly disable once as an A/B test.
+4. Keep HPF off for the first clean baseline; enable it only if wind/rumble is masking calls.
 5. Aim for typical peaks around `-20 dBFS` to `-10 dBFS` without constant clipping.
 
 ## Version History
+
+### v2.6.5
+- Added stable low-amplitude unsigned PDM centering with hysteresis and a slow DC tracker before HPF/gain
+- Reduced AGC maximum lift and target RMS so quiet mic-bed noise is not amplified into whispery/gritty audio
+- Made the optional noise suppressor gentler when enabled
+- Changed the HPF default to OFF; it remains available for wind/rumble but can thin quiet PDM audio
+- Updated diagnostics to report when the unsigned PDM centering path is active
+
+### v2.6.4
+- De-clicked I2S fallback blocks so brief read gaps fade out over a short edge instead of becoming full-block ramps.
+- Smooths the first samples after a fallback before sending RTSP or browser PCM/WAV frames, avoiding a zero-to-signal tap at recovered segment boundaries.
+- Publishes fallback blocks to the browser diagnostics ring as well as RTSP, so the browser PCM path does not turn a capture stall into a missing HTTP audio segment.
 
 ### v2.3.0
 - Socket ownership model — Core 1 exclusively owns WiFiClient during streaming
@@ -179,4 +192,4 @@ The codebase is now less branding-specific, and the API/UI expose the active har
 
 ## Remaining tapping diagnosis
 
-There is no dedicated mic-enable GPIO being toggled in the normal capture path. If tapping still coincides with the meter dropping, suspect **I2S read gaps** or a timing/cadence problem before assuming a mute/enable pin issue. The firmware now counts fallback blocks and keeps RTP timing continuous during short read stalls so those events are visible in the UI instead of becoming silent packet gaps.
+There is no dedicated mic-enable GPIO being toggled in the normal capture path. If tapping coincides with the meter dropping, suspect **I2S read gaps** or a timing/cadence problem before assuming a mute/enable pin issue. The firmware counts fallback blocks, keeps RTP/browser PCM timing continuous during short read stalls, and de-clicks both sides of the fallback so recovered audio does not restart with a hard segment edge.

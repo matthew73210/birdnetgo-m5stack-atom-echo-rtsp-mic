@@ -1,0 +1,687 @@
+:root {
+  color-scheme: dark;
+  --bg: #11100f;
+  --surface: #171817;
+  --surface-2: #20221f;
+  --surface-3: #262923;
+  --text: #f4f6f1;
+  --muted: #a9aea5;
+  --border: #343831;
+  --green: #20c77a;
+  --cyan: #4aa3df;
+  --yellow: #f4c44d;
+  --red: #f05a63;
+  --shadow: rgba(0, 0, 0, 0.28);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background:
+    linear-gradient(180deg, #151613 0, var(--bg) 260px),
+    var(--bg);
+  color: var(--text);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.45;
+}
+
+a {
+  color: var(--green);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+button {
+  min-height: 40px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  padding: 9px 12px;
+  font: inherit;
+  font-weight: 750;
+  cursor: pointer;
+  transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
+}
+
+input,
+select {
+  min-height: 40px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #111310;
+  color: var(--text);
+  padding: 8px 10px;
+  font: inherit;
+}
+
+input:disabled,
+select:disabled {
+  opacity: 0.55;
+}
+
+input.dirty,
+select.dirty {
+  border-color: var(--yellow);
+  box-shadow: 0 0 0 2px rgba(244, 196, 77, 0.18);
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--green);
+  background: var(--surface-3);
+  transform: translateY(-1px);
+}
+
+button.primary {
+  border-color: var(--green);
+  background: var(--green);
+  color: #07120c;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  transform: none;
+}
+
+.shell {
+  width: min(1180px, 100%);
+  margin: 0 auto;
+  padding: 18px;
+}
+
+.topbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: start;
+  margin-bottom: 14px;
+}
+
+.brand-block {
+  min-width: 0;
+}
+
+.eyebrow {
+  color: var(--green);
+  font-size: 12px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  margin-top: 2px;
+  font-size: 38px;
+  line-height: 1.03;
+  letter-spacing: 0;
+}
+
+h2 {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.topbar p,
+.quiet {
+  color: var(--muted);
+}
+
+.command-strip {
+  display: grid;
+  justify-items: end;
+  gap: 10px;
+}
+
+.state,
+.chips,
+.actions,
+.links,
+.quick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.quick-actions {
+  justify-content: flex-end;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  padding: 4px 8px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.pill.ok,
+.metric.ok strong {
+  color: var(--green);
+}
+
+.pill.ok {
+  border-color: #2f9f6a;
+}
+
+.pill.warn,
+.metric.warn strong {
+  color: var(--yellow);
+}
+
+.pill.bad,
+.notice.bad,
+.metric.bad strong {
+  color: var(--red);
+}
+
+.notice {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+
+.overview {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.metric,
+.level-panel,
+.panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 12px 34px var(--shadow);
+}
+
+.metric {
+  position: relative;
+  overflow: hidden;
+  min-height: 102px;
+  padding: 14px;
+}
+
+.metric::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 4px;
+  background: var(--border);
+}
+
+.metric.ok::before {
+  background: var(--green);
+}
+
+.metric.warn::before {
+  background: var(--yellow);
+}
+
+.metric.bad::before {
+  background: var(--red);
+}
+
+.metric span,
+.metric small {
+  display: block;
+  color: var(--muted);
+}
+
+.metric span {
+  font-size: 12px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.metric strong {
+  display: block;
+  margin-top: 8px;
+  font-size: 28px;
+  line-height: 1;
+  overflow-wrap: anywhere;
+}
+
+.metric small {
+  margin-top: 9px;
+  font-size: 12px;
+}
+
+.level-panel {
+  padding: 16px;
+  margin-bottom: 12px;
+}
+
+.level-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.level-head span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.level-head strong {
+  display: block;
+  margin-top: 3px;
+  font-size: 32px;
+  line-height: 1;
+}
+
+.visualizer {
+  display: grid;
+  grid-template-columns: repeat(22, minmax(3px, 1fr));
+  align-items: end;
+  gap: 5px;
+  height: 96px;
+  margin-top: 18px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #0d0e0d;
+}
+
+.visualizer i {
+  display: block;
+  min-height: 6px;
+  border-radius: 4px 4px 0 0;
+  background: var(--green);
+  opacity: 0.86;
+  transition: height 180ms ease;
+}
+
+.meter {
+  height: 12px;
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #0b0c0b;
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+  min-width: 2px;
+  transition: width 180ms ease;
+}
+
+.meter-fill.ok {
+  background: var(--green);
+}
+
+.meter-fill.warn {
+  background: var(--yellow);
+}
+
+.meter-fill.bad {
+  background: var(--red);
+}
+
+.level-panel p {
+  margin-top: 10px;
+  color: var(--muted);
+}
+
+.spectrogram-panel {
+  margin-bottom: 12px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 12px 34px var(--shadow);
+}
+
+.spectrogram-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 14px;
+  margin-bottom: 12px;
+}
+
+.spectrogram-head span,
+.spectrogram-controls span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.spectrogram-head strong {
+  display: block;
+  margin-top: 3px;
+  font-size: 26px;
+  line-height: 1;
+}
+
+.spectrogram-head p {
+  margin-top: 6px;
+  color: var(--muted);
+}
+
+.spectrogram-state,
+.spectrogram-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.spectrogram-state {
+  justify-content: flex-end;
+}
+
+.spectrogram-frame {
+  position: relative;
+  overflow: hidden;
+  min-height: 248px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #090b09;
+}
+
+.spectrogram-frame canvas {
+  display: block;
+  width: 100%;
+  height: 248px;
+}
+
+.axis {
+  position: absolute;
+  color: rgba(244, 246, 241, 0.68);
+  font-size: 11px;
+  font-weight: 780;
+  pointer-events: none;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.65);
+}
+
+.axis-high {
+  top: 8px;
+  left: 10px;
+}
+
+.axis-low {
+  bottom: 8px;
+  left: 10px;
+}
+
+.axis-low-x {
+  top: 8px;
+  left: 10px;
+}
+
+.axis-high-x {
+  top: 8px;
+  right: 10px;
+}
+
+.axis-time {
+  right: 10px;
+  bottom: 8px;
+}
+
+.spectrogram-controls {
+  margin-top: 10px;
+}
+
+.spectrogram-controls label {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+
+.spectrogram-controls select {
+  width: 100%;
+  margin-top: 5px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.panel {
+  padding: 16px;
+}
+
+.settings-panel {
+  grid-column: span 2;
+}
+
+.network-panel {
+  grid-column: span 1;
+}
+
+.control-panel {
+  background: var(--surface-2);
+}
+
+.panel-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  min-height: 30px;
+  margin-bottom: 8px;
+}
+
+.client-slots {
+  display: flex;
+  gap: 5px;
+}
+
+.client-slots i {
+  width: 18px;
+  height: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #0d0e0d;
+}
+
+.client-slots i.active {
+  border-color: var(--green);
+  background: var(--green);
+}
+
+.stat {
+  display: grid;
+  grid-template-columns: minmax(94px, 0.8fr) minmax(0, 1.2fr);
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+}
+
+.stat span {
+  color: var(--muted);
+}
+
+.stat strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 780;
+}
+
+.setting {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(0, 1.4fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+}
+
+.setting > div:first-child {
+  min-width: 0;
+}
+
+.setting span {
+  display: block;
+  color: var(--muted);
+}
+
+.setting small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.setting input,
+.setting select {
+  width: 100%;
+}
+
+.setting .unit {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.apply {
+  min-width: 58px;
+}
+
+.warn-text {
+  color: var(--yellow);
+}
+
+.actions,
+.links,
+.chips {
+  margin-top: 12px;
+}
+
+.actions button {
+  flex: 1 1 120px;
+}
+
+.links a {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-3);
+  padding: 8px 10px;
+  font-weight: 780;
+}
+
+@media (max-width: 980px) {
+  .topbar {
+    grid-template-columns: 1fr;
+  }
+
+  .command-strip,
+  .quick-actions {
+    justify-items: start;
+    justify-content: flex-start;
+  }
+
+  .overview,
+  .grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .settings-panel {
+    grid-column: span 2;
+  }
+}
+
+@media (max-width: 640px) {
+  .shell {
+    padding: 12px;
+  }
+
+  h1 {
+    font-size: 30px;
+  }
+
+  .overview,
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-panel {
+    grid-column: span 1;
+  }
+
+  .metric {
+    min-height: 88px;
+  }
+
+  .metric strong,
+  .level-head strong {
+    font-size: 26px;
+  }
+
+  .stat {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
+  .setting {
+    grid-template-columns: 1fr auto;
+  }
+
+  .setting input,
+  .setting select {
+    grid-column: 1 / -1;
+  }
+
+  .setting .unit {
+    grid-column: 1;
+  }
+
+  .setting .apply {
+    grid-column: 2;
+  }
+
+  .visualizer {
+    height: 76px;
+    gap: 3px;
+  }
+
+  .spectrogram-head {
+    display: block;
+  }
+
+  .spectrogram-state {
+    justify-content: flex-start;
+    margin-top: 10px;
+  }
+
+  .spectrogram-frame {
+    min-height: 190px;
+  }
+
+  .spectrogram-frame canvas {
+    height: 190px;
+  }
+}

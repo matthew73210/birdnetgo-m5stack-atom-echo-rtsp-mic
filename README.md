@@ -1,184 +1,273 @@
-# M5 Atom RTSP Microphone for BirdNET-Go
+# AtomS3 Lite PDM RTSP Microphone for BirdNET-Go
 
-A high-quality RTSP audio streaming server for **M5 Atom-class ESP32 devices**, currently tuned for the **AtomS3 Lite + Unit Mini PDM** signal path and documented with the changes needed for Atom Echo-style codec inputs, streaming live audio to [BirdNET-Go](https://github.com/tphakala/birdnet-go) or any RTSP-compatible client.
+Firmware for turning an [M5Stack AtomS3 Lite ESP32-S3 Dev Kit](https://shop.m5stack.com/products/atoms3-lite-esp32s3-dev-kit) plus an [M5Stack PDM MEMS Microphone Unit (SPM1423)](https://shop.m5stack.com/products/pdm-microphone-unit-spm1423?variant=35694843134116) into a small RTSP microphone for [BirdNET-Go](https://github.com/tphakala/birdnet-go), VLC, ffplay, or any client that can consume RTSP/RTP L16 mono PCM.
 
-<p align="left">
-  <img src="https://shop.m5stack.com/cdn/shop/files/3_e4ea519e-765f-4f30-aad1-7855ff9f8744_1200x1200.jpg" alt="M5Stack Atom Echo" width="300">
-</p>
+This repository is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](https://github.com/stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic). The upstream project targets the all-in-one M5Stack Atom Echo / Atom Voice style hardware. This fork is tuned for a two-piece setup: AtomS3 Lite as the ESP32-S3 controller, with the external Unit Mini PDM microphone on the HY2.0-4P connector.
 
-**Buy**: [M5Stack Store](https://shop.m5stack.com/products/atom-echo-smart-speaker-dev-kit) | [Amazon](https://www.amazon.com/M5Stack-Atom-Echo-Smart-Speaker/dp/B0C7QSVPB2)
+## Target Hardware
+
+Required:
+
+- [AtomS3 Lite ESP32S3 Dev Kit](https://shop.m5stack.com/products/atoms3-lite-esp32s3-dev-kit) - ESP32-S3FN8, 8 MB flash, USB-C, built-in WS2812C RGB LED.
+- [PDM MEMS Microphone Unit (SPM1423)](https://shop.m5stack.com/products/pdm-microphone-unit-spm1423?variant=35694843134116) - digital MEMS microphone with PDM CLK/DAT output.
+- HY2.0-4P Grove cable, usually included with the PDM Unit.
+
+Wiring with the standard HY2.0 cable:
+
+| PDM Unit wire | PDM Unit signal | AtomS3 Lite pin | Firmware define |
+| --- | --- | --- | --- |
+| Black | GND | GND | - |
+| Red | 5V | 5V | - |
+| Yellow | Data | G2 | `I2S_DATA_IN_PIN = 2` |
+| White | Clock | G1 | `I2S_CLK_PIN = 1` |
+
+The AtomS3 Lite HY2.0 pinout maps yellow to `G2` and white to `G1`; the PDM Unit maps yellow to data and white to clock. That is why this firmware uses **CLK=G1** and **DATA=G2**.
+
+Important: `i2sShiftBits` is fixed at `0` for this PDM path. Do not make it configurable. These PDM samples are already 16-bit values; shifting them right can turn normal audio into zeros.
+
+## What Changed From Upstream
+
+| Area | Upstream stedrow project | This fork |
+| --- | --- | --- |
+| Main hardware | M5Stack Atom Echo / Atom Voice style device | AtomS3 Lite plus external Unit Mini PDM |
+| PlatformIO board | `m5stack-atom` | `m5stack-atoms3` |
+| MCU family | ESP32-PICO-D4 class Atom hardware | ESP32-S3 AtomS3 Lite |
+| Microphone pins | Onboard Atom Echo/Voice mic pins | External PDM Unit: `G1` clock, `G2` data |
+| LED handling | M5Atom display helpers / Atom LED pin | FastLED on AtomS3 Lite WS2812 pin `G35` |
+| Hostname | `atomecho.local` | `atoms3mic.local` |
+| Uploads | USB serial | USB serial first, then Arduino OTA on port `3232` |
+| RTSP transport | Atom Echo-oriented single target | TCP interleaved RTP, bounded two-client mode, clean UDP rejection |
+| Web UI | Basic status, settings, logs | Rebuilt diagnostics UI, audio level, FFT, telemetry history, browser PCM/WAV preview, thermal controls |
+| Audio defaults | Echo-oriented gain/HPF defaults | Conservative gain, HPF off by default, PDM centering, limiter, optional noise suppressor and AGC |
+
+This is not a drop-in Atom Echo binary. Atom Echo / Atom Voice has its own onboard SPM1423 microphone, speaker amp, LED, and ESP32-PICO-D4 pinout. To support it cleanly from this branch, add a separate board/pin profile rather than flashing the AtomS3 Lite build unchanged.
 
 ## Features
 
-- **Dual-core architecture** — Core 1 handles full audio pipeline, Core 0 handles Web UI and RTSP negotiation
-- **mDNS discovery** — `atoms3mic.local` (default; use the hostname shown in boot logs if customized), no IP needed
-- **Web UI** — configure settings, view signal levels, logs, diagnostics, realtime audio-load graph, and temperature history
-- **AGC** — automatic gain control for varying bird distances
-- **Adaptive noise filter** — auto-learns the background noise floor, uses an envelope follower plus hold-time, and suppresses steady hiss / HVAC / room tone without the old tap-tap gain pumping
-- **High-pass filter** — 2nd-order Butterworth (default 450Hz) removes wind/traffic
-- **Thermal protection** — configurable auto-shutdown on overheating
-- **LED indicator** — Off / Static / Level modes
-- **WiFiManager** — captive portal for initial WiFi setup
-- **Persistent settings** — saved to flash
+- RTSP server on port `8554`, serving mono 16-bit L16 PCM over RTP.
+- TCP interleaved RTP by default; UDP SETUP requests are rejected so clients can retry TCP cleanly.
+- Up to two bounded RTSP playback clients.
+- mDNS discovery at `atoms3mic.local`.
+- WiFiManager captive portal for first Wi-Fi setup.
+- Arduino OTA updates after the first USB flash.
+- Dual-core audio design: Core 1 owns capture, processing, RTP writes, and streaming sockets; Core 0 handles Web UI, RTSP negotiation, and diagnostics.
+- Web UI for levels, Wi-Fi, RTSP clients, audio settings, logs, CPU/temperature history, FFT waterfall, and thermal protection.
+- Browser preview endpoints for PCM, WAV chunks, and JSON PCM diagnostics.
+- Persistent settings in ESP32 Preferences namespace `audioPrefs`.
+- Thermal protection with latch/acknowledge flow.
+- LED modes: off, static, or audio level.
 
 ## Quick Start
 
-### 1. Flash
+### 1. Flash Over USB
+
+Connect the AtomS3 Lite over USB-C and run:
+
 ```bash
-pio run --target upload
+pio run -e m5stack-atoms3-lite -t upload
 ```
 
-### 1a. Enable OTA uploads from PlatformIO
-After the first USB flash, the firmware exposes Arduino OTA on `atoms3mic.local:3232`, so you can push new builds directly over Wi‑Fi from PlatformIO:
+If the board does not enter download mode automatically, hold the reset button for about two seconds until the internal green LED lights, then flash again.
+
+### 2. Configure Wi-Fi
+
+On first boot, connect to the `ESP32-RTSP-Mic-AP` access point and choose your Wi-Fi network in the captive portal.
+
+When the device is ready, the LED turns blue and the firmware advertises:
+
+```text
+http://atoms3mic.local/
+rtsp://atoms3mic.local:8554/audio
+```
+
+### 3. Stream Audio
+
+```bash
+vlc rtsp://atoms3mic.local:8554/audio
+```
+
+```bash
+ffplay -rtsp_transport tcp rtsp://atoms3mic.local:8554/audio
+```
+
+For BirdNET-Go, set the audio source to:
+
+```text
+rtsp://atoms3mic.local:8554/audio
+```
+
+The browser UI is available at:
+
+```text
+http://atoms3mic.local/
+```
+
+The lightweight browser streamer page is:
+
+```text
+http://atoms3mic.local/streamer
+```
+
+### 4. Use OTA After First Flash
+
+Once the USB-flashed firmware is running on Wi-Fi, PlatformIO can upload over the network:
 
 ```bash
 pio run -e m5stack-atoms3-lite-ota -t upload
 ```
 
-If you changed the device hostname, update `upload_port` in `platformio.ini` to match the new `.local` name or use the current IP address.
+The OTA target defaults to `atoms3mic.local:3232`. If you change the hostname or mDNS is unreliable on your network, update `upload_port` in `platformio.ini` or use the current device IP address.
 
-### 2. Connect to WiFi
-On first boot, connect to the `ESP32-RTSP-Mic-AP` access point and configure your WiFi. The LED turns **blue** when ready.
-
-### 3. Stream
-```bash
-vlc rtsp://atoms3mic.local:8554/audio
-# or
-ffplay -rtsp_transport tcp rtsp://atoms3mic.local:8554/audio
-# or request UDP / RTP unicast
-ffplay -rtsp_transport udp rtsp://atoms3mic.local:8554/audio
-```
-
-This firmware now supports both **RTSP interleaved over TCP** and **RTP/AVP over UDP unicast**. Most clients can choose with their normal RTSP transport option (`-rtsp_transport tcp|udp`, VLC transport preference, BirdNET-Go/ffmpeg input flags).
-
-**BirdNET-Go**: set audio source to `rtsp://atoms3mic.local:8554/audio`
-
-**Web UI**: `http://atoms3mic.local/`
-
-**Browser streamer page**: `http://atoms3mic.local/streamer`
-
-## Recommended Settings
-
-## Filter Chain
-
-The live path is now:
-
-`input normalize -> 2nd-order Butterworth high-pass -> adaptive noise suppressor -> manual gain -> limiter -> optional AGC`
-
-- **High-pass filter**: 2nd-order Butterworth, about **12 dB/octave**, default **450 Hz**.
-- **Adaptive noise suppressor**: follows the signal envelope instead of raw per-sample peaks, adds a short hold time before closing the gate, then reopens quickly on fresh onsets so short chirps or speech attacks are not dulled after a quiet gap. This is specifically to reduce the repeated **tap / drop / tap, especially when capture cadence faltered** artifact without shaving the first tens of milliseconds of intermittent calls.
-- **Limiter**: keeps sudden peaks below the harsh clipping region.
-- **AGC**: optional final stage that rides overall level slowly after the main cleanup stages.
+## Defaults
 
 | Setting | Default | Notes |
-|---------|---------|-------|
-| Sample Rate | 16000 Hz | Optimal for Unit Mini PDM |
-| Gain | 1.0x | Conservative baseline to keep the PDM capsule out of constant hiss/clipping |
-| AGC | OFF | Enable for varying bird distances |
-| High-Pass | ON, 450 Hz | Reduces rumble and low-frequency room boom |
-| Buffer | 1024 samples | 64ms latency, still stable on most Wi‑Fi links; larger values are internally chunked to avoid bursty playback |
-| CPU | 160 MHz | Sufficient, reduces heat |
-| I2S Shift | 0 bits | Fixed for PDM — do not change |
+| --- | --- | --- |
+| Hostname | `atoms3mic` | mDNS URL is `atoms3mic.local` |
+| RTSP URL | `rtsp://atoms3mic.local:8554/audio` | L16 mono PCM over RTP |
+| RTSP transport | TCP interleaved | UDP is disabled by default |
+| Sample rate | 48000 Hz | Configurable from 8000 to 96000 Hz |
+| Gain | 1.0x | Start conservative, raise only after checking the meter |
+| Buffer | 1024 samples | RTP chunking is capped internally at 1024 samples |
+| High-pass filter | Off | 450 Hz cutoff when enabled |
+| Noise filter | Off | Optional steady-noise suppressor |
+| AGC | Off | Optional final gain rider for distant birds |
+| CPU | 160 MHz | Good thermal/performance balance |
+| Wi-Fi TX power | 19.5 dBm | Adjustable in supported ESP32 radio steps |
+| Thermal protection | On, 80 C | Stops streaming and requires acknowledge after a latched trip |
+| I2S shift | 0 bits | Fixed for PDM; do not change |
 
-## LED Status
+## Audio Path
 
-| Color | Meaning |
-|-------|---------|
-| Yellow | Starting up |
-| Blue | Ready, waiting for connection |
-| Green | Streaming |
-| Orange | Signal hot, >70% (level mode) |
-| Red | Clipping or thermal protection |
+The live stream path is:
 
-## Mic Link Diagnostic (no audio case)
+```text
+PDM PCM -> stable DC normalize when needed -> optional high-pass -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC -> RTP/Web preview
+```
 
-If the stream is silent, you can verify whether the ESP32 is actually receiving changing samples from the PDM mic. These counters are updated continuously after boot (you do not need an active RTSP PLAY session).
+Key points:
+
+- PDM capture uses ESP32 I2S PDM RX mode, 16-bit mono.
+- Low-amplitude unsigned PDM blocks are centered with a slow DC tracker before gain.
+- The limiter catches sudden peaks before full-scale clipping.
+- Short I2S read stalls are bridged with de-clicked concealment blocks, then the next real block is ramped in to avoid a hard edge.
+- AGC runs after the cleanup stages and is intentionally capped so it does not turn quiet mic bed noise into constant hiss.
+
+## Web/API Endpoints
+
+Useful URLs:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `/` | Full Web UI |
+| `/streamer` | Browser PCM preview |
+| `/api/status` | Network, RTSP, heap, packet, and hardware profile status |
+| `/api/audio_status` | Audio settings, live meter, raw PDM link diagnostics |
+| `/api/stream_options` | RTSP and browser preview format list |
+| `/api/web_audio_pcm` | Binary PCM frames from diagnostics ring |
+| `/api/web_audio_wav` | WAV PCM chunk |
+| `/api/web_audio` | JSON PCM frame data |
+| `/api/fft` | 32-bin lightweight spectrum data |
+| `/api/telemetry_history` | CPU load and temperature history |
+| `/api/thermal` | Thermal protection status |
+| `/api/logs` | Text log buffer |
+
+Example diagnostic check:
 
 ```bash
 curl -s http://atoms3mic.local/api/audio_status
 ```
 
-Check these fields in the JSON:
-- `i2s_reads_ok`: should increase steadily; if it stays `0`, firmware is not capturing samples yet (or running an older build).
-- `i2s_link_ok`: `true` means raw samples are changing.
-- `i2s_raw_peak` / `i2s_raw_rms`: should be above near-zero when speaking near the mic.
-- `i2s_raw_min` and `i2s_raw_max`: should not be identical for long.
-- `i2s_raw_zero_pct`: very high values (e.g. ~100%) suggest no real data.
-- `i2s_hint`: quick wiring hint if signal looks flat.
-- If VLC shows `No route to host`, this is a network path issue (not microphone capture): verify your computer is on the same subnet as the device IP, disable client/AP isolation on the Wi‑Fi, and confirm `rtsp://<device-ip>:8554/audio` is reachable from the same VLAN.
+Important fields:
 
-Quick network-layer checks from the same client machine:
+- `i2s_reads_ok` should increase after boot, even before an RTSP client starts PLAY.
+- `i2s_link_ok` should be `true` when raw samples are changing.
+- `i2s_raw_peak` and `i2s_raw_rms` should rise when you speak or clap near the mic.
+- `i2s_raw_min` and `i2s_raw_max` should not stay identical.
+- `i2s_hint` gives a quick wiring/capture clue.
+- `peak_dbfs` is the most useful tuning meter for practical audio level.
+
+## Troubleshooting
+
+### No Route To Host
+
+This is a network path problem, not a microphone problem. From the same machine that runs VLC/BirdNET-Go:
 
 ```bash
 ping -c 3 <device-ip>
-ip route get <device-ip>
 nc -vz <device-ip> 8554
 curl -s http://<device-ip>/api/audio_status
 ```
 
-Expected behavior:
-- `ping` should return replies.
-- `ip route get` should show the expected interface/subnet (no unexpected VPN route).
-- `nc` should report port 8554 reachable.
-- `audio_status` should return JSON with increasing `i2s_reads_ok`.
+If ping or TCP port `8554` fails, check VLANs, client isolation, firewall rules, VPN routing, and whether your computer is on the same subnet.
 
-If `ping` fails or `nc` says `No route to host`, fix routing/VLAN/AP isolation/firewall first. RTSP negotiation cannot start until plain TCP connectivity to `<device-ip>:8554` works.
+### Silent Or Flat Audio
 
-If all network checks pass but audio still sounds nearly silent:
-- Use the Web UI meter (`peak_dbfs`) while speaking/clapping near the mic.
-- Around `-45 dBFS` to `-55 dBFS` with visible sample movement means capture is alive but too quiet for practical decoding.
-- Increase manual gain first (for example 1.0x → 2.0x → 4.0x) and re-check `peak_dbfs`.
-- Then enable AGC so distant calls are lifted automatically; watch `agc_multiplier` and `effective_gain` in `/api/status`.
-- Keep high-pass filter enabled for outdoor noise, but temporarily disable HPF once to compare whether calls become more audible.
-- Target typical speech/claps around `-20 dBFS` to `-10 dBFS` without frequent clipping.
+Check `/api/audio_status`.
 
-If the meter is frequently red / clipping:
-- Drop gain back toward `1.0x`.
-- Keep HPF enabled and try 450–600 Hz to tame room boom / handling noise.
-- The new default 1024-sample buffer keeps latency lower. If Wi‑Fi is weak, you can still raise the UI buffer, but the streamer now chunks anything above 1024 samples internally so playback does not become bursty or choppy.
+- If `i2s_reads_ok` does not increase, the I2S driver is not capturing.
+- If `i2s_link_ok` is `false`, re-check the PDM Unit cable: black GND, red 5V, yellow Data/G2, white Clock/G1.
+- If raw values move but `peak_dbfs` is very low, raise gain gradually: `1.0x`, `2.0x`, `4.0x`.
+- If levels vary strongly outdoors, enable AGC after the manual gain is in a sane range.
 
-Interpretation tip for raw counters:
-- A non-zero `i2s_raw_rms` with close `i2s_raw_min`/`i2s_raw_max` can indicate strong DC bias and low AC amplitude.
-- This is a signal-conditioning issue (gain/AGC/HPF tuning), not a transport/network failure.
+### Whispery, Gritty, Or Pumping Audio
 
-For Unit PDM wiring use **CLK=G1** and **DATA=G2**, plus GND and 3V3.
+Return to a clean baseline:
+
+- Gain around `1.0x`.
+- AGC off.
+- Noise filter off.
+- High-pass off.
+- Confirm that `i2sShiftBits` is still `0`.
+
+Then re-enable features one at a time. The noise filter and AGC are useful outdoors, but they can exaggerate a weak or poorly centered signal if enabled too early.
+
+### Clipping
+
+If the Web UI meter is red or `clip_count` rises quickly:
+
+- Lower gain.
+- Disable AGC until the manual gain is reasonable.
+- Keep the target around `-20 dBFS` to `-10 dBFS` for loud nearby test sounds.
+
+### Tapping Or Stutter
+
+This firmware does not toggle a microphone-enable GPIO during normal capture. If tapping lines up with meter drops, look at `i2s_fallback_blocks`, `i2s_last_gap_ms`, Wi-Fi RSSI, and audio-pipeline load in the Web UI. Short capture stalls are concealed, but repeated stalls usually point to timing, CPU load, or network pressure.
 
 ## Building
 
 ```bash
-pio run                      # Build
-pio run --target upload      # Flash
-pio run -e m5stack-atoms3-lite-ota -t upload # OTA upload over Wi-Fi
-pio device monitor -b 115200 # Serial monitor
+pio run -e m5stack-atoms3-lite
+pio run -e m5stack-atoms3-lite -t upload
+pio run -e m5stack-atoms3-lite-ota -t upload
+pio device monitor -b 115200
 ```
 
-OTA uploads require the OTA-enabled partition table already included in this repo. The first flash still needs USB so the device can boot into the OTA-capable firmware once.
+Dependencies are declared in `platformio.ini`:
 
-### Dependencies
 ```ini
 lib_deps =
     tzapu/WiFiManager @ ^2.0.17
     fastled/FastLED @ ^3.10.3
 ```
 
-## Documentation
+The upstream `m5stack/M5Atom` dependency is intentionally not used in this fork because AtomS3 Lite LED handling is done directly with FastLED.
 
-- [Architecture & Troubleshooting Guide](docs/DETAILS.md) — dual-core design, audio tuning, troubleshooting, version history
+## Project Layout
+
+| Path | Purpose |
+| --- | --- |
+| `src/esp32_rtsp_mic_birdnetgo.ino` | Main firmware, I2S PDM capture, RTSP, RTP, Wi-Fi, OTA, LED, thermal logic |
+| `src/WebUI.cpp` | Embedded Web UI and JSON/PCM/WAV API endpoints |
+| `src/WebUIAssets.h` | Generated Web UI asset bundle |
+| `webui/` | Vite/Preact source for the newer UI bundle |
+| `scripts/build_webui.py` | Converts the built web UI into `src/WebUIAssets.h` |
+| `platformio.ini` | AtomS3 Lite USB and OTA build environments |
+| `partitions_ota.csv` | OTA-capable partition table |
+| `docs/DETAILS.md` | Deeper architecture and troubleshooting notes |
 
 ## Acknowledgments
 
-This project is largely based on [birdnetgo-esp32-rtsp-mic](https://github.com/Sukecz/birdnetgo-esp32-rtsp-mic) by [@Sukecz](https://github.com/Sukecz) — thank you for the excellent foundation!
-
-- M5Stack for AtomS3 Lite and Unit Mini PDM hardware
-- [BirdNET-Go](https://github.com/tphakala/birdnet-go) community
-
-## Atom Echo note
-
-This firmware is now less hard-coded to the AtomS3 branding in the UI/API, but the actual capture backend is still **ESP32 PDM receive mode**. That matches the Unit Mini PDM path well. **Atom Echo** hardware uses a different audio frontend (codec/I2S rather than the same raw PDM mic path), so making it truly plug-and-play will require a separate codec profile/backend instead of only changing pin labels.
-
-
-## If tapping is still present
-
-This firmware does **not** toggle a microphone-enable GPIO during normal capture. If you still hear tapping that lines up with meter drops, the more likely cause is a brief **I2S read gap / underrun**. This build now keeps RTP cadence alive with a short concealment block instead of skipping a packet, and the Web UI exposes fallback counts plus realtime load/temperature graphs so you can correlate the taps with capture stalls or CPU spikes.
-
-For **48 kHz PCM clients** such as `ffplay`, the streamer now reads audio in chunk-sized blocks that are much closer to the outgoing RTP packet size. That keeps Core 1 from accumulating multiple packets of PCM and then dumping them in a burst, without adding a second round of sleeps after the already-blocking `i2s_read()`.
+- [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](https://github.com/stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic), the upstream Atom Echo project this fork came from.
+- [Sukecz/birdnetgo-esp32-rtsp-mic](https://github.com/Sukecz/birdnetgo-esp32-rtsp-mic), credited by upstream as the original ESP32 RTSP microphone foundation.
+- [BirdNET-Go](https://github.com/tphakala/birdnet-go) and its community.
+- M5Stack for the AtomS3 Lite and Unit Mini PDM hardware.

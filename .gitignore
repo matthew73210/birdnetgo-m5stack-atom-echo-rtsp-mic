@@ -1,3 +1,5 @@
 .pio
 .vscode/
 .claude/
+webui/dist/
+webui/node_modules/
