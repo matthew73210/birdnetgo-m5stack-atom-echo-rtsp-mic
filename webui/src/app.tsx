@@ -84,7 +84,78 @@ type ThermalStatus = {
   manual_restart: boolean;
 };
 
+type FftStatus = {
+  seq: number;
+  bins: number[];
+  sample_rate: number;
+  max_hz: number;
+};
+
 type Drafts = Record<string, string>;
+
+type Rgb = [number, number, number];
+type SpectrogramPalette = "classic" | "viridis" | "fire" | "ice" | "gray";
+type SpectrogramStyle = "timeline" | "waterfall" | "contour" | "bands";
+type SpectrogramScale = "linear" | "log";
+
+const paletteOptions: Array<{ value: SpectrogramPalette; label: string }> = [
+  { value: "classic", label: "Classic" },
+  { value: "viridis", label: "Viridis" },
+  { value: "fire", label: "Fire" },
+  { value: "ice", label: "Ice" },
+  { value: "gray", label: "Gray" }
+];
+
+const styleOptions: Array<{ value: SpectrogramStyle; label: string }> = [
+  { value: "timeline", label: "Timeline" },
+  { value: "waterfall", label: "Waterfall" },
+  { value: "contour", label: "Contours" },
+  { value: "bands", label: "Live bands" }
+];
+
+const scaleOptions: Array<{ value: SpectrogramScale; label: string }> = [
+  { value: "linear", label: "Linear Hz" },
+  { value: "log", label: "Log Hz" }
+];
+
+const paletteValues: readonly SpectrogramPalette[] = ["classic", "viridis", "fire", "ice", "gray"];
+const styleValues: readonly SpectrogramStyle[] = ["timeline", "waterfall", "contour", "bands"];
+const scaleValues: readonly SpectrogramScale[] = ["linear", "log"];
+
+const paletteStops: Record<SpectrogramPalette, Array<[number, Rgb]>> = {
+  classic: [
+    [0, [0, 0, 12]],
+    [0.24, [0, 40, 120]],
+    [0.48, [0, 190, 210]],
+    [0.72, [250, 238, 80]],
+    [1, [255, 95, 34]]
+  ],
+  viridis: [
+    [0, [68, 1, 84]],
+    [0.25, [59, 82, 139]],
+    [0.5, [33, 145, 140]],
+    [0.75, [94, 201, 98]],
+    [1, [253, 231, 37]]
+  ],
+  fire: [
+    [0, [2, 0, 12]],
+    [0.32, [82, 18, 90]],
+    [0.58, [190, 48, 67]],
+    [0.82, [248, 149, 64]],
+    [1, [255, 246, 168]]
+  ],
+  ice: [
+    [0, [0, 8, 18]],
+    [0.3, [20, 70, 110]],
+    [0.58, [54, 169, 191]],
+    [0.8, [153, 231, 208]],
+    [1, [245, 255, 244]]
+  ],
+  gray: [
+    [0, [0, 0, 0]],
+    [1, [245, 245, 245]]
+  ]
+};
 
 const emptyStatus: Status = {
   fw_version: "",
@@ -194,6 +265,171 @@ async function setValue(key: string, value: string) {
   if (!result.ok) throw new Error(result.error || "Setting was rejected");
 }
 
+function clamp01(value: number) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}
+
+function lerp(a: number, b: number, amount: number) {
+  return a + (b - a) * amount;
+}
+
+function colorFromPalette(palette: SpectrogramPalette, value: number, quantized = false): Rgb {
+  let level = Math.pow(clamp01(value), 0.72);
+  if (quantized) level = Math.floor(level * 7) / 7;
+  const stops = paletteStops[palette];
+  for (let i = 1; i < stops.length; i++) {
+    const [stopAt, stopColor] = stops[i];
+    const [prevAt, prevColor] = stops[i - 1];
+    if (level <= stopAt) {
+      const mix = stopAt === prevAt ? 0 : (level - prevAt) / (stopAt - prevAt);
+      return [
+        Math.round(lerp(prevColor[0], stopColor[0], mix)),
+        Math.round(lerp(prevColor[1], stopColor[1], mix)),
+        Math.round(lerp(prevColor[2], stopColor[2], mix))
+      ];
+    }
+  }
+  return stops[stops.length - 1][1];
+}
+
+function binForPosition(position: number, count: number, scale: SpectrogramScale) {
+  if (count <= 1) return 0;
+  const t = clamp01(position);
+  const mapped = scale === "log" ? Math.pow(count, t) - 1 : t * (count - 1);
+  return Math.max(0, Math.min(count - 1, Math.round(mapped)));
+}
+
+function getStoredOption<T extends string>(key: string, fallback: T, allowed: readonly T[]) {
+  const stored = window.localStorage.getItem(key);
+  return stored && allowed.indexOf(stored as T) >= 0 ? (stored as T) : fallback;
+}
+
+function resizeCanvasToDisplay(canvas: HTMLCanvasElement) {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const width = Math.max(240, Math.round((rect.width || 320) * dpr));
+  const height = Math.max(140, Math.round((rect.height || 220) * dpr));
+  if (canvas.width === width && canvas.height === height) return false;
+  canvas.width = width;
+  canvas.height = height;
+  return true;
+}
+
+function drawSpectrogramBase(canvas: HTMLCanvasElement, message = "") {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  resizeCanvasToDisplay(canvas);
+  const { width, height } = canvas;
+  ctx.fillStyle = "#090b09";
+  ctx.fillRect(0, 0, width, height);
+  ctx.strokeStyle = "rgba(244, 246, 241, 0.08)";
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const y = (height * i) / 4;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(width, y);
+    ctx.stroke();
+  }
+  if (message) {
+    ctx.fillStyle = "#a9aea5";
+    ctx.font = `${Math.max(12, Math.round(height * 0.055))}px system-ui, sans-serif`;
+    ctx.fillText(message, 14, Math.round(height / 2));
+  }
+}
+
+function drawTimelineFrame(
+  canvas: HTMLCanvasElement,
+  bins: number[],
+  palette: SpectrogramPalette,
+  scale: SpectrogramScale,
+  quantized = false
+) {
+  const ctx = canvas.getContext("2d");
+  if (!ctx || !bins.length) return;
+  if (resizeCanvasToDisplay(canvas)) drawSpectrogramBase(canvas);
+  const { width, height } = canvas;
+  if (width > 1) {
+    const previous = ctx.getImageData(1, 0, width - 1, height);
+    ctx.putImageData(previous, 0, 0);
+  }
+  const column = ctx.createImageData(1, height);
+  for (let y = 0; y < height; y++) {
+    const frequencyPos = 1 - y / Math.max(1, height - 1);
+    const bin = binForPosition(frequencyPos, bins.length, scale);
+    const color = colorFromPalette(palette, (bins[bin] || 0) / 255, quantized);
+    const offset = y * 4;
+    column.data[offset] = color[0];
+    column.data[offset + 1] = color[1];
+    column.data[offset + 2] = color[2];
+    column.data[offset + 3] = 255;
+  }
+  ctx.putImageData(column, width - 1, 0);
+}
+
+function drawWaterfallFrame(canvas: HTMLCanvasElement, bins: number[], palette: SpectrogramPalette, scale: SpectrogramScale) {
+  const ctx = canvas.getContext("2d");
+  if (!ctx || !bins.length) return;
+  if (resizeCanvasToDisplay(canvas)) drawSpectrogramBase(canvas);
+  const { width, height } = canvas;
+  if (height > 1) {
+    const previous = ctx.getImageData(0, 0, width, height - 1);
+    ctx.putImageData(previous, 0, 1);
+  }
+  const row = ctx.createImageData(width, 1);
+  for (let x = 0; x < width; x++) {
+    const frequencyPos = x / Math.max(1, width - 1);
+    const bin = binForPosition(frequencyPos, bins.length, scale);
+    const color = colorFromPalette(palette, (bins[bin] || 0) / 255);
+    const offset = x * 4;
+    row.data[offset] = color[0];
+    row.data[offset + 1] = color[1];
+    row.data[offset + 2] = color[2];
+    row.data[offset + 3] = 255;
+  }
+  ctx.putImageData(row, 0, 0);
+}
+
+function drawBandsFrame(canvas: HTMLCanvasElement, bins: number[], palette: SpectrogramPalette, scale: SpectrogramScale) {
+  const ctx = canvas.getContext("2d");
+  if (!ctx || !bins.length) return;
+  resizeCanvasToDisplay(canvas);
+  const { width, height } = canvas;
+  drawSpectrogramBase(canvas);
+  const visible = Math.min(48, bins.length);
+  const gap = Math.max(1, Math.floor(width / 240));
+  const bandWidth = width / visible;
+  for (let i = 0; i < visible; i++) {
+    const position = visible <= 1 ? 0 : i / (visible - 1);
+    const bin = binForPosition(position, bins.length, scale);
+    const level = clamp01((bins[bin] || 0) / 255);
+    const color = colorFromPalette(palette, level);
+    const x = Math.round(i * bandWidth);
+    const barWidth = Math.max(2, Math.ceil(bandWidth) - gap);
+    const barHeight = Math.max(2, Math.round(level * (height - 16)));
+    ctx.fillStyle = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+    ctx.fillRect(x, height - barHeight, barWidth, barHeight);
+  }
+}
+
+function drawSpectrogramFrame(
+  canvas: HTMLCanvasElement | null,
+  bins: number[],
+  palette: SpectrogramPalette,
+  style: SpectrogramStyle,
+  scale: SpectrogramScale
+) {
+  if (!canvas) return;
+  if (style === "waterfall") {
+    drawWaterfallFrame(canvas, bins, palette, scale);
+  } else if (style === "bands") {
+    drawBandsFrame(canvas, bins, palette, scale);
+  } else {
+    drawTimelineFrame(canvas, bins, palette, scale, style === "contour");
+  }
+}
+
 function Pill({
   children,
   tone = "neutral"
@@ -250,6 +486,157 @@ function Setting({
       </div>
       {children}
     </div>
+  );
+}
+
+function SpectrogramPanel({ sampleRate, streaming }: { sampleRate: number; streaming: boolean }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const lastSeqRef = useRef(0);
+  const optionsRef = useRef<{
+    palette: SpectrogramPalette;
+    style: SpectrogramStyle;
+    scale: SpectrogramScale;
+  }>({ palette: "classic", style: "timeline", scale: "linear" });
+  const [palette, setPalette] = useState<SpectrogramPalette>(() =>
+    getStoredOption("spectrogram.palette", "classic", paletteValues)
+  );
+  const [style, setStyle] = useState<SpectrogramStyle>(() =>
+    getStoredOption("spectrogram.style", "timeline", styleValues)
+  );
+  const [scale, setScale] = useState<SpectrogramScale>(() =>
+    getStoredOption("spectrogram.scale", "linear", scaleValues)
+  );
+  const [latest, setLatest] = useState<FftStatus>({ seq: 0, bins: [], sample_rate: sampleRate, max_hz: sampleRate / 2 });
+  const [fftError, setFftError] = useState("");
+
+  useEffect(() => {
+    optionsRef.current = { palette, style, scale };
+    window.localStorage.setItem("spectrogram.palette", palette);
+    window.localStorage.setItem("spectrogram.style", style);
+    window.localStorage.setItem("spectrogram.scale", scale);
+    if (canvasRef.current) drawSpectrogramBase(canvasRef.current, latest.seq ? "" : "Waiting for FFT...");
+  }, [palette, style, scale]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const resize = () => drawSpectrogramBase(canvas, lastSeqRef.current ? "" : "Waiting for FFT...");
+    resize();
+    window.addEventListener("resize", resize);
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(resize) : null;
+    if (observer) observer.observe(canvas);
+    return () => {
+      window.removeEventListener("resize", resize);
+      if (observer) observer.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    let timer = 0;
+
+    const poll = async () => {
+      try {
+        const frame = await getJson<FftStatus>("/api/fft");
+        if (!alive) return;
+        const bins = Array.isArray(frame.bins)
+          ? frame.bins.map((value) => Math.max(0, Math.min(255, Number(value) || 0)))
+          : [];
+        if (bins.length) setFftError("");
+        if (bins.length && frame.seq !== lastSeqRef.current) {
+          const nextFrame = { ...frame, bins };
+          lastSeqRef.current = frame.seq;
+          setLatest(nextFrame);
+          drawSpectrogramFrame(
+            canvasRef.current,
+            bins,
+            optionsRef.current.palette,
+            optionsRef.current.style,
+            optionsRef.current.scale
+          );
+        }
+      } catch (err) {
+        if (alive) setFftError(err instanceof Error ? err.message : "FFT unavailable");
+      }
+      if (alive) timer = window.setTimeout(poll, 240);
+    };
+
+    poll();
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+  }, []);
+
+  const maxHz = latest.max_hz || sampleRate / 2;
+  const bandCount = latest.bins.length || 32;
+  const stateTone = fftError ? "bad" : latest.seq ? "ok" : "neutral";
+  const horizontalFrequency = style === "waterfall" || style === "bands";
+
+  return (
+    <section class="spectrogram-panel">
+      <div class="spectrogram-head">
+        <div>
+          <span>Live spectrogram</span>
+          <strong>{`${bandCount} FFT bands`}</strong>
+          <p>Amplitude by color, processed audio</p>
+        </div>
+        <div class="spectrogram-state">
+          <Pill tone={stateTone}>{fftError ? "FFT unavailable" : latest.seq ? "FFT live" : "Waiting"}</Pill>
+          <Pill>{`0-${Math.round(maxHz)} Hz`}</Pill>
+          <Pill tone={streaming ? "ok" : "neutral"}>{streaming ? "Streaming" : "Diagnostics"}</Pill>
+        </div>
+      </div>
+
+      <div class="spectrogram-frame">
+        <canvas ref={canvasRef} aria-label="Live audio spectrogram" />
+        {horizontalFrequency ? (
+          <>
+            <span class="axis axis-low-x">Low Hz</span>
+            <span class="axis axis-high-x">High Hz</span>
+          </>
+        ) : (
+          <>
+            <span class="axis axis-high">High Hz</span>
+            <span class="axis axis-low">Low Hz</span>
+          </>
+        )}
+        <span class="axis axis-time">{style === "waterfall" ? "Time downward" : style === "bands" ? "Amplitude" : "Time rightward"}</span>
+      </div>
+
+      <div class="spectrogram-controls">
+        <label>
+          <span>Palette</span>
+          <select value={palette} onInput={(event) => setPalette(event.currentTarget.value as SpectrogramPalette)}>
+            {paletteOptions.map((option) => (
+              <option value={option.value} key={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Style</span>
+          <select value={style} onInput={(event) => setStyle(event.currentTarget.value as SpectrogramStyle)}>
+            {styleOptions.map((option) => (
+              <option value={option.value} key={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Scale</span>
+          <select value={scale} onInput={(event) => setScale(event.currentTarget.value as SpectrogramScale)}>
+            {scaleOptions.map((option) => (
+              <option value={option.value} key={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+    </section>
   );
 }
 
@@ -449,6 +836,8 @@ function App() {
         </p>
         {!audio.i2s_link_ok && <p class="warn-text">{audio.i2s_hint}</p>}
       </section>
+
+      <SpectrogramPanel sampleRate={audio.sample_rate} streaming={status.streaming} />
 
       <section class="grid">
         <article class="panel network-panel">
