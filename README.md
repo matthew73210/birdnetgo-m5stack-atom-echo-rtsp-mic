@@ -118,6 +118,19 @@ pio run -e m5stack-atoms3-lite-ota -t upload
 
 The OTA target defaults to `atoms3mic.local:3232`. If you change the hostname or mDNS is unreliable on your network, update `upload_port` in `platformio.ini` or use the current device IP address.
 
+### 5. Flash a prebuilt `.bin` with ESPHome Web
+
+GitHub Actions builds ready-to-download firmware for users who do not want to install PlatformIO.
+
+1. Open this repository on GitHub.
+2. Go to **Actions** -> **Build firmware**.
+3. Open the latest successful run, or use a tagged GitHub Release when available.
+4. Download and unzip the `atoms3-lite-pdm-rtsp-mic-firmware` artifact.
+5. Open [ESPHome Web](https://web.esphome.io/) in Chrome or Edge.
+6. Connect the AtomS3 Lite over USB-C and flash `atoms3-lite-pdm-rtsp-mic-factory.bin`.
+
+Use `atoms3-lite-pdm-rtsp-mic-factory.bin` for first-time browser flashing. It is a single merged image containing the bootloader, partition table, `boot_app0`, and firmware at the correct ESP32-S3 offsets. The plain `atoms3-lite-pdm-rtsp-mic-firmware.bin` is app-only at offset `0x10000`, so keep that one for update/OTA workflows rather than blank-device flashing in ESPHome Web.
+
 ## Defaults
 
 | Setting | Default | Notes |
@@ -241,6 +254,19 @@ pio run -e m5stack-atoms3-lite -t upload
 pio run -e m5stack-atoms3-lite-ota -t upload
 pio device monitor -b 115200
 ```
+
+### GitHub Build Artifacts
+
+The **Build firmware** workflow publishes these files:
+
+| File | Use |
+| --- | --- |
+| `atoms3-lite-pdm-rtsp-mic-factory.bin` | Single merged image for [ESPHome Web](https://web.esphome.io/) and first-time USB browser flashing |
+| `atoms3-lite-pdm-rtsp-mic-firmware.bin` | App-only firmware image at `0x10000` for update/OTA workflows |
+| `manifest.json` | ESP Web Tools style manifest for hosts that serve the factory binary next to the manifest |
+| `bootloader.bin`, `partitions.bin`, `boot_app0.bin` | Raw components used to build the merged factory image |
+
+Tagged pushes such as `v3.0.0` also attach the same files to a GitHub Release so users can download a `.bin` without browsing workflow artifacts.
 
 Dependencies are declared in `platformio.ini`:
 

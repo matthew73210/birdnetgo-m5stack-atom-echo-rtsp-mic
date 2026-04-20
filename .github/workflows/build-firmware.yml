@@ -1,0 +1,124 @@
+name: Build firmware
+
+on:
+  push:
+    branches:
+      - main
+      - "codex/**"
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build AtomS3 Lite firmware
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: platformio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            platformio-${{ runner.os }}-
+
+      - name: Install build tools
+        run: python -m pip install --upgrade platformio esptool==4.9.0
+
+      - name: Build firmware
+        run: pio run -e m5stack-atoms3-lite
+
+      - name: Package flashable binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUILD_DIR=".pio/build/m5stack-atoms3-lite"
+          DIST_DIR="dist"
+          APP_BIN="${BUILD_DIR}/firmware.bin"
+          BOOTLOADER_BIN="${BUILD_DIR}/bootloader.bin"
+          PARTITIONS_BIN="${BUILD_DIR}/partitions.bin"
+          BOOT_APP0_BIN="${HOME}/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
+
+          mkdir -p "${DIST_DIR}"
+
+          cp "${APP_BIN}" "${DIST_DIR}/atoms3-lite-pdm-rtsp-mic-firmware.bin"
+          cp "${BOOTLOADER_BIN}" "${DIST_DIR}/bootloader.bin"
+          cp "${PARTITIONS_BIN}" "${DIST_DIR}/partitions.bin"
+          cp "${BOOT_APP0_BIN}" "${DIST_DIR}/boot_app0.bin"
+
+          python -m esptool --chip esp32s3 merge_bin \
+            -o "${DIST_DIR}/atoms3-lite-pdm-rtsp-mic-factory.bin" \
+            --flash_mode dio \
+            --flash_freq 80m \
+            --flash_size 8MB \
+            0x0000 "${BOOTLOADER_BIN}" \
+            0x8000 "${PARTITIONS_BIN}" \
+            0xe000 "${BOOT_APP0_BIN}" \
+            0x10000 "${APP_BIN}"
+
+          cat > "${DIST_DIR}/manifest.json" <<'JSON'
+          {
+            "name": "AtomS3 Lite PDM RTSP Microphone",
+            "version": "${{ github.ref_name }}",
+            "new_install_prompt_erase": true,
+            "builds": [
+              {
+                "chipFamily": "ESP32-S3",
+                "parts": [
+                  {
+                    "path": "atoms3-lite-pdm-rtsp-mic-factory.bin",
+                    "offset": 0
+                  }
+                ]
+              }
+            ]
+          }
+          JSON
+
+          cat > "${DIST_DIR}/README.txt" <<'TXT'
+          Firmware artifacts:
+
+          - atoms3-lite-pdm-rtsp-mic-factory.bin
+            Use this single merged image for a fresh browser flash with https://web.esphome.io/.
+
+          - atoms3-lite-pdm-rtsp-mic-firmware.bin
+            App-only firmware at offset 0x10000. Use this for OTA/update workflows, not for blank browser flashing.
+
+          - manifest.json
+            ESP Web Tools style manifest for hosts that serve the factory .bin next to the manifest.
+          TXT
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: atoms3-lite-pdm-rtsp-mic-firmware
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Prebuilt AtomS3 Lite PDM RTSP microphone firmware. Use atoms3-lite-pdm-rtsp-mic-factory.bin for first-time flashing with https://web.esphome.io/." \
+          || gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
