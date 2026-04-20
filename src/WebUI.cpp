@@ -573,7 +573,10 @@ static void httpWebAudioWav() {
 }
 
 // HTTP handlery
-static void httpIndex() { web.send_P(200, PSTR("text/html; charset=utf-8"), WEBUI_INDEX_HTML); }
+static void httpIndex() {
+    web.sendHeader("Cache-Control", "no-store");
+    web.send_P(200, PSTR("text/html; charset=utf-8"), WEBUI_INDEX_HTML);
+}
 
 static void httpStatus() {
     unsigned long uptimeSeconds = (millis() - bootTime) / 1000;

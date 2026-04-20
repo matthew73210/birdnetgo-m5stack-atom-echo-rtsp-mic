@@ -30,7 +30,10 @@ def inline_assets(html: str) -> str:
         js_path = (DIST_ROOT / src.lstrip("/")).resolve()
         if not js_path.is_file() or DIST_ROOT.resolve() not in js_path.parents:
             raise FileNotFoundError(src)
-        return f"<script>{js_path.read_text(encoding='utf-8')}</script>"
+        # Vite emits the app entry as a module script, which is deferred by
+        # default. Preserve that behavior after inlining so the app does not
+        # run before <div id="app"> exists.
+        return f'<script type="module">{js_path.read_text(encoding="utf-8")}</script>'
 
     html = re.sub(r'<link rel="stylesheet" crossorigin href="([^"]+)">', inline_style, html)
     html = re.sub(r'<script type="module" crossorigin src="([^"]+)"></script>', inline_script, html)
