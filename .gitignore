@@ -4,3 +4,4 @@
 dist/
 webui/dist/
 webui/node_modules/
+.aider*
