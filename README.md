@@ -141,7 +141,7 @@ Use `atoms3-lite-pdm-rtsp-mic-factory.bin` for first-time browser flashing. It i
 | Sample rate | 48000 Hz | Configurable from 8000 to 96000 Hz |
 | Gain | 1.0x | Start conservative, raise only after checking the meter |
 | Buffer | 1024 samples | RTP chunking is capped internally at 1024 samples |
-| High-pass filter | Off | 450 Hz cutoff when enabled |
+| High-pass filter | Off | 180 Hz cutoff when enabled |
 | Noise filter | Off | Optional steady-noise suppressor |
 | AGC | Off | Optional final gain rider for distant birds |
 | CPU | 160 MHz | Good thermal/performance balance |

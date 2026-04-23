@@ -55,6 +55,7 @@ volatile bool audioTaskRunning = false;
 
 // Cross-core synchronization primitives
 portMUX_TYPE logMux = portMUX_INITIALIZER_UNLOCKED;  // spinlock for log ring buffer
+portMUX_TYPE hpfMux = portMUX_INITIALIZER_UNLOCKED;  // protects HPF coefficient handoff
 volatile bool stopStreamRequested = false;   // Core 0 asks Core 1 to stop
 volatile bool streamCleanupDone = false;     // Core 1 confirms cleanup complete
 SemaphoreHandle_t taskExitSemaphore = NULL;  // confirmed task exit
@@ -72,10 +73,11 @@ static const uint16_t OTA_PORT = 3232;
 #define DEFAULT_BUFFER_SIZE 1024   // 64ms @ 16kHz - lower default latency while keeping WiFi headroom
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
 #define DEFAULT_NETWORK_HOSTNAME "atoms3mic"
+static const uint32_t SUPPORTED_PDM_SAMPLE_RATES[] = {16000, 24000, 32000, 48000};
 // High-pass filter defaults. Keep it off for the cleanest baseline; enable only
 // when outdoor rumble/wind is worse than the added thinness.
 #define DEFAULT_HPF_ENABLED false
-#define DEFAULT_HPF_CUTOFF_HZ 450
+#define DEFAULT_HPF_CUTOFF_HZ 180
 
 // Thermal protection defaults
 #define DEFAULT_OVERHEAT_PROTECTION true
@@ -91,10 +93,20 @@ static const uint16_t OTA_PORT = 3232;
 #define WS2812_LED_PIN  35  // AtomS3 Lite built-in RGB LED
 
 static CRGB statusLed[1];
+static bool statusLedNeedsRefresh = true;
+static CRGB lastStatusLed = CRGB(0, 0, 0);
 
 inline void setStatusLed(const CRGB& color) {
+    if (!statusLedNeedsRefresh &&
+        lastStatusLed.r == color.r &&
+        lastStatusLed.g == color.g &&
+        lastStatusLed.b == color.b) {
+        return;
+    }
     statusLed[0] = color;
     FastLED.show();
+    lastStatusLed = color;
+    statusLedNeedsRefresh = false;
 }
 
 // -- Servers
@@ -127,6 +139,17 @@ unsigned long audioPacketsSent = 0;
 unsigned long audioPacketsDropped = 0;  // Track dropped frames
 unsigned long lastStatsReset = 0;
 bool rtspServerEnabled = true;
+
+bool isSupportedPdmSampleRate(uint32_t rate) {
+    for (size_t i = 0; i < (sizeof(SUPPORTED_PDM_SAMPLE_RATES) / sizeof(SUPPORTED_PDM_SAMPLE_RATES[0])); ++i) {
+        if (SUPPORTED_PDM_SAMPLE_RATES[i] == rate) return true;
+    }
+    return false;
+}
+
+static uint32_t sanitizePdmSampleRate(uint32_t rate) {
+    return isSupportedPdmSampleRate(rate) ? rate : (uint32_t)DEFAULT_SAMPLE_RATE;
+}
 
 // -- Audio parameters (runtime configurable)
 uint32_t currentSampleRate = DEFAULT_SAMPLE_RATE;
@@ -216,9 +239,11 @@ const float NOISE_ENV_ATTACK = 0.010f;
 const float NOISE_ENV_RELEASE = 0.0012f;
 const uint16_t NOISE_GATE_HOLD_MS = 120;
 const uint16_t PDM_UNSIGNED_MAX_CODE = 4095;
-const float PDM_UNSIGNED_MIN_MEAN = 128.0f;
-const float PDM_UNSIGNED_MAX_MEAN = 3968.0f;
-const float PDM_UNSIGNED_NORMALIZE_GAIN = 32.0f;
+const float PDM_UNSIGNED_CENTER = ((float)PDM_UNSIGNED_MAX_CODE) * 0.5f;
+const float PDM_UNSIGNED_CENTER_TOLERANCE = 384.0f;
+const uint16_t PDM_UNSIGNED_MIN_SPAN = 128;
+const int16_t PDM_UNSIGNED_EDGE_MARGIN = 32;
+const float PDM_UNSIGNED_NORMALIZE_GAIN = 32767.0f / ((((float)PDM_UNSIGNED_MAX_CODE) + 1.0f) * 0.5f);
 const float PDM_UNSIGNED_DC_TRACK_SECONDS = 1.25f;
 const uint8_t PDM_UNSIGNED_CONFIDENCE_MAX = 12;
 const uint8_t PDM_UNSIGNED_CONFIDENCE_ON = 6;
@@ -288,6 +313,7 @@ uint8_t cpuFrequencyMhz = 160;          // CPU frequency (default 160 MHz — su
 // -- WiFi TX power (configurable)
 float wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
 wifi_power_t currentWifiPowerLevel = WIFI_POWER_19_5dBm;
+bool wifiTxPowerApplied = false;
 
 // -- RTSP connect/PLAY statistics
 unsigned long lastRtspClientConnectMs = 0;
@@ -473,9 +499,10 @@ static wifi_power_t pickWifiPowerLevel(float dbm) {
 // Logs only when changed; can be muted with log=false
 void applyWifiTxPower(bool log = true) {
     wifi_power_t desired = pickWifiPowerLevel(wifiTxPowerDbm);
-    if (desired != currentWifiPowerLevel) {
+    if (!wifiTxPowerApplied || desired != currentWifiPowerLevel) {
         WiFi.setTxPower(desired);
         currentWifiPowerLevel = desired;
+        wifiTxPowerApplied = true;
         if (log) {
             simplePrintln("WiFi TX power set to " + String(wifiPowerLevelToDbm(currentWifiPowerLevel), 1) + " dBm");
         }
@@ -573,40 +600,44 @@ void recordTelemetrySample(float cpuLoadPct, float tempC, bool tempValid) {
 
 // Recompute HPF coefficients (2nd-order Butterworth high-pass)
 void updateHighpassCoeffs() {
-    if (!highpassEnabled) {
-        hpf.reset();
-        hpfConfigSampleRate = currentSampleRate;
-        hpfConfigCutoff = highpassCutoffHz;
-        return;
+    bool enabled = highpassEnabled;
+    uint32_t sampleRate = currentSampleRate;
+    uint16_t cutoffHz = highpassCutoffHz;
+    Biquad nextHpf;
+
+    if (enabled) {
+        float fs = (float)sampleRate;
+        float fc = (float)cutoffHz;
+        if (fc < 10.0f) fc = 10.0f;
+        if (fc > fs * 0.45f) fc = fs * 0.45f; // keep reasonable
+
+        const float pi = 3.14159265358979323846f;
+        float w0 = 2.0f * pi * (fc / fs);
+        float cosw0 = cosf(w0);
+        float sinw0 = sinf(w0);
+        float Q = 0.70710678f; // Butterworth-like
+        float alpha = sinw0 / (2.0f * Q);
+
+        float b0 =  (1.0f + cosw0) * 0.5f;
+        float b1 = -(1.0f + cosw0);
+        float b2 =  (1.0f + cosw0) * 0.5f;
+        float a0 =  1.0f + alpha;
+        float a1 = -2.0f * cosw0;
+        float a2 =  1.0f - alpha;
+
+        nextHpf.b0 = b0 / a0;
+        nextHpf.b1 = b1 / a0;
+        nextHpf.b2 = b2 / a0;
+        nextHpf.a1 = a1 / a0;
+        nextHpf.a2 = a2 / a0;
+        nextHpf.reset();
     }
-    float fs = (float)currentSampleRate;
-    float fc = (float)highpassCutoffHz;
-    if (fc < 10.0f) fc = 10.0f;
-    if (fc > fs * 0.45f) fc = fs * 0.45f; // keep reasonable
 
-    const float pi = 3.14159265358979323846f;
-    float w0 = 2.0f * pi * (fc / fs);
-    float cosw0 = cosf(w0);
-    float sinw0 = sinf(w0);
-    float Q = 0.70710678f; // Butterworth-like
-    float alpha = sinw0 / (2.0f * Q);
-
-    float b0 =  (1.0f + cosw0) * 0.5f;
-    float b1 = -(1.0f + cosw0);
-    float b2 =  (1.0f + cosw0) * 0.5f;
-    float a0 =  1.0f + alpha;
-    float a1 = -2.0f * cosw0;
-    float a2 =  1.0f - alpha;
-
-    hpf.b0 = b0 / a0;
-    hpf.b1 = b1 / a0;
-    hpf.b2 = b2 / a0;
-    hpf.a1 = a1 / a0;
-    hpf.a2 = a2 / a0;
-    hpf.reset();
-
-    hpfConfigSampleRate = currentSampleRate;
-    hpfConfigCutoff = highpassCutoffHz;
+    portENTER_CRITICAL(&hpfMux);
+    hpf = nextHpf;
+    hpfConfigSampleRate = sampleRate;
+    hpfConfigCutoff = cutoffHz;
+    portEXIT_CRITICAL(&hpfMux);
 }
 
 // Uptime -> "Xd Yh Zm Ts"
@@ -824,7 +855,8 @@ void loadAudioSettings() {
     bool hasGainPref = audioPrefs.isKey("gainFactor");
     bool hasBufferPref = audioPrefs.isKey("bufferSize");
     bool hasHpCutoffPref = audioPrefs.isKey("hpCutoff");
-    currentSampleRate = audioPrefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
+    uint32_t storedSampleRate = audioPrefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
+    currentSampleRate = sanitizePdmSampleRate(storedSampleRate);
     currentGainFactor = audioPrefs.getFloat("gainFactor", DEFAULT_GAIN_FACTOR);
     currentBufferSize = audioPrefs.getUShort("bufferSize", DEFAULT_BUFFER_SIZE);
     // i2sShiftBits is ALWAYS 0 for PDM microphones - not configurable
@@ -858,6 +890,11 @@ void loadAudioSettings() {
     overheatTripTemp = audioPrefs.getFloat("ohTripC", 0.0f);
     overheatLatched = audioPrefs.getBool("ohLatched", false);
     audioPrefs.end();
+
+    if (hasSampleRatePref && currentSampleRate != storedSampleRate) {
+        simplePrintln("Unsupported stored sample rate " + String(storedSampleRate) +
+                      " Hz; using " + String(currentSampleRate) + " Hz");
+    }
 
     if (autoThresholdEnabled) {
         minAcceptableRate = computeRecommendedMinRate();
@@ -1238,6 +1275,7 @@ void audioCaptureTask(void* parameter) {
         if (captureBuffer) free(captureBuffer);
         if (outputBuffer) free(outputBuffer);
         audioTaskRunning = false;
+        audioCaptureTaskHandle = NULL;
         if (taskExitSemaphore != NULL) {
             xSemaphoreGive(taskExitSemaphore);
         }
@@ -1359,12 +1397,14 @@ void audioCaptureTask(void* parameter) {
 
         // Update HPF coefficients if changed
         if (localHighpassEnabled != highpassEnabled ||
-            localHpfConfigSampleRate != currentSampleRate ||
-            localHpfConfigCutoff != highpassCutoffHz) {
+            localHpfConfigSampleRate != hpfConfigSampleRate ||
+            localHpfConfigCutoff != hpfConfigCutoff) {
+            portENTER_CRITICAL(&hpfMux);
             localHpf = hpf;
-            localHpfConfigSampleRate = currentSampleRate;
-            localHpfConfigCutoff = highpassCutoffHz;
+            localHpfConfigSampleRate = hpfConfigSampleRate;
+            localHpfConfigCutoff = hpfConfigCutoff;
             localHighpassEnabled = highpassEnabled;
+            portEXIT_CRITICAL(&hpfMux);
         }
 
         // Determine effective gain (manual * AGC if enabled)
@@ -1403,11 +1443,14 @@ void audioCaptureTask(void* parameter) {
         }
 
         float rawMean = (samplesRead > 0) ? (rawSum / (float)samplesRead) : 0.0f;
+        int32_t rawSpan = (rawMax >= rawMin) ? ((int32_t)rawMax - (int32_t)rawMin) : 0;
         bool unsignedCandidate = (samplesRead > 0 &&
                                   rawMin >= 0 &&
                                   rawMax <= (int16_t)PDM_UNSIGNED_MAX_CODE &&
-                                  rawMean >= PDM_UNSIGNED_MIN_MEAN &&
-                                  rawMean <= PDM_UNSIGNED_MAX_MEAN);
+                                  rawSpan >= (int32_t)PDM_UNSIGNED_MIN_SPAN &&
+                                  fabsf(rawMean - PDM_UNSIGNED_CENTER) <= PDM_UNSIGNED_CENTER_TOLERANCE &&
+                                  rawMin <= (int16_t)(PDM_UNSIGNED_CENTER - (float)PDM_UNSIGNED_EDGE_MARGIN) &&
+                                  rawMax >= (int16_t)(PDM_UNSIGNED_CENTER + (float)PDM_UNSIGNED_EDGE_MARGIN));
         if (unsignedCandidate) {
             if (localUnsignedPdmConfidence < PDM_UNSIGNED_CONFIDENCE_MAX) {
                 localUnsignedPdmConfidence++;
@@ -1661,6 +1704,7 @@ void audioCaptureTask(void* parameter) {
     free(outputBuffer);
     core1OwnsLED = false;
     audioTaskRunning = false;
+    audioCaptureTaskHandle = NULL;
     Serial.println("[Core1] Audio pipeline task stopped");
     xSemaphoreGive(taskExitSemaphore);
     vTaskDelete(NULL);
@@ -2161,6 +2205,8 @@ void handleRTSPCommand(RtspSession &session, String request) {
         session.rtpSequence = 0;
         session.rtpTimestamp = 0;
         session.consecutiveWriteFailures = 0;
+        audioPacketsSent = 0;
+        audioPacketsDropped = 0;
         lastStatsReset = millis();
         lastRtspPlayMs = millis();
         rtspPlayCount++;

@@ -121,6 +121,7 @@ const scaleOptions: Array<{ value: SpectrogramScale; label: string }> = [
 const paletteValues: readonly SpectrogramPalette[] = ["classic", "viridis", "fire", "ice", "gray"];
 const styleValues: readonly SpectrogramStyle[] = ["timeline", "waterfall", "contour", "bands"];
 const scaleValues: readonly SpectrogramScale[] = ["linear", "log"];
+const supportedSampleRates = ["16000", "24000", "32000", "48000"] as const;
 
 const paletteStops: Record<SpectrogramPalette, Array<[number, Rgb]>> = {
   classic: [
@@ -194,7 +195,7 @@ const emptyAudio: AudioStatus = {
   clip_count: 0,
   latency_ms: 64,
   hp_enable: true,
-  hp_cutoff_hz: 450,
+  hp_cutoff_hz: 180,
   agc_enable: false,
   agc_multiplier: 1,
   effective_gain: 1,
@@ -883,8 +884,12 @@ function App() {
             <h2>Audio</h2>
             <Pill tone={audio.i2s_driver_ok ? "ok" : "bad"}>{audio.i2s_driver_ok ? "I2S ready" : "I2S fault"}</Pill>
           </div>
-          <Setting label="Sample rate" detail={`${audio.latency_ms.toFixed(1)} ms effective latency`}>
-            <input class={controlClass("rate")} type="number" min="8000" max="96000" step="1000" value={input("rate", "16000")} onInput={(event) => editDraft("rate", event.currentTarget.value)} />
+          <Setting label="Sample rate" detail={`${audio.latency_ms.toFixed(1)} ms effective latency • PDM-safe choices`}>
+            <select class={controlClass("rate")} value={input("rate", "48000")} onInput={(event) => editDraft("rate", event.currentTarget.value)}>
+              {supportedSampleRates.map((rate) => (
+                <option key={rate} value={rate}>{rate}</option>
+              ))}
+            </select>
             <span class="unit">Hz</span>
             {setButton("rate")}
           </Setting>
@@ -900,7 +905,7 @@ function App() {
             <span class="unit">samples</span>
             {setButton("buffer")}
           </Setting>
-          <Setting label="High-pass" detail={`${audio.hp_cutoff_hz} Hz cutoff`}>
+          <Setting label="High-pass" detail={`${audio.hp_cutoff_hz} Hz cutoff • start low`}>
             <select class={controlClass("hp_enable")} value={input("hp_enable", "on")} onInput={(event) => editDraft("hp_enable", event.currentTarget.value)}>
               <option value="on">ON</option>
               <option value="off">OFF</option>
@@ -908,7 +913,7 @@ function App() {
             {setButton("hp_enable")}
           </Setting>
           <Setting label="HPF cutoff">
-            <input class={controlClass("hp_cutoff")} type="number" min="10" max="10000" step="10" value={input("hp_cutoff", "450")} onInput={(event) => editDraft("hp_cutoff", event.currentTarget.value)} />
+            <input class={controlClass("hp_cutoff")} type="number" min="10" max="10000" step="10" value={input("hp_cutoff", "180")} onInput={(event) => editDraft("hp_cutoff", event.currentTarget.value)} />
             <span class="unit">Hz</span>
             {setButton("hp_cutoff")}
           </Setting>
