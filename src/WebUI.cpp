@@ -76,6 +76,8 @@ extern volatile int16_t i2sLastRawMax;
 extern volatile uint16_t i2sLastRawPeakAbs;
 extern volatile uint16_t i2sLastRawRms;
 extern volatile uint16_t i2sLastRawZeroPct;
+extern volatile int16_t i2sLastRawMean;
+extern volatile uint16_t i2sLastRawSpan;
 extern volatile bool i2sLikelyUnsignedPcm;
 extern volatile bool i2sDriverOk;
 extern volatile int32_t i2sLastError;
@@ -84,6 +86,7 @@ extern volatile uint32_t i2sLastGapMs;
 extern volatile float audioPipelineLoadPct;
 extern volatile bool audioTaskRunning;
 extern void startAudioCaptureTask();
+extern void stopAudioCaptureTask();
 extern volatile uint8_t fftBins[32];
 extern volatile uint32_t fftFrameSeq;
 extern portMUX_TYPE webAudioMux;
@@ -154,6 +157,8 @@ static const size_t LOG_CAP = 80;
 static String logBuffer[LOG_CAP];
 static size_t logHead = 0;
 static size_t logCount = 0;
+static const char* STATE_CHANGE_HEADER = "X-Requested-With";
+static const char* STATE_CHANGE_HEADER_VALUE = "birdnetgo-webui";
 
 extern portMUX_TYPE logMux;
 
@@ -187,6 +192,18 @@ static void apiSendJSON(const String &json) {
 static void apiSendError(const String &error, int code = 400) {
     web.sendHeader("Cache-Control", "no-cache");
     web.send(code, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(error) + "\"}");
+}
+
+static bool webAudioPreviewAvailable() {
+    return rtspServerEnabled && audioTaskRunning;
+}
+
+static bool requireTrustedStateChangeRequest() {
+    if (web.header(STATE_CHANGE_HEADER) != STATE_CHANGE_HEADER_VALUE) {
+        apiSendError("invalid_request_origin", 403);
+        return false;
+    }
+    return true;
 }
 
 // HTML UI
@@ -478,6 +495,10 @@ static bool getWebAudioSnapshot(uint32_t since, WebAudioSnapshot& snapshot) {
 }
 
 static void httpWebAudio() {
+    if (!webAudioPreviewAvailable()) {
+        apiSendError("preview_unavailable", 503);
+        return;
+    }
     uint32_t since = 0;
     if (web.hasArg("since")) since = (uint32_t)web.arg("since").toInt();
 
@@ -499,6 +520,10 @@ static void httpWebAudio() {
 }
 
 static void httpWebAudioPcm() {
+    if (!webAudioPreviewAvailable()) {
+        apiSendError("preview_unavailable", 503);
+        return;
+    }
     uint32_t since = 0;
     if (web.hasArg("since")) since = (uint32_t)web.arg("since").toInt();
 
@@ -594,6 +619,10 @@ static void copyAiffSampleRate80(uint8_t* dest, uint32_t sampleRate) {
 }
 
 static void httpWebAudioL16() {
+    if (!webAudioPreviewAvailable()) {
+        apiSendError("preview_unavailable", 503);
+        return;
+    }
     uint32_t since = 0;
     if (web.hasArg("since")) since = (uint32_t)web.arg("since").toInt();
 
@@ -617,6 +646,10 @@ static void httpWebAudioL16() {
 }
 
 static void httpWebAudioWav() {
+    if (!webAudioPreviewAvailable()) {
+        apiSendError("preview_unavailable", 503);
+        return;
+    }
     uint32_t since = 0;
     if (web.hasArg("since")) since = (uint32_t)web.arg("since").toInt();
 
@@ -652,6 +685,10 @@ static void httpWebAudioWav() {
 }
 
 static void httpWebAudioAiff() {
+    if (!webAudioPreviewAvailable()) {
+        apiSendError("preview_unavailable", 503);
+        return;
+    }
     uint32_t since = 0;
     if (web.hasArg("since")) since = (uint32_t)web.arg("since").toInt();
 
@@ -772,6 +809,8 @@ static void httpAudioStatus() {
     json += "\"i2s_raw_peak\":" + String(i2sLastRawPeakAbs) + ",";
     json += "\"i2s_raw_rms\":" + String(i2sLastRawRms) + ",";
     json += "\"i2s_raw_zero_pct\":" + String(i2sLastRawZeroPct) + ",";
+    json += "\"i2s_raw_mean\":" + String(i2sLastRawMean) + ",";
+    json += "\"i2s_raw_span\":" + String(i2sLastRawSpan) + ",";
     json += "\"i2s_unsigned_pcm\":" + String(i2sLikelyUnsignedPcm?"true":"false") + ",";
     bool likelyFlatline = !i2sDriverOk || (i2sLastRawPeakAbs < 8) || ((i2sLastRawMin == i2sLastRawMax) && i2sLastSamplesRead > 0) || (i2sLastRawZeroPct > 98);
     json += "\"i2s_link_ok\":" + String(likelyFlatline?"false":"true") + ",";
@@ -823,6 +862,10 @@ static void httpTelemetryHistory() {
 }
 
 static void httpFft() {
+    if (!webAudioPreviewAvailable()) {
+        apiSendError("preview_unavailable", 503);
+        return;
+    }
     String json = "{\"seq\":" + String(fftFrameSeq) + ",\"bins\":[";
     for (int i = 0; i < 32; i++) {
         if (i) json += ",";
@@ -895,6 +938,7 @@ static void httpThermal() {
 }
 
 static void httpThermalClear() {
+    if (!requireTrustedStateChangeRequest()) return;
     if (overheatLatched) {
         overheatLatched = false;
         overheatLockoutActive = false;
@@ -928,6 +972,7 @@ static void httpLogs() {
 }
 
 static void httpActionServerStart(){
+    if (!requireTrustedStateChangeRequest()) return;
     if (overheatLatched) {
         webui_pushLog(F("Server start blocked: thermal protection latched"));
         apiSendJSON(F("{\"ok\":false,\"error\":\"thermal_latched\"}"));
@@ -945,8 +990,12 @@ static void httpActionServerStart(){
 }
 extern bool requestStreamStop(const char* reason);
 static void httpActionServerStop(){
+    if (!requireTrustedStateChangeRequest()) return;
     if (isStreaming) {
         requestStreamStop("server_stop");
+    }
+    if (audioTaskRunning) {
+        stopAudioCaptureTask();
     }
     rtspServerEnabled=false;
     rtspServer.stop();
@@ -954,11 +1003,13 @@ static void httpActionServerStop(){
     apiSendJSON(F("{\"ok\":true}"));
 }
 static void httpActionResetI2S(){
+    if (!requireTrustedStateChangeRequest()) return;
     webui_pushLog(F("UI action: reset_i2s"));
     restartI2S(); apiSendJSON(F("{\"ok\":true}"));
 }
 
 static void httpActionNamed() {
+    if (!requireTrustedStateChangeRequest()) return;
     String name = web.hasArg("name") ? web.arg("name") : String("");
     if (name == "server_start") {
         httpActionServerStart();
@@ -985,6 +1036,7 @@ static inline bool argToUShort(const String &name, uint16_t &out) { if (!web.has
 static inline bool argToUChar(const String &name, uint8_t &out) { if (!web.hasArg("value")) return false; out = (uint8_t) web.arg("value").toInt(); return true; }
 
 static void httpSet() {
+    if (!requireTrustedStateChangeRequest()) return;
     String key = web.arg("key");
     String val = web.hasArg("value") ? web.arg("value") : String("");
     if (key.length() == 0) {
@@ -1024,6 +1076,8 @@ static void httpSet() {
 }
 
 void webui_begin() {
+    const char* headerKeys[] = {STATE_CHANGE_HEADER};
+    web.collectHeaders(headerKeys, 1);
     web.on("/", httpIndex);
     web.on("/streamer", httpStreamer);
     web.on("/api/web_audio", httpWebAudio);
@@ -1040,13 +1094,23 @@ void webui_begin() {
     web.on("/api/thermal", httpThermal);
     web.on("/api/thermal/clear", HTTP_POST, httpThermalClear);
     web.on("/api/logs", httpLogs);
-    web.on("/api/action/server_start", httpActionServerStart);
-    web.on("/api/action/server_stop", httpActionServerStop);
-    web.on("/api/action/reset_i2s", httpActionResetI2S);
-    web.on("/api/action", httpActionNamed);
-    web.on("/api/action/reboot", [](){ webui_pushLog(F("UI action: reboot")); apiSendJSON(F("{\"ok\":true}")); scheduleReboot(false, 600); });
-    web.on("/api/action/factory_reset", [](){ webui_pushLog(F("UI action: factory_reset")); apiSendJSON(F("{\"ok\":true}")); scheduleReboot(true, 600); });
-    web.on("/api/set", httpSet);
+    web.on("/api/action/server_start", HTTP_POST, httpActionServerStart);
+    web.on("/api/action/server_stop", HTTP_POST, httpActionServerStop);
+    web.on("/api/action/reset_i2s", HTTP_POST, httpActionResetI2S);
+    web.on("/api/action", HTTP_POST, httpActionNamed);
+    web.on("/api/action/reboot", HTTP_POST, [](){
+        if (!requireTrustedStateChangeRequest()) return;
+        webui_pushLog(F("UI action: reboot"));
+        apiSendJSON(F("{\"ok\":true}"));
+        scheduleReboot(false, 600);
+    });
+    web.on("/api/action/factory_reset", HTTP_POST, [](){
+        if (!requireTrustedStateChangeRequest()) return;
+        webui_pushLog(F("UI action: factory_reset"));
+        apiSendJSON(F("{\"ok\":true}"));
+        scheduleReboot(true, 600);
+    });
+    web.on("/api/set", HTTP_POST, httpSet);
     web.begin();
 }
 

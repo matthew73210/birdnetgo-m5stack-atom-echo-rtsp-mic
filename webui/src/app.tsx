@@ -248,21 +248,44 @@ async function getJson<T>(url: string): Promise<T> {
 }
 
 async function postJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { method: "POST", cache: "no-store" });
+  const response = await fetch(url, {
+    method: "POST",
+    cache: "no-store",
+    headers: {
+      "X-Requested-With": "birdnetgo-webui"
+    }
+  });
+  const body = await response.text();
+  if (!response.ok) throw new Error(body || `${response.status} ${response.statusText}`);
+  return (body ? JSON.parse(body) : {}) as T;
+}
+
+async function postForm<T>(url: string, data: Record<string, string>): Promise<T> {
+  const bodyData = new URLSearchParams();
+  for (const [key, value] of Object.entries(data)) {
+    bodyData.set(key, value);
+  }
+  const response = await fetch(url, {
+    method: "POST",
+    cache: "no-store",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+      "X-Requested-With": "birdnetgo-webui"
+    },
+    body: bodyData.toString()
+  });
   const body = await response.text();
   if (!response.ok) throw new Error(body || `${response.status} ${response.statusText}`);
   return (body ? JSON.parse(body) : {}) as T;
 }
 
 async function action(name: string) {
-  const result = await getJson<{ ok: boolean; error?: string }>(`/api/action/${encodeURIComponent(name)}`);
+  const result = await postJson<{ ok: boolean; error?: string }>(`/api/action/${encodeURIComponent(name)}`);
   if (!result.ok) throw new Error(result.error || "Action was rejected");
 }
 
 async function setValue(key: string, value: string) {
-  const result = await getJson<{ ok: boolean; error?: string }>(
-    `/api/set?key=${encodeURIComponent(key)}&value=${encodeURIComponent(value)}`
-  );
+  const result = await postForm<{ ok: boolean; error?: string }>("/api/set", { key, value });
   if (!result.ok) throw new Error(result.error || "Setting was rejected");
 }
 

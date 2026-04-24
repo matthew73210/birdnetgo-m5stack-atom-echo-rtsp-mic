@@ -135,6 +135,7 @@ static void updateStreamingStateFromSessions();
 static uint8_t countRtspClients();
 static uint8_t countStreamingRtspClients();
 static RtspSession* firstStreamingSession();
+static void clearAudioDiagnostics();
 static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSamples);
 static void sendRTPPacketsToActiveSessions(int16_t* audioData, int numSamples);
 // Note: Audio buffers now allocated by Core 1 task
@@ -183,6 +184,8 @@ volatile int16_t i2sLastRawMax = 0;
 volatile uint16_t i2sLastRawPeakAbs = 0;
 volatile uint16_t i2sLastRawRms = 0;
 volatile uint16_t i2sLastRawZeroPct = 0;
+volatile int16_t i2sLastRawMean = 0;
+volatile uint16_t i2sLastRawSpan = 0;
 volatile bool i2sLikelyUnsignedPcm = false;
 volatile bool i2sDriverOk = false;
 volatile int32_t i2sLastError = ESP_OK;
@@ -245,11 +248,12 @@ const float NOISE_ENV_ATTACK = 0.010f;
 const float NOISE_ENV_RELEASE = 0.0012f;
 const uint16_t NOISE_GATE_HOLD_MS = 120;
 const uint16_t PDM_UNSIGNED_MAX_CODE = 4095;
-const float PDM_UNSIGNED_CENTER = ((float)PDM_UNSIGNED_MAX_CODE) * 0.5f;
-const float PDM_UNSIGNED_CENTER_TOLERANCE = 384.0f;
-const uint16_t PDM_UNSIGNED_MIN_SPAN = 128;
-const int16_t PDM_UNSIGNED_EDGE_MARGIN = 32;
-const float PDM_UNSIGNED_NORMALIZE_GAIN = 32767.0f / ((((float)PDM_UNSIGNED_MAX_CODE) + 1.0f) * 0.5f);
+const uint16_t PDM_UNSIGNED_MIN_SPAN = 24;
+const int16_t PDM_UNSIGNED_EDGE_MARGIN = 16;
+const float PDM_UNSIGNED_MIN_MEAN = 256.0f;
+const float PDM_UNSIGNED_MIN_MEAN_TO_SPAN = 4.0f;
+const float PDM_UNSIGNED_MIN_HALFSCALE = 512.0f;
+const float PDM_UNSIGNED_MAX_HALFSCALE = 2048.0f;
 const float PDM_UNSIGNED_DC_TRACK_SECONDS = 1.25f;
 const uint8_t PDM_UNSIGNED_CONFIDENCE_MAX = 12;
 const uint8_t PDM_UNSIGNED_CONFIDENCE_ON = 6;
@@ -588,6 +592,22 @@ static void publishWebAudioFrame(const int16_t* samples, uint16_t count) {
     webAudioRingSeq[webAudioSlot] = nextWebAudioSeq;
     webAudioFrameSeq = nextWebAudioSeq;
     portEXIT_CRITICAL(&webAudioMux);
+}
+
+static void clearAudioDiagnostics() {
+    portENTER_CRITICAL(&webAudioMux);
+    webAudioFrameSeq = 0;
+    memset((void*)webAudioFrameSamples, 0, sizeof(webAudioFrameSamples));
+    memset((void*)webAudioSampleRate, 0, sizeof(webAudioSampleRate));
+    memset((void*)webAudioRingSeq, 0, sizeof(webAudioRingSeq));
+    memset(webAudioFrame, 0, sizeof(webAudioFrame));
+    portEXIT_CRITICAL(&webAudioMux);
+
+    memset((void*)fftBins, 0, sizeof(fftBins));
+    fftFrameSeq = 0;
+    lastPeakAbs16 = 0;
+    peakHoldAbs16 = 0;
+    peakHoldUntilMs = 0;
 }
 
 void recordTelemetrySample(float cpuLoadPct, float tempC, bool tempValid) {
@@ -1572,9 +1592,9 @@ void audioCaptureTask(void* parameter) {
                                   rawMin >= 0 &&
                                   rawMax <= (int16_t)PDM_UNSIGNED_MAX_CODE &&
                                   rawSpan >= (int32_t)PDM_UNSIGNED_MIN_SPAN &&
-                                  fabsf(rawMean - PDM_UNSIGNED_CENTER) <= PDM_UNSIGNED_CENTER_TOLERANCE &&
-                                  rawMin <= (int16_t)(PDM_UNSIGNED_CENTER - (float)PDM_UNSIGNED_EDGE_MARGIN) &&
-                                  rawMax >= (int16_t)(PDM_UNSIGNED_CENTER + (float)PDM_UNSIGNED_EDGE_MARGIN));
+                                  rawMin >= PDM_UNSIGNED_EDGE_MARGIN &&
+                                  rawMean >= PDM_UNSIGNED_MIN_MEAN &&
+                                  rawMean >= ((float)rawSpan * PDM_UNSIGNED_MIN_MEAN_TO_SPAN));
         if (unsignedCandidate) {
             if (localUnsignedPdmConfidence < PDM_UNSIGNED_CONFIDENCE_MAX) {
                 localUnsignedPdmConfidence++;
@@ -1612,8 +1632,12 @@ void audioCaptureTask(void* parameter) {
 
             float sample;
             if (localUnsignedPdm) {
+                float unsignedHalfScale = localPdmDc;
+                if (unsignedHalfScale < PDM_UNSIGNED_MIN_HALFSCALE) unsignedHalfScale = PDM_UNSIGNED_MIN_HALFSCALE;
+                if (unsignedHalfScale > PDM_UNSIGNED_MAX_HALFSCALE) unsignedHalfScale = PDM_UNSIGNED_MAX_HALFSCALE;
+                float unsignedNormalizeGain = 32767.0f / unsignedHalfScale;
                 localPdmDc += ((float)raw - localPdmDc) * pdmDcAlpha;
-                sample = ((float)raw - localPdmDc) * PDM_UNSIGNED_NORMALIZE_GAIN;
+                sample = ((float)raw - localPdmDc) * unsignedNormalizeGain;
             } else {
                 sample = (float)(raw >> i2sShiftBits);
             }
@@ -1710,6 +1734,10 @@ void audioCaptureTask(void* parameter) {
         i2sLastRawMin = rawMin;
         i2sLastRawMax = rawMax;
         i2sLastRawPeakAbs = rawPeakAbs;
+        i2sLastRawSpan = (rawSpan > 0) ? (uint16_t)rawSpan : 0;
+        if (rawMean > 32767.0f) rawMean = 32767.0f;
+        if (rawMean < -32768.0f) rawMean = -32768.0f;
+        i2sLastRawMean = (int16_t)rawMean;
         if (samplesRead > 0) {
             float rawRms = sqrtf(rawSumSquares / (float)samplesRead);
             if (rawRms > 65535.0f) rawRms = 65535.0f;
@@ -1876,6 +1904,7 @@ void stopAudioCaptureTask() {
             }
         }
         updateStreamingStateFromSessions();
+        clearAudioDiagnostics();
     }
 }
 
@@ -2317,6 +2346,14 @@ void handleRTSPCommand(RtspSession &session, String request) {
         simplePrintln("RTSP SETUP using TCP interleaved transport for " + session.remoteAddr);
 
     } else if (request.startsWith("PLAY")) {
+        if (!session.setupDone) {
+            client.print("RTSP/1.0 455 Method Not Valid in This State\r\n");
+            client.print("CSeq: " + cseq + "\r\n");
+            client.print("Connection: keep-alive\r\n\r\n");
+            simplePrintln("PLAY rejected: SETUP required before PLAY for " + session.remoteAddr);
+            return;
+        }
+
         if (!i2sDriverOk) {
             client.print("RTSP/1.0 503 Service Unavailable\r\n");
             client.print("CSeq: " + cseq + "\r\n");
@@ -2416,6 +2453,12 @@ void processRTSP(RtspSession &session) {
         char* endOfHeader = strstr((char*)session.parseBuffer, "\r\n\r\n");
         if (endOfHeader != nullptr) {
             int headerLen = (endOfHeader - (char*)session.parseBuffer) + 4;
+            uint16_t bodyBytes = parseRtspContentLengthValue((char*)session.parseBuffer);
+            int totalMessageLen = headerLen + (int)bodyBytes;
+            if (session.parseBufferPos < totalMessageLen) {
+                return;
+            }
+
             *endOfHeader = '\0';
             String request = String((char*)session.parseBuffer);
 
@@ -2424,11 +2467,12 @@ void processRTSP(RtspSession &session) {
                 return;
             }
 
-            int remaining = session.parseBufferPos - headerLen;
+            int remaining = session.parseBufferPos - totalMessageLen;
             if (remaining > 0) {
-                memmove(session.parseBuffer, session.parseBuffer + headerLen, remaining);
+                memmove(session.parseBuffer, session.parseBuffer + totalMessageLen, remaining);
             }
             session.parseBufferPos = max(0, remaining);
+            session.parseBuffer[session.parseBufferPos] = '\0';
         }
     }
 }
@@ -2584,9 +2628,6 @@ void setup() {
         Serial.println("Updating highpass coefficients...");
         updateHighpassCoeffs();
         Serial.println("Highpass coefficients updated");
-        // Start Core 1 audio pipeline now so raw I2S diagnostics are available even before PLAY.
-        startAudioCaptureTask();
-        Serial.println("Dual-core audio ready (Core 1 pipeline running for always-on diagnostics)");
     } else {
         Serial.printf("I2S driver setup failed, audio pipeline not started (err=%ld)\n", (long)i2sLastError);
     }
@@ -2598,6 +2639,10 @@ void setup() {
     } else {
         rtspServerEnabled = false;
         rtspServer.stop();
+    }
+    if (i2sDriverOk && rtspServerEnabled) {
+        startAudioCaptureTask();
+        Serial.println("Dual-core audio ready (Core 1 pipeline running for live diagnostics)");
     }
     // Web UI
     webui_begin();
@@ -2753,6 +2798,8 @@ void loop() {
         // RTSP server disabled (overheat lockout)
         if (isStreaming) {
             requestStreamStop("server disabled");
+        }
+        if (audioTaskRunning) {
             stopAudioCaptureTask();
         }
         for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
