@@ -4,14 +4,13 @@
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <esp_err.h>
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wcpp"
-#include "driver/i2s.h"
-#pragma GCC diagnostic pop
+#include "driver/i2s_common.h"
+#include "driver/i2s_pdm.h"
 #include <Preferences.h>
 #include <math.h>
 #include <time.h>
 #include <FastLED.h>
+#include "PdmProbeResult.h"
 #include "WebUI.h"
 
 // ================== DUAL-CORE AUDIO ARCHITECTURE ==================
@@ -63,7 +62,7 @@ SemaphoreHandle_t taskExitSemaphore = NULL;  // confirmed task exit
 volatile bool core1OwnsLED = false;          // LED ownership flag
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "3.0.0"
+#define FW_VERSION "4.0.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 static const uint16_t OTA_PORT = 3232;
@@ -79,9 +78,9 @@ static const char LOG_TIMEZONE_LABEL[] = "UTC";
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
 #define DEFAULT_NETWORK_HOSTNAME "atoms3mic"
 static const uint32_t SUPPORTED_PDM_SAMPLE_RATES[] = {16000, 24000, 32000, 48000};
-// High-pass filter defaults. Keep it off for the cleanest baseline; enable only
-// when outdoor rumble/wind is worse than the added thinness.
-#define DEFAULT_HPF_ENABLED false
+// High-pass filter defaults. V4's settled PDM feed carries low-frequency/DC
+// wander, so keep HPF on and let AGC/noise suppression stay opt-in.
+#define DEFAULT_HPF_ENABLED true
 #define DEFAULT_HPF_CUTOFF_HZ 180
 
 // Thermal protection defaults
@@ -138,6 +137,7 @@ static RtspSession* firstStreamingSession();
 static void clearAudioDiagnostics();
 static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSamples);
 static void sendRTPPacketsToActiveSessions(int16_t* audioData, int numSamples);
+static esp_err_t i2sMicRead(void* dest, size_t size, size_t* bytesRead, uint32_t timeoutMs);
 // Note: Audio buffers now allocated by Core 1 task
 
 // -- Global state
@@ -187,8 +187,13 @@ volatile uint16_t i2sLastRawZeroPct = 0;
 volatile int16_t i2sLastRawMean = 0;
 volatile uint16_t i2sLastRawSpan = 0;
 volatile bool i2sLikelyUnsignedPcm = false;
+volatile bool i2sUsingModernPdmDriver = false;
+volatile bool i2sPdmUseLeftSlot = false;
+volatile bool i2sPdmClkInverted = false;
+volatile bool i2sPdmProbeFoundSigned = false;
 volatile bool i2sDriverOk = false;
 volatile int32_t i2sLastError = ESP_OK;
+static i2s_chan_handle_t i2sRxChannel = NULL;
 volatile uint32_t audioFallbackBlockCount = 0;
 volatile uint32_t i2sLastGapMs = 0;
 volatile float audioPipelineLoadPct = 0.0f;
@@ -259,6 +264,8 @@ const float PDM_UNSIGNED_DC_TRACK_SECONDS = 1.25f;
 const uint8_t PDM_UNSIGNED_CONFIDENCE_MAX = 12;
 const uint8_t PDM_UNSIGNED_CONFIDENCE_ON = 6;
 const uint8_t PDM_UNSIGNED_CONFIDENCE_OFF = 2;
+const uint16_t PDM_PROBE_SETTLE_MS = 650;
+const uint8_t PDM_PROBE_MEASURE_READS = 5;
 const char* DEVICE_TITLE = "M5 Atom RTSP Microphone";
 const char* DEVICE_INPUT_PROFILE = "PDM input profile (AtomS3 Lite + Unit Mini PDM tuned)";
 const char* FILTER_CHAIN_BASE = "PDM PCM -> stable DC normalize when needed -> 2nd-order Butterworth high-pass -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC";
@@ -1456,8 +1463,8 @@ void audioCaptureTask(void* parameter) {
     bool localPdmDcInitialized = false;
     uint8_t localUnsignedPdmConfidence = 0;
     float localPdmDc = 0.0f;
-    const TickType_t readTimeoutTicks = pdMS_TO_TICKS(max(20UL, min(200UL,
-        ((unsigned long)readBufferSamples * 1000UL) / max((uint32_t)1, currentSampleRate) + 10UL)));
+    const uint32_t readTimeoutMs = max(20UL, min(200UL,
+        ((unsigned long)readBufferSamples * 1000UL) / max((uint32_t)1, currentSampleRate) + 10UL));
 
     while (audioTaskRunning) {
         // Check if Core 0 requested us to stop streaming
@@ -1490,9 +1497,9 @@ void audioCaptureTask(void* parameter) {
         }
 
         // Read from I2S with a cadence-aware timeout so concealment can kick in
-        esp_err_t result = i2s_read(I2S_NUM_0, captureBuffer,
-                                    readBufferSamples * sizeof(int16_t),
-                                    &bytesRead, readTimeoutTicks);
+        esp_err_t result = i2sMicRead(captureBuffer,
+                                      readBufferSamples * sizeof(int16_t),
+                                      &bytesRead, readTimeoutMs);
         unsigned long processStartUs = micros();
 
         if (result != ESP_OK || bytesRead == 0) {
@@ -1959,79 +1966,267 @@ bool requestStreamStop(const char* reason) {
     }
 }
 
-// I2S setup for AtomS3 Lite + Unit Mini PDM (PDM microphone mode)
+static esp_err_t i2sMicRead(void* dest, size_t size, size_t* bytesRead, uint32_t timeoutMs) {
+    if (!i2sRxChannel) {
+        if (bytesRead) *bytesRead = 0;
+        return ESP_ERR_INVALID_STATE;
+    }
+    return i2s_channel_read(i2sRxChannel, dest, size, bytesRead, timeoutMs);
+}
+
+// I2S setup for AtomS3 Lite + Unit Mini PDM using the ESP-IDF 5 PDM RX channel driver.
+static void shutdownModernI2sDriver() {
+    if (!i2sRxChannel) {
+        return;
+    }
+
+    esp_err_t err = i2s_channel_disable(i2sRxChannel);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        simplePrintln("WARNING: I2S channel disable returned " + String(esp_err_to_name(err)));
+    }
+
+    err = i2s_del_channel(i2sRxChannel);
+    if (err != ESP_OK) {
+        simplePrintln("WARNING: I2S channel delete returned " + String(esp_err_to_name(err)));
+    }
+    i2sRxChannel = NULL;
+}
+
+static i2s_pdm_slot_mask_t pdmLine0SlotMask(bool useLeftSlot) {
+#if SOC_I2S_PDM_MAX_RX_LINES > 1
+    return useLeftSlot ? I2S_PDM_RX_LINE0_SLOT_LEFT : I2S_PDM_RX_LINE0_SLOT_RIGHT;
+#else
+    return useLeftSlot ? I2S_PDM_SLOT_LEFT : I2S_PDM_SLOT_RIGHT;
+#endif
+}
+
+static bool setupModernPdmDriverCandidate(uint16_t dmaBufLen, uint8_t dmaBufCount,
+                                          bool useLeftSlot, bool clkInvert,
+                                          bool verboseLogs) {
+    shutdownModernI2sDriver();
+
+    i2s_chan_config_t chanConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chanConfig.dma_desc_num = dmaBufCount;
+    chanConfig.dma_frame_num = dmaBufLen;
+
+    esp_err_t err = i2s_new_channel(&chanConfig, NULL, &i2sRxChannel);
+    if (err != ESP_OK) {
+        i2sLastError = err;
+        if (verboseLogs) {
+            simplePrintln("ERROR: I2S new_channel failed: " + String(esp_err_to_name(err)));
+        }
+        i2sRxChannel = NULL;
+        return false;
+    }
+
+    i2s_pdm_rx_config_t pdmConfig = {
+        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(currentSampleRate),
+        .slot_cfg = I2S_PDM_RX_SLOT_PCM_FMT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {}
+    };
+    pdmConfig.slot_cfg.slot_mask = pdmLine0SlotMask(useLeftSlot);
+#if SOC_I2S_SUPPORTS_PDM_RX_HP_FILTER
+    // Keep the driver capture path honest; firmware DSP owns DC removal / HPF.
+    pdmConfig.slot_cfg.hp_en = false;
+    pdmConfig.slot_cfg.hp_cut_off_freq_hz = 35.5f;
+    pdmConfig.slot_cfg.amplify_num = 1;
+#endif
+    pdmConfig.gpio_cfg.clk = (gpio_num_t)I2S_CLK_PIN;
+#if SOC_I2S_PDM_MAX_RX_LINES > 1
+    for (uint8_t i = 0; i < SOC_I2S_PDM_MAX_RX_LINES; ++i) {
+        pdmConfig.gpio_cfg.dins[i] = I2S_GPIO_UNUSED;
+    }
+    pdmConfig.gpio_cfg.dins[0] = (gpio_num_t)I2S_DATA_IN_PIN;
+#else
+    pdmConfig.gpio_cfg.din = (gpio_num_t)I2S_DATA_IN_PIN;
+#endif
+    pdmConfig.gpio_cfg.invert_flags.clk_inv = clkInvert ? 1 : 0;
+
+    err = i2s_channel_init_pdm_rx_mode(i2sRxChannel, &pdmConfig);
+    if (err != ESP_OK) {
+        i2sLastError = err;
+        if (verboseLogs) {
+            simplePrintln("ERROR: I2S PDM RX init failed: " + String(esp_err_to_name(err)));
+        }
+        shutdownModernI2sDriver();
+        return false;
+    }
+
+    err = i2s_channel_enable(i2sRxChannel);
+    if (err != ESP_OK) {
+        i2sLastError = err;
+        if (verboseLogs) {
+            simplePrintln("ERROR: I2S channel enable failed: " + String(esp_err_to_name(err)));
+        }
+        shutdownModernI2sDriver();
+        return false;
+    }
+
+    i2sLastError = ESP_OK;
+    return true;
+}
+
+static bool isBetterPdmCandidate(const PdmProbeResult& candidate, const PdmProbeResult& best) {
+    if (!candidate.valid) return false;
+    if (!best.valid) return true;
+    if (candidate.spansZero != best.spansZero) return candidate.spansZero;
+
+    float candidateDcRatio = fabsf((float)candidate.rawMean) / max(1.0f, (float)candidate.rawSpan);
+    float bestDcRatio = fabsf((float)best.rawMean) / max(1.0f, (float)best.rawSpan);
+    if (fabsf(candidateDcRatio - bestDcRatio) > 0.20f) return candidateDcRatio < bestDcRatio;
+    if (candidate.rawSpan != best.rawSpan) return candidate.rawSpan > best.rawSpan;
+    if (candidate.rawPeakAbs != best.rawPeakAbs) return candidate.rawPeakAbs > best.rawPeakAbs;
+    if (candidate.useLeftSlot != best.useLeftSlot) return candidate.useLeftSlot;
+    if (candidate.clkInvert != best.clkInvert) return !candidate.clkInvert;
+    return false;
+}
+
+static PdmProbeResult probeModernPdmCandidate(uint16_t dmaBufLen, uint8_t dmaBufCount,
+                                              bool useLeftSlot, bool clkInvert,
+                                              int16_t* probeBuffer, uint16_t probeSamples) {
+    PdmProbeResult result;
+    result.useLeftSlot = useLeftSlot;
+    result.clkInvert = clkInvert;
+
+    if (!probeBuffer || probeSamples == 0) {
+        return result;
+    }
+    if (!setupModernPdmDriverCandidate(dmaBufLen, dmaBufCount, useLeftSlot, clkInvert, false)) {
+        simplePrintln("Modern PDM probe " + String(useLeftSlot ? "left" : "right") +
+                      (clkInvert ? " / clk inverted" : " / normal clock") +
+                      " setup failed: " + String(esp_err_to_name((esp_err_t)i2sLastError)));
+        return result;
+    }
+
+    size_t bytesRead = 0;
+    unsigned long settleUntil = millis() + PDM_PROBE_SETTLE_MS;
+    do {
+        (void)i2sMicRead(probeBuffer, probeSamples * sizeof(int16_t), &bytesRead, 80);
+    } while (millis() < settleUntil);
+
+    int16_t rawMin = 32767;
+    int16_t rawMax = -32768;
+    uint32_t rawPeak = 0;
+    int64_t rawSum = 0;
+    uint32_t totalSamples = 0;
+
+    for (uint8_t pass = 0; pass < PDM_PROBE_MEASURE_READS; ++pass) {
+        esp_err_t err = i2sMicRead(probeBuffer, probeSamples * sizeof(int16_t), &bytesRead, 80);
+        if (err != ESP_OK || bytesRead == 0) {
+            continue;
+        }
+
+        uint16_t samples = (uint16_t)(bytesRead / sizeof(int16_t));
+        for (uint16_t i = 0; i < samples; ++i) {
+            int16_t raw = probeBuffer[i];
+            if (raw < rawMin) rawMin = raw;
+            if (raw > rawMax) rawMax = raw;
+            uint32_t absRaw = (uint32_t)abs((int)raw);
+            if (absRaw > rawPeak) rawPeak = absRaw;
+            rawSum += raw;
+        }
+        totalSamples += samples;
+    }
+
+    if (totalSamples == 0) {
+        simplePrintln("Modern PDM probe " + String(useLeftSlot ? "left" : "right") +
+                      (clkInvert ? " / clk inverted" : " / normal clock") +
+                      " yielded no audio blocks");
+        return result;
+    }
+
+    result.valid = true;
+    result.rawMin = rawMin;
+    result.rawMax = rawMax;
+    result.rawPeakAbs = (uint16_t)min<uint32_t>(rawPeak, 32767U);
+    result.rawMean = (int16_t)lroundf((float)rawSum / (float)totalSamples);
+    result.rawSpan = (rawMax >= rawMin) ? (uint16_t)((int32_t)rawMax - (int32_t)rawMin) : 0;
+    result.spansZero = (rawMin < -32 && rawMax > 32);
+    simplePrintln("Modern PDM probe " + String(useLeftSlot ? "left" : "right") +
+                  (clkInvert ? " / clk inverted" : " / normal clock") +
+                  ": mean " + String((int32_t)result.rawMean) +
+                  ", span " + String((uint32_t)result.rawSpan) +
+                  ", peak " + String((uint32_t)result.rawPeakAbs) +
+                  (result.spansZero ? ", signed" : ", offset"));
+    return result;
+}
+
+static bool setupModernPdmDriver(uint16_t dmaBufLen, uint8_t dmaBufCount) {
+    uint16_t probeSamples = computeI2sReadBufferSamples();
+    if (probeSamples < 64) {
+        probeSamples = 64;
+    }
+
+    int16_t* probeBuffer = (int16_t*)malloc(probeSamples * sizeof(int16_t));
+    if (!probeBuffer) {
+        simplePrintln("Modern PDM probe could not allocate scratch buffer; using right-slot normal-clock fallback");
+        if (!setupModernPdmDriverCandidate(dmaBufLen, dmaBufCount, false, false, true)) {
+            return false;
+        }
+        i2sPdmUseLeftSlot = false;
+        i2sPdmClkInverted = false;
+        i2sPdmProbeFoundSigned = false;
+    } else {
+        PdmProbeResult best;
+        const bool slotOptions[] = {true, false};
+        const bool clockOptions[] = {false, true};
+        for (uint8_t slot = 0; slot < 2; ++slot) {
+            for (uint8_t clock = 0; clock < 2; ++clock) {
+                PdmProbeResult probe = probeModernPdmCandidate(dmaBufLen, dmaBufCount,
+                                                               slotOptions[slot],
+                                                               clockOptions[clock],
+                                                               probeBuffer,
+                                                               probeSamples);
+                if (isBetterPdmCandidate(probe, best)) {
+                    best = probe;
+                }
+            }
+        }
+        free(probeBuffer);
+
+        bool useLeftSlot = best.valid ? best.useLeftSlot : false;
+        bool clkInvert = best.valid ? best.clkInvert : false;
+        if (!best.valid) {
+            simplePrintln("Modern PDM probe did not find a clear candidate; using right-slot normal-clock fallback");
+        }
+        if (!setupModernPdmDriverCandidate(dmaBufLen, dmaBufCount, useLeftSlot, clkInvert, true)) {
+            return false;
+        }
+        i2sPdmUseLeftSlot = useLeftSlot;
+        i2sPdmClkInverted = clkInvert;
+        i2sPdmProbeFoundSigned = best.valid && best.spansZero;
+    }
+
+    i2sUsingModernPdmDriver = true;
+    i2sDriverOk = true;
+    i2sLastError = ESP_OK;
+    simplePrintln("I2S ready (modern ESP-IDF PDM RX): " + String(currentSampleRate) + "Hz, gain " +
+                  String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
+                  " (chunk " + String(effectiveAudioChunkSize()) + ")" +
+                  ", dma " + String(dmaBufCount) + "x" + String(dmaBufLen) +
+                  ", read " + String(computeI2sReadBufferSamples()) +
+                  ", slot " + String(i2sPdmUseLeftSlot ? "left" : "right") +
+                  (i2sPdmClkInverted ? ", clk inverted" : ", normal clock") +
+                  ", driver HPF off" +
+                  (i2sPdmProbeFoundSigned ? ", signed PCM" : ", unsigned fallback armed") +
+                  ", shiftBits " + String(i2sShiftBits));
+    return true;
+}
+
 void setup_i2s_driver() {
     i2sDriverOk = false;
     i2sLastError = ESP_OK;
-
-    esp_err_t err = i2s_driver_uninstall(I2S_NUM_0);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        simplePrintln("WARNING: I2S uninstall returned " + String(esp_err_to_name(err)));
-    }
+    i2sLikelyUnsignedPcm = false;
+    i2sUsingModernPdmDriver = false;
+    i2sPdmUseLeftSlot = false;
+    i2sPdmClkInverted = false;
+    i2sPdmProbeFoundSigned = false;
 
     const uint16_t dma_buf_len = computeI2sDmaBufferLen();
     const uint8_t dma_buf_count = computeI2sDmaBufferCount();
+    shutdownModernI2sDriver();
 
-    i2s_config_t i2s_config = {
-        // PDM mode for Unit Mini PDM microphone
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
-        .sample_rate = currentSampleRate,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,  // Match original demo exactly
-        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,   // Match M5 reference PDM example
-#if ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 1, 0)
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-#else
-        .communication_format = I2S_COMM_FORMAT_I2S,
-#endif
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = dma_buf_count,
-        .dma_buf_len = dma_buf_len,
-        .use_apll = false,
-        .tx_desc_auto_clear = false,
-        .fixed_mclk = 0
-    };
-
-    i2s_pin_config_t pin_config = {
-#if (ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 3, 0))
-        .mck_io_num = I2S_PIN_NO_CHANGE,
-#endif
-        .bck_io_num = I2S_PIN_NO_CHANGE,
-        .ws_io_num = I2S_CLK_PIN,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = I2S_DATA_IN_PIN
-    };
-
-    err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-    if (err != ESP_OK) {
-        i2sLastError = err;
-        simplePrintln("ERROR: I2S driver_install failed: " + String(esp_err_to_name(err)));
-        return;
-    }
-
-    err = i2s_set_pin(I2S_NUM_0, &pin_config);
-    if (err != ESP_OK) {
-        i2sLastError = err;
-        simplePrintln("ERROR: I2S set_pin failed: " + String(esp_err_to_name(err)));
-        i2s_driver_uninstall(I2S_NUM_0);
-        return;
-    }
-
-    err = i2s_set_clk(I2S_NUM_0, currentSampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
-    if (err != ESP_OK) {
-        i2sLastError = err;
-        simplePrintln("ERROR: I2S set_clk failed: " + String(esp_err_to_name(err)));
-        i2s_driver_uninstall(I2S_NUM_0);
-        return;
-    }
-
-    i2sDriverOk = true;
-    i2sLastError = ESP_OK;
-    simplePrintln("I2S ready (PDM mode): " + String(currentSampleRate) + "Hz, gain " +
-                  String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
-                  " (chunk " + String(effectiveAudioChunkSize()) + ")" +
-                  ", dma " + String(dma_buf_count) + "x" + String(dma_buf_len) +
-                  ", read " + String(computeI2sReadBufferSamples()) +
-                  ", shiftBits " + String(i2sShiftBits));
+    (void)setupModernPdmDriver(dma_buf_len, dma_buf_count);
 }
 
 static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len, unsigned long timeoutMs) {
