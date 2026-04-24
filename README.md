@@ -52,7 +52,7 @@ This is not a drop-in Atom Echo binary. Atom Echo / Atom Voice has its own onboa
 - Arduino OTA updates after the first USB flash.
 - Dual-core audio design: Core 1 owns capture, processing, RTP writes, and streaming sockets; Core 0 handles Web UI, RTSP negotiation, and diagnostics.
 - Web UI for levels, Wi-Fi, RTSP clients, audio settings, logs, CPU/temperature history, FFT waterfall, and thermal protection.
-- Browser preview endpoints for PCM, WAV chunks, and JSON PCM diagnostics.
+- Browser preview endpoints for HTTP L16, AIFF, PCM, WAV chunks, and JSON PCM diagnostics.
 - Persistent settings in ESP32 Preferences namespace `audioPrefs`.
 - Thermal protection with latch/acknowledge flow.
 - LED modes: off, static, or audio level.
@@ -138,7 +138,7 @@ Use `atoms3-lite-pdm-rtsp-mic-factory.bin` for first-time browser flashing. It i
 | Hostname | `atoms3mic` | mDNS URL is `atoms3mic.local` |
 | RTSP URL | `rtsp://atoms3mic.local:8554/audio` | L16 mono PCM over RTP |
 | RTSP transport | TCP interleaved | UDP is disabled by default |
-| Sample rate | 48000 Hz | Configurable from 8000 to 96000 Hz |
+| Sample rate | 48000 Hz | Supported PDM rates: 16000, 24000, 32000, 48000 Hz |
 | Gain | 1.0x | Start conservative, raise only after checking the meter |
 | Buffer | 1024 samples | RTP chunking is capped internally at 1024 samples |
 | High-pass filter | Off | 180 Hz cutoff when enabled |
@@ -177,6 +177,8 @@ Useful URLs:
 | `/api/audio_status` | Audio settings, live meter, raw PDM link diagnostics |
 | `/api/stream_options` | RTSP and browser preview format list |
 | `/api/web_audio_pcm` | Binary PCM frames from diagnostics ring |
+| `/api/web_audio_l16` | HTTP L16 mono PCM chunk |
+| `/api/web_audio_aiff` | AIFF PCM chunk |
 | `/api/web_audio_wav` | WAV PCM chunk |
 | `/api/web_audio` | JSON PCM frame data |
 | `/api/fft` | 32-bin lightweight spectrum data |

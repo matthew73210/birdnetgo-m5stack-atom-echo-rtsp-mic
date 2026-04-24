@@ -6,6 +6,8 @@
 - RTSP now uses a bounded session table. Core 0 negotiates pending clients, then Core 1 owns every active streaming socket after `PLAY`.
 - The device already exposes multiple audio access shapes:
   - RTSP/RTP L16 mono PCM at `rtsp://<device>:8554/audio`
+  - HTTP L16 mono PCM chunks at `/api/web_audio_l16`
+  - AIFF PCM chunks at `/api/web_audio_aiff`
   - Browser WebAudio PCM frames at `/api/web_audio_pcm`
   - Bounded WAV PCM chunks at `/api/web_audio_wav`
   - JSON PCM diagnostics frames at `/api/web_audio`
@@ -77,6 +79,8 @@ Build flow:
 - Added bounded two-client RTSP TCP interleaved streaming with per-session RTP state.
 - Added a Streams & Clients panel/API fields to report connected and active RTSP clients.
 - Added `/api/stream_options` so clients can discover supported formats and current RTSP policy.
+- Added `/api/web_audio_l16` for standard big-endian HTTP L16 chunks from the diagnostics ring buffer.
+- Added `/api/web_audio_aiff` for AIFF PCM chunks from the diagnostics ring buffer.
 - Added `/api/web_audio_wav` for short WAV PCM chunks from the diagnostics ring buffer.
 - Fixed the read-only I2S Shift markup so it renders as valid HTML.
 - Closed the Status card correctly so the UI no longer nests major cards inside it.

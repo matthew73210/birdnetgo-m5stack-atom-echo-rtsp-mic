@@ -26,6 +26,7 @@ extern float maxTemperature;
 extern bool rtspServerEnabled;
 extern unsigned long audioPacketsSent;
 extern unsigned long audioPacketsDropped;
+extern unsigned long audioBlocksSent;
 extern uint32_t rtspRejectedClientCount;
 extern uint32_t currentSampleRate;
 extern bool isSupportedPdmSampleRate(uint32_t rate);
@@ -81,6 +82,8 @@ extern volatile int32_t i2sLastError;
 extern volatile uint32_t audioFallbackBlockCount;
 extern volatile uint32_t i2sLastGapMs;
 extern volatile float audioPipelineLoadPct;
+extern volatile bool audioTaskRunning;
+extern void startAudioCaptureTask();
 extern volatile uint8_t fftBins[32];
 extern volatile uint32_t fftFrameSeq;
 extern portMUX_TYPE webAudioMux;
@@ -519,6 +522,17 @@ static void httpWebAudioPcm() {
     }
 }
 
+static void sendWebAudioPayloadHeaders(const WebAudioSnapshot& snapshot, const String& contentType, size_t payloadBytes, uint32_t sampleRate) {
+    web.sendHeader("Cache-Control", "no-store");
+    web.sendHeader("X-WebAudio-Seq", String(snapshot.seq));
+    web.sendHeader("X-WebAudio-Rate", String(sampleRate));
+    web.sendHeader("X-WebAudio-Samples", String(snapshot.samples));
+    web.sendHeader("X-WebAudio-Frames", String(snapshot.frames));
+    web.sendHeader("X-WebAudio-Dropped", String(snapshot.dropped));
+    web.setContentLength(payloadBytes);
+    web.send(200, contentType, "");
+}
+
 static void putLe16(uint8_t* p, uint16_t v) {
     p[0] = (uint8_t)(v & 0xFF);
     p[1] = (uint8_t)((v >> 8) & 0xFF);
@@ -529,6 +543,77 @@ static void putLe32(uint8_t* p, uint32_t v) {
     p[1] = (uint8_t)((v >> 8) & 0xFF);
     p[2] = (uint8_t)((v >> 16) & 0xFF);
     p[3] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+static void putBe16(uint8_t* p, uint16_t v) {
+    p[0] = (uint8_t)((v >> 8) & 0xFF);
+    p[1] = (uint8_t)(v & 0xFF);
+}
+
+static void putBe32(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)((v >> 24) & 0xFF);
+    p[1] = (uint8_t)((v >> 16) & 0xFF);
+    p[2] = (uint8_t)((v >> 8) & 0xFF);
+    p[3] = (uint8_t)(v & 0xFF);
+}
+
+static void writeBigEndianPcmPayload(const int16_t* samples, uint16_t sampleCount) {
+    if (!samples || sampleCount == 0) return;
+
+    uint8_t chunk[256];
+    uint16_t offset = 0;
+    while (offset < sampleCount) {
+        uint16_t chunkSamples = (uint16_t)min((uint16_t)(sizeof(chunk) / sizeof(int16_t)), (uint16_t)(sampleCount - offset));
+        for (uint16_t i = 0; i < chunkSamples; ++i) {
+            uint16_t value = (uint16_t)samples[offset + i];
+            chunk[i * 2] = (uint8_t)((value >> 8) & 0xFF);
+            chunk[i * 2 + 1] = (uint8_t)(value & 0xFF);
+        }
+        web.client().write(chunk, (size_t)chunkSamples * sizeof(int16_t));
+        offset += chunkSamples;
+    }
+}
+
+static void copyAiffSampleRate80(uint8_t* dest, uint32_t sampleRate) {
+    static const uint8_t sr16000[10] = {0x40, 0x0C, 0xFA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    static const uint8_t sr24000[10] = {0x40, 0x0D, 0xBB, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    static const uint8_t sr32000[10] = {0x40, 0x0D, 0xFA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    static const uint8_t sr48000[10] = {0x40, 0x0E, 0xBB, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+    const uint8_t* encoded = sr16000;
+    switch (sampleRate) {
+        case 24000: encoded = sr24000; break;
+        case 32000: encoded = sr32000; break;
+        case 48000: encoded = sr48000; break;
+        case 16000:
+        default:
+            encoded = sr16000;
+            break;
+    }
+    memcpy(dest, encoded, 10);
+}
+
+static void httpWebAudioL16() {
+    uint32_t since = 0;
+    if (web.hasArg("since")) since = (uint32_t)web.arg("since").toInt();
+
+    WebAudioSnapshot& snapshot = webAudioHttpSnapshot;
+    if (!getWebAudioSnapshot(since, snapshot)) {
+        web.send(204, "text/plain", "");
+        return;
+    }
+
+    const uint32_t sampleRate = snapshot.rate ? snapshot.rate : 16000;
+    const size_t payloadBytes = (size_t)snapshot.samples * sizeof(int16_t);
+    sendWebAudioPayloadHeaders(
+        snapshot,
+        String("audio/L16;rate=") + String(sampleRate) + ";channels=1",
+        payloadBytes,
+        sampleRate
+    );
+    if (payloadBytes > 0) {
+        writeBigEndianPcmPayload(snapshot.frame, snapshot.samples);
+    }
 }
 
 static void httpWebAudioWav() {
@@ -559,17 +644,40 @@ static void httpWebAudioWav() {
     putLe16(header + 34, bitsPerSample);
     putLe32(header + 40, dataBytes);
 
-    web.sendHeader("Cache-Control", "no-store");
-    web.sendHeader("X-WebAudio-Seq", String(snapshot.seq));
-    web.sendHeader("X-WebAudio-Rate", String(sampleRate));
-    web.sendHeader("X-WebAudio-Samples", String(snapshot.samples));
-    web.sendHeader("X-WebAudio-Frames", String(snapshot.frames));
-    web.sendHeader("X-WebAudio-Dropped", String(snapshot.dropped));
-    web.setContentLength(sizeof(header) + dataBytes);
-    web.send(200, "audio/wav", "");
+    sendWebAudioPayloadHeaders(snapshot, "audio/wav", sizeof(header) + dataBytes, sampleRate);
     web.client().write(header, sizeof(header));
     if (dataBytes > 0) {
         web.client().write((const uint8_t*)snapshot.frame, dataBytes);
+    }
+}
+
+static void httpWebAudioAiff() {
+    uint32_t since = 0;
+    if (web.hasArg("since")) since = (uint32_t)web.arg("since").toInt();
+
+    WebAudioSnapshot& snapshot = webAudioHttpSnapshot;
+    if (!getWebAudioSnapshot(since, snapshot)) {
+        web.send(204, "text/plain", "");
+        return;
+    }
+
+    const uint32_t sampleRate = snapshot.rate ? snapshot.rate : 16000;
+    const uint32_t dataBytes = (uint32_t)snapshot.samples * sizeof(int16_t);
+    uint8_t header[54] = {
+        'F','O','R','M',0,0,0,0,'A','I','F','F',
+        'C','O','M','M',0,0,0,18,0,1,0,0,0,0,0,16,0,0,0,0,0,0,0,0,0,0,
+        'S','S','N','D',0,0,0,0,0,0,0,0,0,0,0,0
+    };
+
+    putBe32(header + 4, 46U + dataBytes);
+    putBe32(header + 22, (uint32_t)snapshot.samples);
+    copyAiffSampleRate80(header + 28, sampleRate);
+    putBe32(header + 42, 8U + dataBytes);
+
+    sendWebAudioPayloadHeaders(snapshot, "audio/aiff", sizeof(header) + dataBytes, sampleRate);
+    web.client().write(header, sizeof(header));
+    if (dataBytes > 0) {
+        writeBigEndianPcmPayload(snapshot.frame, snapshot.samples);
     }
 }
 
@@ -583,7 +691,7 @@ static void httpStatus() {
     unsigned long uptimeSeconds = (millis() - bootTime) / 1000;
     String uptimeStr = formatUptime(uptimeSeconds);
     unsigned long runtime = millis() - lastStatsReset;
-    uint32_t currentRate = (isStreaming && runtime > 1000) ? (audioPacketsSent * 1000) / runtime : 0;
+    uint32_t currentRate = (isStreaming && runtime > 1000) ? (audioBlocksSent * 1000) / runtime : 0;
     String json = "{";
     json += "\"fw_version\":\"" + String(FW_VERSION_STR) + "\",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
@@ -608,7 +716,7 @@ static void httpStatus() {
     json += "\"connected_rtsp_clients\":" + String(getConnectedRtspClientCount()) + ",";
     json += "\"max_rtsp_clients\":" + String(getMaxRtspClientCount()) + ",";
     json += "\"rtsp_rejected_clients\":" + String(rtspRejectedClientCount) + ",";
-    json += "\"stream_formats\":\"RTSP/RTP L16, WebAudio PCM, WAV PCM chunk, JSON PCM\",";
+    json += "\"stream_formats\":\"RTSP/RTP L16, HTTP L16, AIFF PCM, WebAudio PCM, WAV PCM chunk, JSON PCM\",";
     json += "\"multi_client_policy\":\"bounded_multi_rtsp_tcp\",";
     json += "\"hardware_profile\":\"" + jsonEscape(describeHardwareProfile()) + "\"";
     json += "}";
@@ -745,9 +853,11 @@ static void httpStreamOptions() {
     json += "\"rtsp_rejected_clients\":" + String(rtspRejectedClientCount) + ",";
     json += "\"rtsp_transport\":\"" + String(currentRtspTransportName()) + "\",";
     json += "\"multi_client_policy\":\"bounded_multi_rtsp_tcp\",";
-    json += "\"note\":\"RTSP supports two bounded TCP interleaved clients. Browser PCM, WAV chunks, and JSON PCM read from the diagnostics ring buffer.\",";
+    json += "\"note\":\"RTSP supports two bounded TCP interleaved clients. HTTP L16, AIFF, browser PCM, WAV chunks, and JSON PCM read from the diagnostics ring buffer.\",";
     json += "\"formats\":[";
     json += "{\"id\":\"rtsp_l16\",\"label\":\"RTSP/RTP L16 mono PCM\",\"url\":\"rtsp://" + ip + ":8554/audio\",\"content_type\":\"audio/L16\"},";
+    json += "{\"id\":\"http_l16\",\"label\":\"HTTP L16 mono PCM chunk\",\"url\":\"http://" + ip + "/api/web_audio_l16\",\"content_type\":\"audio/L16\"},";
+    json += "{\"id\":\"aiff_pcm\",\"label\":\"AIFF PCM chunk\",\"url\":\"http://" + ip + "/api/web_audio_aiff\",\"content_type\":\"audio/aiff\"},";
     json += "{\"id\":\"web_pcm\",\"label\":\"Browser PCM binary frames\",\"url\":\"http://" + ip + "/api/web_audio_pcm\",\"content_type\":\"application/octet-stream\"},";
     json += "{\"id\":\"wav_pcm\",\"label\":\"WAV PCM chunk\",\"url\":\"http://" + ip + "/api/web_audio_wav\",\"content_type\":\"audio/wav\"},";
     json += "{\"id\":\"json_pcm\",\"label\":\"JSON PCM frames\",\"url\":\"http://" + ip + "/api/web_audio\",\"content_type\":\"application/json\"}";
@@ -797,6 +907,9 @@ static void httpThermalClear() {
             rtspServer.setNoDelay(true);
             rtspServerEnabled = true;
         }
+        if (i2sDriverOk && !audioTaskRunning) {
+            startAudioCaptureTask();
+        }
         saveAudioSettings();
         webui_pushLog(F("UI action: thermal_latch_clear"));
         apiSendJSON(F("{\"ok\":true}"));
@@ -823,6 +936,9 @@ static void httpActionServerStart(){
     if (!rtspServerEnabled) {
         rtspServerEnabled=true; rtspServer.begin(); rtspServer.setNoDelay(true);
         overheatLockoutActive = false;
+    }
+    if (i2sDriverOk && !audioTaskRunning) {
+        startAudioCaptureTask();
     }
     webui_pushLog(F("UI action: server_start"));
     apiSendJSON(F("{\"ok\":true}"));
@@ -893,7 +1009,7 @@ static void httpSet() {
     else if (key == "check_interval") { uint32_t v; if (argToUInt("value", v) && v>=1 && v<=60) { performanceCheckInterval=v; saveAudioSettings(); ok=true; } else error="invalid_check_interval"; }
     else if (key == "sched_reset") { String v=web.arg("value"); if (v=="on"||v=="off") { extern bool scheduledResetEnabled; scheduledResetEnabled=(v=="on"); saveAudioSettings(); ok=true; } else error="invalid_scheduled_reset"; }
     else if (key == "reset_hours") { uint32_t v; if (argToUInt("value", v) && v>=1 && v<=168) { extern uint32_t resetIntervalHours; resetIntervalHours=v; saveAudioSettings(); ok=true; } else error="invalid_reset_hours"; }
-    else if (key == "cpu_freq") { uint32_t v; if (argToUInt("value", v) && v>=40 && v<=240) { cpuFrequencyMhz=(uint8_t)v; setCpuFrequencyMhz(cpuFrequencyMhz); saveAudioSettings(); ok=true; } else error="invalid_cpu_freq"; }
+    else if (key == "cpu_freq") { uint32_t v; if (argToUInt("value", v) && (v==80 || v==120 || v==160 || v==240)) { cpuFrequencyMhz=(uint8_t)v; setCpuFrequencyMhz(cpuFrequencyMhz); saveAudioSettings(); ok=true; } else error="invalid_cpu_freq"; }
     else if (key == "hp_enable") { String v=web.arg("value"); if (v=="on"||v=="off") { extern bool highpassEnabled; highpassEnabled=(v=="on"); extern void updateHighpassCoeffs(); updateHighpassCoeffs(); saveAudioSettings(); ok=true; } else error="invalid_hp_enable"; }
     else if (key == "hp_cutoff") { uint32_t v; if (argToUInt("value", v) && v>=10 && v<=10000) { extern uint16_t highpassCutoffHz; highpassCutoffHz=(uint16_t)v; extern void updateHighpassCoeffs(); updateHighpassCoeffs(); saveAudioSettings(); ok=true; } else error="invalid_hp_cutoff"; }
     else if (key == "agc_enable") { String v=web.arg("value"); if (v=="on"||v=="off") { agcEnabled=(v=="on"); if (!agcEnabled) agcMultiplier=1.0f; saveAudioSettings(); ok=true; } else error="invalid_agc_enable"; }
@@ -912,6 +1028,8 @@ void webui_begin() {
     web.on("/streamer", httpStreamer);
     web.on("/api/web_audio", httpWebAudio);
     web.on("/api/web_audio_pcm", httpWebAudioPcm);
+    web.on("/api/web_audio_l16", httpWebAudioL16);
+    web.on("/api/web_audio_aiff", httpWebAudioAiff);
     web.on("/api/web_audio_wav", httpWebAudioWav);
     web.on("/api/status", httpStatus);
     web.on("/api/audio_status", httpAudioStatus);

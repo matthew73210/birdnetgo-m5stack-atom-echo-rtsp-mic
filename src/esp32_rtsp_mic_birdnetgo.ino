@@ -10,6 +10,7 @@
 #pragma GCC diagnostic pop
 #include <Preferences.h>
 #include <math.h>
+#include <time.h>
 #include <FastLED.h>
 #include "WebUI.h"
 
@@ -66,6 +67,10 @@ volatile bool core1OwnsLED = false;          // LED ownership flag
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 static const uint16_t OTA_PORT = 3232;
+static const char SETTINGS_NAMESPACE[] = "audioPrefs";
+static const char LEGACY_SETTINGS_NAMESPACE[] = "audio";
+static const char LOG_TIMEZONE_POSIX[] = "UTC0";
+static const char LOG_TIMEZONE_LABEL[] = "UTC";
 
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
 #define DEFAULT_SAMPLE_RATE 48000  // Unit Mini PDM / BirdNET-Go preferred rate
@@ -137,6 +142,7 @@ static void sendRTPPacketsToActiveSessions(int16_t* audioData, int numSamples);
 // -- Global state
 unsigned long audioPacketsSent = 0;
 unsigned long audioPacketsDropped = 0;  // Track dropped frames
+unsigned long audioBlocksSent = 0;      // Stream cadence counter, independent of client fan-out
 unsigned long lastStatsReset = 0;
 bool rtspServerEnabled = true;
 
@@ -672,7 +678,7 @@ static bool isTemperatureValid(float temp) {
 
 // Format current local time, fallback to uptime when no RTC/NTP time available
 static void persistOverheatNote() {
-    audioPrefs.begin("audio", false);
+    audioPrefs.begin(SETTINGS_NAMESPACE, false);
     audioPrefs.putString("ohReason", overheatLastReason);
     audioPrefs.putString("ohStamp", overheatLastTimestamp);
     audioPrefs.putFloat("ohTripC", overheatTripTemp);
@@ -769,7 +775,7 @@ void checkPerformance() {
         }
 
         uint32_t runtime = millis() - lastStatsReset;
-        uint32_t currentRate = (audioPacketsSent * 1000) / runtime;
+        uint32_t currentRate = (audioBlocksSent * 1000) / runtime;
 
         if (currentRate > maxPacketRate) maxPacketRate = currentRate;
         if (currentRate < minPacketRate) minPacketRate = currentRate;
@@ -784,6 +790,7 @@ void checkPerformance() {
                 consecutiveLowCount = 0;
                 restartI2S();
                 audioPacketsSent = 0;
+                audioBlocksSent = 0;
                 lastStatsReset = millis();
                 lastI2SReset = millis();
             }
@@ -848,37 +855,147 @@ void checkScheduledReset() {
     }
 }
 
+static bool settingsNamespaceHasData(const char* ns) {
+    Preferences prefs;
+    if (!prefs.begin(ns, true)) return false;
+    bool hasData =
+        prefs.isKey("sampleRate") ||
+        prefs.isKey("gainFactor") ||
+        prefs.isKey("bufferSize") ||
+        prefs.isKey("wifiTxDbm") ||
+        prefs.isKey("ohEnable");
+    prefs.end();
+    return hasData;
+}
+
+static void migrateLegacySettingsIfNeeded() {
+    if (settingsNamespaceHasData(SETTINGS_NAMESPACE) || !settingsNamespaceHasData(LEGACY_SETTINGS_NAMESPACE)) {
+        return;
+    }
+
+    Preferences legacyPrefs;
+    Preferences newPrefs;
+    if (!legacyPrefs.begin(LEGACY_SETTINGS_NAMESPACE, true)) return;
+    if (!newPrefs.begin(SETTINGS_NAMESPACE, false)) {
+        legacyPrefs.end();
+        return;
+    }
+
+    if (legacyPrefs.isKey("sampleRate")) newPrefs.putUInt("sampleRate", legacyPrefs.getUInt("sampleRate"));
+    if (legacyPrefs.isKey("gainFactor")) newPrefs.putFloat("gainFactor", legacyPrefs.getFloat("gainFactor"));
+    if (legacyPrefs.isKey("bufferSize")) newPrefs.putUShort("bufferSize", legacyPrefs.getUShort("bufferSize"));
+    if (legacyPrefs.isKey("shiftBits")) newPrefs.putUChar("shiftBits", legacyPrefs.getUChar("shiftBits"));
+    if (legacyPrefs.isKey("autoRecovery")) newPrefs.putBool("autoRecovery", legacyPrefs.getBool("autoRecovery"));
+    if (legacyPrefs.isKey("schedReset")) newPrefs.putBool("schedReset", legacyPrefs.getBool("schedReset"));
+    if (legacyPrefs.isKey("resetHours")) newPrefs.putUInt("resetHours", legacyPrefs.getUInt("resetHours"));
+    if (legacyPrefs.isKey("minRate")) newPrefs.putUInt("minRate", legacyPrefs.getUInt("minRate"));
+    if (legacyPrefs.isKey("checkInterval")) newPrefs.putUInt("checkInterval", legacyPrefs.getUInt("checkInterval"));
+    if (legacyPrefs.isKey("thrAuto")) newPrefs.putBool("thrAuto", legacyPrefs.getBool("thrAuto"));
+    if (legacyPrefs.isKey("cpuFreq")) newPrefs.putUChar("cpuFreq", legacyPrefs.getUChar("cpuFreq"));
+    if (legacyPrefs.isKey("wifiTxDbm")) newPrefs.putFloat("wifiTxDbm", legacyPrefs.getFloat("wifiTxDbm"));
+    if (legacyPrefs.isKey("hpEnable")) newPrefs.putBool("hpEnable", legacyPrefs.getBool("hpEnable"));
+    if (legacyPrefs.isKey("hpCutoff")) newPrefs.putUInt("hpCutoff", legacyPrefs.getUInt("hpCutoff"));
+    if (legacyPrefs.isKey("agcEnable")) newPrefs.putBool("agcEnable", legacyPrefs.getBool("agcEnable"));
+    if (legacyPrefs.isKey("noiseFilter")) newPrefs.putBool("noiseFilter", legacyPrefs.getBool("noiseFilter"));
+    if (legacyPrefs.isKey("ledMode")) newPrefs.putUChar("ledMode", legacyPrefs.getUChar("ledMode"));
+    if (legacyPrefs.isKey("ohEnable")) newPrefs.putBool("ohEnable", legacyPrefs.getBool("ohEnable"));
+    if (legacyPrefs.isKey("ohThresh")) newPrefs.putUInt("ohThresh", legacyPrefs.getUInt("ohThresh"));
+    if (legacyPrefs.isKey("ohReason")) newPrefs.putString("ohReason", legacyPrefs.getString("ohReason"));
+    if (legacyPrefs.isKey("ohStamp")) newPrefs.putString("ohStamp", legacyPrefs.getString("ohStamp"));
+    if (legacyPrefs.isKey("ohTripC")) newPrefs.putFloat("ohTripC", legacyPrefs.getFloat("ohTripC"));
+    if (legacyPrefs.isKey("ohLatched")) newPrefs.putBool("ohLatched", legacyPrefs.getBool("ohLatched"));
+
+    newPrefs.end();
+    legacyPrefs.end();
+    Serial.println("[Settings] Migrated Preferences namespace from 'audio' to 'audioPrefs'");
+}
+
+static float sanitizeBoundedFloat(float value, float fallback, float minValue, float maxValue) {
+    if (!isfinite(value)) return fallback;
+    if (value < minValue || value > maxValue) return fallback;
+    return value;
+}
+
+static uint32_t sanitizeBoundedUInt(uint32_t value, uint32_t fallback, uint32_t minValue, uint32_t maxValue) {
+    if (value < minValue || value > maxValue) return fallback;
+    return value;
+}
+
+static uint16_t sanitizeBufferSize(uint16_t value) {
+    return (value >= 256U && value <= 8192U) ? value : (uint16_t)DEFAULT_BUFFER_SIZE;
+}
+
+static uint8_t sanitizeCpuFrequencySetting(uint8_t value) {
+    switch (value) {
+        case 80:
+        case 120:
+        case 160:
+        case 240:
+            return value;
+        default:
+            return 160;
+    }
+}
+
+static float sanitizeWifiTxPowerSetting(float dbm) {
+    dbm = sanitizeBoundedFloat(dbm, DEFAULT_WIFI_TX_DBM, -1.0f, 19.5f);
+    return wifiPowerLevelToDbm(pickWifiPowerLevel(dbm));
+}
+
+static uint16_t sanitizeHighpassCutoffSetting(uint16_t value, uint32_t sampleRate) {
+    uint32_t maxCutoff = (sampleRate * 45UL) / 100UL;
+    if (maxCutoff < 10UL) maxCutoff = 10UL;
+    if (maxCutoff > 10000UL) maxCutoff = 10000UL;
+    if (value < 10U || value > maxCutoff) {
+        uint16_t fallback = DEFAULT_HPF_CUTOFF_HZ;
+        return (fallback <= maxCutoff) ? fallback : (uint16_t)maxCutoff;
+    }
+    return value;
+}
+
+static uint8_t sanitizeLedModeSetting(uint8_t value) {
+    return (value <= 2U) ? value : 1U;
+}
+
 // Load settings from flash
 void loadAudioSettings() {
-    audioPrefs.begin("audio", false);
+    migrateLegacySettingsIfNeeded();
+    audioPrefs.begin(SETTINGS_NAMESPACE, false);
     bool hasSampleRatePref = audioPrefs.isKey("sampleRate");
     bool hasGainPref = audioPrefs.isKey("gainFactor");
     bool hasBufferPref = audioPrefs.isKey("bufferSize");
     bool hasHpCutoffPref = audioPrefs.isKey("hpCutoff");
     uint32_t storedSampleRate = audioPrefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
     currentSampleRate = sanitizePdmSampleRate(storedSampleRate);
-    currentGainFactor = audioPrefs.getFloat("gainFactor", DEFAULT_GAIN_FACTOR);
-    currentBufferSize = audioPrefs.getUShort("bufferSize", DEFAULT_BUFFER_SIZE);
+    currentGainFactor = sanitizeBoundedFloat(
+        audioPrefs.getFloat("gainFactor", DEFAULT_GAIN_FACTOR),
+        DEFAULT_GAIN_FACTOR,
+        0.1f,
+        100.0f
+    );
+    currentBufferSize = sanitizeBufferSize(audioPrefs.getUShort("bufferSize", DEFAULT_BUFFER_SIZE));
     // i2sShiftBits is ALWAYS 0 for PDM microphones - not configurable
     i2sShiftBits = 0;
     autoRecoveryEnabled = audioPrefs.getBool("autoRecovery", false);
     scheduledResetEnabled = audioPrefs.getBool("schedReset", false);
-    resetIntervalHours = audioPrefs.getUInt("resetHours", 24);
-    minAcceptableRate = audioPrefs.getUInt("minRate", 50);
-    performanceCheckInterval = audioPrefs.getUInt("checkInterval", 15);
+    resetIntervalHours = sanitizeBoundedUInt(audioPrefs.getUInt("resetHours", 24), 24, 1, 168);
+    minAcceptableRate = sanitizeBoundedUInt(audioPrefs.getUInt("minRate", 50), 50, 5, 200);
+    performanceCheckInterval = sanitizeBoundedUInt(audioPrefs.getUInt("checkInterval", 15), 15, 1, 60);
     autoThresholdEnabled = audioPrefs.getBool("thrAuto", true);
-    cpuFrequencyMhz = audioPrefs.getUChar("cpuFreq", 160);
-    wifiTxPowerDbm = audioPrefs.getFloat("wifiTxDbm", DEFAULT_WIFI_TX_DBM);
+    cpuFrequencyMhz = sanitizeCpuFrequencySetting(audioPrefs.getUChar("cpuFreq", 160));
+    wifiTxPowerDbm = sanitizeWifiTxPowerSetting(audioPrefs.getFloat("wifiTxDbm", DEFAULT_WIFI_TX_DBM));
     highpassEnabled = audioPrefs.getBool("hpEnable", DEFAULT_HPF_ENABLED);
-    highpassCutoffHz = (uint16_t)audioPrefs.getUInt("hpCutoff", DEFAULT_HPF_CUTOFF_HZ);
+    highpassCutoffHz = sanitizeHighpassCutoffSetting(
+        (uint16_t)audioPrefs.getUInt("hpCutoff", DEFAULT_HPF_CUTOFF_HZ),
+        currentSampleRate
+    );
     agcEnabled = audioPrefs.getBool("agcEnable", false);
     noiseFilterEnabled = audioPrefs.getBool("noiseFilter", false);
     if (!hasSampleRatePref) currentSampleRate = DEFAULT_SAMPLE_RATE;
     if (!hasGainPref) currentGainFactor = DEFAULT_GAIN_FACTOR;
     if (!hasBufferPref) currentBufferSize = DEFAULT_BUFFER_SIZE;
     if (!hasHpCutoffPref) highpassCutoffHz = DEFAULT_HPF_CUTOFF_HZ;
-    ledMode = audioPrefs.getUChar("ledMode", 1);
-    if (ledMode > 2) ledMode = 1;
+    ledMode = sanitizeLedModeSetting(audioPrefs.getUChar("ledMode", 1));
     overheatProtectionEnabled = audioPrefs.getBool("ohEnable", DEFAULT_OVERHEAT_PROTECTION);
     uint32_t ohLimit = audioPrefs.getUInt("ohThresh", DEFAULT_OVERHEAT_LIMIT_C);
     if (ohLimit < OVERHEAT_MIN_LIMIT_C) ohLimit = OVERHEAT_MIN_LIMIT_C;
@@ -916,7 +1033,7 @@ void loadAudioSettings() {
 
 // Save settings to flash
 void saveAudioSettings() {
-    audioPrefs.begin("audio", false);
+    audioPrefs.begin(SETTINGS_NAMESPACE, false);
     audioPrefs.putUInt("sampleRate", currentSampleRate);
     audioPrefs.putFloat("gainFactor", currentGainFactor);
     audioPrefs.putUShort("bufferSize", currentBufferSize);
@@ -1016,10 +1133,16 @@ uint32_t computeRecommendedMinRate() {
 void resetToDefaultSettings() {
     simplePrintln("FACTORY RESET: Restoring default settings...");
 
-    // Clear persisted settings in our namespace
-    audioPrefs.begin("audio", false);
+    // Clear persisted settings in both the current and legacy namespaces.
+    audioPrefs.begin(SETTINGS_NAMESPACE, false);
     audioPrefs.clear();
     audioPrefs.end();
+
+    Preferences legacyPrefs;
+    if (legacyPrefs.begin(LEGACY_SETTINGS_NAMESPACE, false)) {
+        legacyPrefs.clear();
+        legacyPrefs.end();
+    }
 
     // Reset runtime variables to defaults
     currentSampleRate = DEFAULT_SAMPLE_RATE;
@@ -1377,6 +1500,7 @@ void audioCaptureTask(void* parameter) {
 
             if (streamActive) {
                 sendRTPPacketsToActiveSessions(outputBuffer, chunkSamples);
+                audioBlocksSent++;
                 packetCount++;
 
                 float blockMs = (1000.0f * (float)chunkSamples) / max((float)currentSampleRate, 1.0f);
@@ -1676,6 +1800,7 @@ void audioCaptureTask(void* parameter) {
         if (streamActive) {
             // Send RTP packet
             sendRTPPacketsToActiveSessions(outputBuffer, samplesRead);
+            audioBlocksSent++;
             packetCount++;
         }
 
@@ -2202,12 +2327,16 @@ void handleRTSPCommand(RtspSession &session, String request) {
             return;
         }
 
+        bool hadActiveStreams = (countStreamingRtspClients() > 0);
         session.rtpSequence = 0;
         session.rtpTimestamp = 0;
         session.consecutiveWriteFailures = 0;
-        audioPacketsSent = 0;
-        audioPacketsDropped = 0;
-        lastStatsReset = millis();
+        if (!hadActiveStreams) {
+            audioPacketsSent = 0;
+            audioPacketsDropped = 0;
+            audioBlocksSent = 0;
+            lastStatsReset = millis();
+        }
         lastRtspPlayMs = millis();
         rtspPlayCount++;
 
@@ -2412,8 +2541,8 @@ void setup() {
 
     simplePrintln("WiFi connected: " + WiFi.localIP().toString());
 
-    // NTP time sync (EST = UTC-5, no DST)
-    configTime(-5 * 3600, 0, "pool.ntp.org");
+    // NTP time sync (UTC by default so timestamps stay correct across regions and DST changes)
+    configTzTime(LOG_TIMEZONE_POSIX, "pool.ntp.org");
     Serial.print("Waiting for NTP time sync...");
     time_t now = 0;
     for (int i = 0; i < 20 && now < 100000; i++) {
@@ -2425,7 +2554,7 @@ void setup() {
         localtime_r(&now, &ti);
         char buf[32];
         strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
-        Serial.printf(" OK: %s EST\n", buf);
+        Serial.printf(" OK: %s %s\n", buf, LOG_TIMEZONE_LABEL);
     } else {
         Serial.println(" failed (will use uptime)");
     }

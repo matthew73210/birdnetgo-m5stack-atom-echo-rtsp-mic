@@ -179,7 +179,7 @@ const emptyStatus: Status = {
   connected_rtsp_clients: 0,
   max_rtsp_clients: 2,
   rtsp_rejected_clients: 0,
-  stream_formats: "RTSP/RTP L16, WebAudio PCM, WAV PCM chunk, JSON PCM",
+  stream_formats: "RTSP/RTP L16, HTTP L16, AIFF PCM, WebAudio PCM, WAV PCM chunk, JSON PCM",
   multi_client_policy: "bounded_multi_rtsp_tcp",
   hardware_profile: "PDM input profile"
 };
@@ -873,6 +873,8 @@ function App() {
           <Stat label="Dropped packets" value={status.rtp_packets_dropped} />
           <div class="chips">
             <Pill>RTSP/RTP L16</Pill>
+            <Pill>HTTP L16</Pill>
+            <Pill>AIFF PCM</Pill>
             <Pill>WebAudio PCM</Pill>
             <Pill>WAV chunk</Pill>
             <Pill>JSON PCM</Pill>
@@ -1025,9 +1027,11 @@ function App() {
             <button onClick={() => runAction("reboot")}>Reboot</button>
             <button onClick={() => runAction("factory_reset")}>Defaults</button>
           </div>
-          <p class="quiet">Two RTSP clients can play at once. Browser preview formats stay on the diagnostics ring buffer.</p>
+          <p class="quiet">Two RTSP clients can play at once. HTTP L16, AIFF, browser PCM, WAV, and JSON snapshots all read from the diagnostics ring buffer.</p>
           <div class="links">
             <a href="/streamer" target="_blank" rel="noreferrer">Browser PCM</a>
+            <a href="/api/web_audio_l16" target="_blank" rel="noreferrer">HTTP L16</a>
+            <a href="/api/web_audio_aiff" target="_blank" rel="noreferrer">AIFF Chunk</a>
             <a href="/api/web_audio_wav" target="_blank" rel="noreferrer">WAV Chunk</a>
             <a href="/api/stream_options" target="_blank" rel="noreferrer">Stream API</a>
           </div>
