@@ -228,6 +228,7 @@ Check `/api/audio_status`.
 
 Return to a clean baseline:
 
+- Sample rate `24000` or `16000` Hz if the stream sounds rough at `48000` Hz.
 - Gain around `1.0x`.
 - AGC off.
 - Noise filter off.
@@ -235,6 +236,7 @@ Return to a clean baseline:
 - Confirm that `i2sShiftBits` is still `0`.
 
 Then re-enable features one at a time. The noise filter and AGC are useful outdoors, but they can exaggerate a weak or poorly centered signal if enabled too early.
+If `/api/audio_status` shows `i2s_unsigned_pcm: true`, the firmware is recentering an all-positive PDM stream before gain; the lower rates above are the cleanest baseline for checking whether the raspiness is coming from the mic path versus later DSP stages.
 
 ### Clipping
 

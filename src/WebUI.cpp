@@ -781,7 +781,7 @@ static void httpAudioStatus() {
     json += "\"noise_reduction_db\":" + String(noiseReductionDb, 1) + ",";
     json += "\"filter_chain\":\"" + jsonEscape(describeFilterChain()) + "\",";
     String filterDetail = i2sLikelyUnsignedPcm
-        ? String("Low-amplitude unsigned PDM is centered with a slow DC tracker before HPF/gain.")
+        ? String("Low-amplitude unsigned PDM is centered with a slow DC tracker and conservative fixed scaling before HPF/gain.")
         : String("Signed PDM samples pass through without bit shifting before HPF/gain.");
     json += "\"filter_detail\":\"" + jsonEscape(filterDetail) + "\",";
     json += "\"audio_pipeline_load_pct\":" + String(audioPipelineLoadPct, 1) + ",";
@@ -820,7 +820,11 @@ static void httpAudioStatus() {
     } else if (likelyFlatline) {
         i2sHint = "Mic data looks flat/near-zero. Check CLK/DATA wiring, GND, and 3V3. For Unit PDM use CLK=G1 and DATA=G2.";
     } else if (i2sLikelyUnsignedPcm) {
-        i2sHint = "Mic data is active as low-amplitude unsigned PDM. Firmware is centering it with the DC tracker before streaming.";
+        if (currentSampleRate >= 48000) {
+            i2sHint = "Mic data is active as low-amplitude unsigned PDM. Firmware is centering it with conservative fixed scaling; if the stream still sounds raspy, try 24000 Hz or 16000 Hz for a cleaner baseline.";
+        } else {
+            i2sHint = "Mic data is active as low-amplitude unsigned PDM. Firmware is centering it with conservative fixed scaling before streaming.";
+        }
     } else {
         i2sHint = "Raw signed PDM samples are changing; I2S link appears active.";
     }

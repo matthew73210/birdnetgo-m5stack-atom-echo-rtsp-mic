@@ -248,12 +248,13 @@ const float NOISE_ENV_ATTACK = 0.010f;
 const float NOISE_ENV_RELEASE = 0.0012f;
 const uint16_t NOISE_GATE_HOLD_MS = 120;
 const uint16_t PDM_UNSIGNED_MAX_CODE = 4095;
-const uint16_t PDM_UNSIGNED_MIN_SPAN = 24;
-const int16_t PDM_UNSIGNED_EDGE_MARGIN = 16;
+const uint16_t PDM_UNSIGNED_MIN_SPAN = 64;
+const int16_t PDM_UNSIGNED_EDGE_MARGIN = 24;
 const float PDM_UNSIGNED_MIN_MEAN = 256.0f;
 const float PDM_UNSIGNED_MIN_MEAN_TO_SPAN = 4.0f;
-const float PDM_UNSIGNED_MIN_HALFSCALE = 512.0f;
-const float PDM_UNSIGNED_MAX_HALFSCALE = 2048.0f;
+const float PDM_UNSIGNED_LOW_CENTER_MAX = 1536.0f;
+const float PDM_UNSIGNED_LOW_NORMALIZE_GAIN = 32.0f;
+const float PDM_UNSIGNED_HIGH_NORMALIZE_GAIN = 16.0f;
 const float PDM_UNSIGNED_DC_TRACK_SECONDS = 1.25f;
 const uint8_t PDM_UNSIGNED_CONFIDENCE_MAX = 12;
 const uint8_t PDM_UNSIGNED_CONFIDENCE_ON = 6;
@@ -1632,10 +1633,12 @@ void audioCaptureTask(void* parameter) {
 
             float sample;
             if (localUnsignedPdm) {
-                float unsignedHalfScale = localPdmDc;
-                if (unsignedHalfScale < PDM_UNSIGNED_MIN_HALFSCALE) unsignedHalfScale = PDM_UNSIGNED_MIN_HALFSCALE;
-                if (unsignedHalfScale > PDM_UNSIGNED_MAX_HALFSCALE) unsignedHalfScale = PDM_UNSIGNED_MAX_HALFSCALE;
-                float unsignedNormalizeGain = 32767.0f / unsignedHalfScale;
+                // Keep unsigned-PDM scaling fixed per center band so weak all-positive
+                // blocks do not get over-amplified into gritty/raspy audio.
+                float unsignedNormalizeGain =
+                    (localPdmDc < PDM_UNSIGNED_LOW_CENTER_MAX)
+                        ? PDM_UNSIGNED_LOW_NORMALIZE_GAIN
+                        : PDM_UNSIGNED_HIGH_NORMALIZE_GAIN;
                 localPdmDc += ((float)raw - localPdmDc) * pdmDcAlpha;
                 sample = ((float)raw - localPdmDc) * unsignedNormalizeGain;
             } else {
