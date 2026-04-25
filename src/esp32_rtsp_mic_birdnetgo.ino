@@ -59,6 +59,7 @@ volatile bool audioTaskRunning = false;
 // Cross-core synchronization primitives
 portMUX_TYPE logMux = portMUX_INITIALIZER_UNLOCKED;  // spinlock for log ring buffer
 portMUX_TYPE hpfMux = portMUX_INITIALIZER_UNLOCKED;  // protects HPF coefficient handoff
+portMUX_TYPE diagMux = portMUX_INITIALIZER_UNLOCKED; // protects live diagnostics snapshots
 volatile bool stopStreamRequested = false;   // Core 0 asks Core 1 to stop
 volatile bool streamCleanupDone = false;     // Core 1 confirms cleanup complete
 SemaphoreHandle_t taskExitSemaphore = NULL;  // confirmed task exit
@@ -599,9 +600,29 @@ static void clearAudioDiagnostics() {
     memset((void*)fftBins, 0, sizeof(fftBins));
     fftFrameSeq = 0;
     portEXIT_CRITICAL(&fftMux);
+    portENTER_CRITICAL(&diagMux);
+    audioClipCount = 0;
+    audioFallbackBlockCount = 0;
     lastPeakAbs16 = 0;
     peakHoldAbs16 = 0;
     peakHoldUntilMs = 0;
+    audioClippedLastBlock = false;
+    i2sLastSamplesRead = 0;
+    i2sLastRawMin = 0;
+    i2sLastRawMax = 0;
+    i2sLastRawPeakAbs = 0;
+    i2sLastRawRms = 0;
+    i2sLastRawZeroPct = 0;
+    i2sLastRawMean = 0;
+    i2sLastRawSpan = 0;
+    i2sLikelyUnsignedPcm = false;
+    audioPipelineLoadPct = 0.0f;
+    agcMultiplier = 1.0f;
+    noiseFloorDbfs = -90.0f;
+    noiseGateDbfs = -90.0f;
+    noiseReductionDb = 0.0f;
+    i2sLastGapMs = 0;
+    portEXIT_CRITICAL(&diagMux);
 }
 
 void recordTelemetrySample(float cpuLoadPct, float tempC, bool tempValid) {
@@ -1537,14 +1558,16 @@ void audioCaptureTask(void* parameter) {
                 i2sReadZeroCount = i2sReadZeroCount + 1U;
             }
 
-            audioFallbackBlockCount = audioFallbackBlockCount + 1U;
-            i2sLastGapMs = millis() - lastGoodCaptureMs;
-            i2sLastSamplesRead = 0;
             fillConcealmentBlock(outputBuffer, chunkSamples, lastOutputSample);
             lastOutputSample = outputBuffer[chunkSamples - 1];
             lastBlockWasConcealment = true;
+            portENTER_CRITICAL(&diagMux);
+            audioFallbackBlockCount = audioFallbackBlockCount + 1U;
+            i2sLastGapMs = millis() - lastGoodCaptureMs;
+            i2sLastSamplesRead = 0;
             lastPeakAbs16 = (uint16_t)abs((int)outputBuffer[0]);
             audioClippedLastBlock = false;
+            portEXIT_CRITICAL(&diagMux);
             publishWebAudioFrame(outputBuffer, chunkSamples);
 
             if (streamActive) {
@@ -1556,7 +1579,9 @@ void audioCaptureTask(void* parameter) {
                 float workMs = (float)(micros() - processStartUs) / 1000.0f;
                 float instLoad = (blockMs > 0.0f) ? (workMs * 100.0f / blockMs) : 0.0f;
                 if (instLoad > 100.0f) instLoad = 100.0f;
+                portENTER_CRITICAL(&diagMux);
                 audioPipelineLoadPct += (instLoad - audioPipelineLoadPct) * 0.20f;
+                portEXIT_CRITICAL(&diagMux);
             }
             continue;
         }
@@ -1564,9 +1589,11 @@ void audioCaptureTask(void* parameter) {
         consecutiveErrors = 0;
         i2sReadOkCount = i2sReadOkCount + 1U;
         lastGoodCaptureMs = millis();
-        i2sLastGapMs = 0;
         uint16_t samplesRead = bytesRead / sizeof(int16_t);
+        portENTER_CRITICAL(&diagMux);
+        i2sLastGapMs = 0;
         i2sLastSamplesRead = samplesRead;
+        portEXIT_CRITICAL(&diagMux);
 
         // Update HPF coefficients if changed
         if (localHighpassEnabled != highpassEnabled ||
@@ -1646,7 +1673,9 @@ void audioCaptureTask(void* parameter) {
             localPdmDc = rawMean;
             localPdmDcInitialized = true;
         }
+        portENTER_CRITICAL(&diagMux);
         i2sLikelyUnsignedPcm = localUnsignedPdm;
+        portEXIT_CRITICAL(&diagMux);
 
         float pdmDcAlpha = 0.0f;
         if (localUnsignedPdm) {
@@ -1762,6 +1791,7 @@ void audioCaptureTask(void* parameter) {
         }
 
         // Publish raw capture diagnostics for UI/API
+        portENTER_CRITICAL(&diagMux);
         i2sLastRawMin = rawMin;
         i2sLastRawMax = rawMax;
         i2sLastRawPeakAbs = rawPeakAbs;
@@ -1778,6 +1808,7 @@ void audioCaptureTask(void* parameter) {
             i2sLastRawRms = 0;
             i2sLastRawZeroPct = 100;
         }
+        portEXIT_CRITICAL(&diagMux);
 
         // AGC: adjust multiplier based on RMS
         if (agcEnabled && samplesRead > 0) {
@@ -1794,9 +1825,12 @@ void audioCaptureTask(void* parameter) {
                 if (localAgcMult < AGC_MIN_MULT) localAgcMult = AGC_MIN_MULT;
                 if (localAgcMult > AGC_MAX_MULT) localAgcMult = AGC_MAX_MULT;
             }
+            portENTER_CRITICAL(&diagMux);
             agcMultiplier = localAgcMult;  // Publish for WebUI
+            portEXIT_CRITICAL(&diagMux);
         }
 
+        portENTER_CRITICAL(&diagMux);
         if (noiseFilterEnabled) {
             float floorNorm = max(localNoiseFloor, 1.0f) / 32767.0f;
             float gateNorm = max(localNoiseGate, 1.0f) / 32767.0f;
@@ -1808,19 +1842,21 @@ void audioCaptureTask(void* parameter) {
             noiseGateDbfs = -90.0f;
             noiseReductionDb = 0.0f;
         }
+        portEXIT_CRITICAL(&diagMux);
 
         // Update metering
         if (peakAbs > 32767.0f) peakAbs = 32767.0f;
+        bool logClip = false;
+        uint16_t clipPeak = 0;
+        uint32_t clipCount = 0;
+        portENTER_CRITICAL(&diagMux);
         lastPeakAbs16 = (uint16_t)peakAbs;
         audioClippedLastBlock = clipped;
         if (clipped) {
             audioClipCount++;
-            static unsigned long lastClipLog = 0;
-            if (millis() - lastClipLog > 5000) {
-                Serial.printf("[Core1] Clipping! Peak=%u count=%lu\n",
-                             lastPeakAbs16, audioClipCount);
-                lastClipLog = millis();
-            }
+            clipPeak = lastPeakAbs16;
+            clipCount = audioClipCount;
+            logClip = true;
         }
 
         if (lastPeakAbs16 > peakHoldAbs16) {
@@ -1828,6 +1864,16 @@ void audioCaptureTask(void* parameter) {
             peakHoldUntilMs = millis() + 3000UL;
         } else if (peakHoldAbs16 > 0 && millis() > peakHoldUntilMs) {
             peakHoldAbs16 = 0;
+        }
+        portEXIT_CRITICAL(&diagMux);
+        if (logClip) {
+            static unsigned long lastClipLog = 0;
+            unsigned long nowMs = millis();
+            if (nowMs - lastClipLog > 5000) {
+                Serial.printf("[Core1] Clipping! Peak=%u count=%lu\n",
+                             clipPeak, clipCount);
+                lastClipLog = nowMs;
+            }
         }
 
         // LED update (throttled to ~10 Hz) only while actively streaming.
@@ -1867,7 +1913,9 @@ void audioCaptureTask(void* parameter) {
         float workMs = (float)(micros() - processStartUs) / 1000.0f;
         float instLoad = (blockMs > 0.0f) ? (workMs * 100.0f / blockMs) : 0.0f;
         if (instLoad > 100.0f) instLoad = 100.0f;
+        portENTER_CRITICAL(&diagMux);
         audioPipelineLoadPct += (instLoad - audioPipelineLoadPct) * 0.15f;
+        portEXIT_CRITICAL(&diagMux);
 
         // Process incoming RTSP commands during streaming (~every 50ms)
         // Keeps all socket I/O on Core 1 during streaming

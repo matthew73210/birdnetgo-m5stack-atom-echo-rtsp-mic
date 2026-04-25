@@ -683,6 +683,8 @@ function App() {
   const [dirty, setDirty] = useState<Record<string, boolean>>({});
   const [error, setError] = useState("");
   const dirtyRef = useRef<Record<string, boolean>>({});
+  const loadSeqRef = useRef(0);
+  const loadInFlightRef = useRef(false);
 
   const rtspUrl = useMemo(() => {
     const ip = status.ip || window.location.hostname;
@@ -712,12 +714,15 @@ function App() {
   };
 
   const load = async () => {
+    const requestSeq = loadSeqRef.current + 1;
+    loadSeqRef.current = requestSeq;
     const [nextStatus, nextAudio, nextPerf, nextThermal] = await Promise.all([
       getJson<Status>("/api/status"),
       getJson<AudioStatus>("/api/audio_status"),
       getJson<PerfStatus>("/api/perf_status"),
       getJson<ThermalStatus>("/api/thermal")
     ]);
+    if (requestSeq !== loadSeqRef.current) return false;
     setStatus(nextStatus);
     setAudio(nextAudio);
     setPerf(nextPerf);
@@ -742,16 +747,22 @@ function App() {
       oh_enable: nextThermal.protection_enabled ? "on" : "off",
       oh_limit: String(nextThermal.shutdown_c)
     });
+    return true;
   };
 
   useEffect(() => {
     let alive = true;
     const loadSafe = async () => {
+      if (loadInFlightRef.current) return;
+      loadInFlightRef.current = true;
       try {
-        await load();
+        const applied = await load();
+        if (!applied) return;
         if (alive) setError("");
       } catch (err) {
         if (alive) setError(err instanceof Error ? err.message : "Unable to load status");
+      } finally {
+        loadInFlightRef.current = false;
       }
     };
     loadSafe();
@@ -780,6 +791,7 @@ function App() {
     try {
       await setValue(key, draft[key] || "");
       clearDirty(key);
+      loadInFlightRef.current = false;
       await load();
       setError("");
     } catch (err) {
@@ -790,6 +802,7 @@ function App() {
   const runAction = async (name: string) => {
     try {
       await action(name);
+      loadInFlightRef.current = false;
       await load();
       setError("");
     } catch (err) {
@@ -801,6 +814,7 @@ function App() {
     try {
       const result = await postJson<{ ok: boolean }>("/api/thermal/clear");
       if (!result.ok) throw new Error("Thermal latch was not active");
+      loadInFlightRef.current = false;
       await load();
       setError("");
     } catch (err) {

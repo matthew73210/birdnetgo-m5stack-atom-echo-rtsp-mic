@@ -70,6 +70,7 @@ extern volatile bool noiseFilterEnabled;
 extern volatile float noiseFloorDbfs;
 extern volatile float noiseGateDbfs;
 extern volatile float noiseReductionDb;
+extern portMUX_TYPE diagMux;
 extern uint8_t ledMode;
 extern volatile uint32_t i2sReadOkCount;
 extern volatile uint32_t i2sReadErrCount;
@@ -580,6 +581,7 @@ static void httpStatus() {
     unsigned long runtime = millis() - lastStatsReset;
     uint32_t currentRate = (isStreaming && runtime > 1000) ? (audioBlocksSent * 1000) / runtime : 0;
     String json = "{";
+    json.reserve(900);
     json += "\"fw_version\":\"" + String(FW_VERSION_STR) + "\",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"gateway\":\"" + WiFi.gatewayIP().toString() + "\",";
@@ -611,9 +613,66 @@ static void httpStatus() {
 }
 
 static void httpAudioStatus() {
+    float agcMult;
+    float noiseFloor;
+    float noiseGate;
+    float noiseReduction;
+    float pipelineLoad;
+    uint32_t fallbackBlocks;
+    uint32_t clipCount;
+    uint32_t lastGapMs;
+    bool driverOk;
+    int32_t lastError;
+    uint16_t peakAbs16;
+    uint16_t peakHold16;
+    bool clippedLastBlock;
+    uint16_t lastSamplesRead;
+    int16_t rawMin;
+    int16_t rawMax;
+    uint16_t rawPeakAbs;
+    uint16_t rawRms;
+    uint16_t rawZeroPct;
+    int16_t rawMean;
+    uint16_t rawSpan;
+    bool likelyUnsignedPcm;
+    bool usingModernPdmDriver;
+    bool pdmUseLeftSlot;
+    bool pdmClkInverted;
+    bool pdmProbeFoundSigned;
+
+    portENTER_CRITICAL(&diagMux);
+    agcMult = agcMultiplier;
+    noiseFloor = noiseFloorDbfs;
+    noiseGate = noiseGateDbfs;
+    noiseReduction = noiseReductionDb;
+    pipelineLoad = audioPipelineLoadPct;
+    fallbackBlocks = audioFallbackBlockCount;
+    clipCount = audioClipCount;
+    lastGapMs = i2sLastGapMs;
+    driverOk = i2sDriverOk;
+    lastError = i2sLastError;
+    peakAbs16 = lastPeakAbs16;
+    peakHold16 = peakHoldAbs16;
+    clippedLastBlock = audioClippedLastBlock;
+    lastSamplesRead = i2sLastSamplesRead;
+    rawMin = i2sLastRawMin;
+    rawMax = i2sLastRawMax;
+    rawPeakAbs = i2sLastRawPeakAbs;
+    rawRms = i2sLastRawRms;
+    rawZeroPct = i2sLastRawZeroPct;
+    rawMean = i2sLastRawMean;
+    rawSpan = i2sLastRawSpan;
+    likelyUnsignedPcm = i2sLikelyUnsignedPcm;
+    usingModernPdmDriver = i2sUsingModernPdmDriver;
+    pdmUseLeftSlot = i2sPdmUseLeftSlot;
+    pdmClkInverted = i2sPdmClkInverted;
+    pdmProbeFoundSigned = i2sPdmProbeFoundSigned;
+    portEXIT_CRITICAL(&diagMux);
+
     uint16_t effectiveChunk = effectiveAudioChunkSize();
     float latency_ms = (float)effectiveChunk / currentSampleRate * 1000.0f;
     String json = "{";
+    json.reserve(1800);
     json += "\"sample_rate\":" + String(currentSampleRate) + ",";
     json += "\"gain\":" + String(currentGainFactor,2) + ",";
     json += "\"buffer_size\":" + String(currentBufferSize) + ",";
@@ -624,74 +683,74 @@ static void httpAudioStatus() {
     json += "\"hp_cutoff_hz\":" + String((uint32_t)highpassCutoffHz) + ",";
     json += "\"hp_cutoff_max_hz\":" + String((uint32_t)maxHighpassCutoffForSampleRate(currentSampleRate)) + ",";
     json += "\"agc_enable\":" + String(agcEnabled?"true":"false") + ",";
-    json += "\"agc_multiplier\":" + String(agcMultiplier, 2) + ",";
+    json += "\"agc_multiplier\":" + String(agcMult, 2) + ",";
     json += "\"noise_filter_enable\":" + String(noiseFilterEnabled?"true":"false") + ",";
-    json += "\"noise_floor_dbfs\":" + String(noiseFloorDbfs, 1) + ",";
-    json += "\"noise_gate_dbfs\":" + String(noiseGateDbfs, 1) + ",";
-    json += "\"noise_reduction_db\":" + String(noiseReductionDb, 1) + ",";
+    json += "\"noise_floor_dbfs\":" + String(noiseFloor, 1) + ",";
+    json += "\"noise_gate_dbfs\":" + String(noiseGate, 1) + ",";
+    json += "\"noise_reduction_db\":" + String(noiseReduction, 1) + ",";
     json += "\"filter_chain\":\"" + jsonEscape(describeFilterChain()) + "\",";
-    String captureMode = i2sUsingModernPdmDriver
-        ? String("V4 ESP-IDF PDM RX selected ") + (i2sPdmUseLeftSlot ? "left" : "right") +
-              " slot" + (i2sPdmClkInverted ? " with inverted clock. " : " with normal clock. ")
+    String captureMode = usingModernPdmDriver
+        ? String("V4 ESP-IDF PDM RX selected ") + (pdmUseLeftSlot ? "left" : "right") +
+              " slot" + (pdmClkInverted ? " with inverted clock. " : " with normal clock. ")
         : String("PDM RX driver is not active yet. ");
     String filterDetail = captureMode +
-        (i2sLikelyUnsignedPcm
+        (likelyUnsignedPcm
             ? String("Live blocks still look all-positive, so the unsigned DC tracker and fixed scaling remain active before HPF/gain.")
             : String("Signed PCM is reaching DSP directly before HPF/gain."));
     json += "\"filter_detail\":\"" + jsonEscape(filterDetail) + "\",";
-    json += "\"audio_pipeline_load_pct\":" + String(audioPipelineLoadPct, 1) + ",";
-    json += "\"i2s_fallback_blocks\":" + String(audioFallbackBlockCount) + ",";
-    json += "\"i2s_last_gap_ms\":" + String(i2sLastGapMs) + ",";
-    json += "\"i2s_driver_ok\":" + String(i2sDriverOk?"true":"false") + ",";
-    json += "\"i2s_last_error\":" + String((int32_t)i2sLastError) + ",";
-    float effectiveGain = agcEnabled ? (currentGainFactor * agcMultiplier) : currentGainFactor;
+    json += "\"audio_pipeline_load_pct\":" + String(pipelineLoad, 1) + ",";
+    json += "\"i2s_fallback_blocks\":" + String(fallbackBlocks) + ",";
+    json += "\"i2s_last_gap_ms\":" + String(lastGapMs) + ",";
+    json += "\"i2s_driver_ok\":" + String(driverOk?"true":"false") + ",";
+    json += "\"i2s_last_error\":" + String((int32_t)lastError) + ",";
+    float effectiveGain = agcEnabled ? (currentGainFactor * agcMult) : currentGainFactor;
     json += "\"effective_gain\":" + String(effectiveGain, 2) + ",";
     // Metering/clipping
-    uint16_t p = (peakHoldAbs16 > 0) ? peakHoldAbs16 : lastPeakAbs16;
+    uint16_t p = (peakHold16 > 0) ? peakHold16 : peakAbs16;
     float peak_pct = (p <= 0) ? 0.0f : (100.0f * (float)p / 32767.0f);
     float peak_dbfs = (p <= 0) ? -90.0f : (20.0f * log10f((float)p / 32767.0f));
     json += "\"peak_pct\":" + String(peak_pct,1) + ",";
     json += "\"peak_dbfs\":" + String(peak_dbfs,1) + ",";
-    json += "\"clip\":" + String(audioClippedLastBlock?"true":"false") + ",";
-    json += "\"clip_count\":" + String(audioClipCount) + ",";
+    json += "\"clip\":" + String(clippedLastBlock?"true":"false") + ",";
+    json += "\"clip_count\":" + String(clipCount) + ",";
     json += "\"led_mode\":" + String(ledMode) + ",";
     json += "\"i2s_reads_ok\":" + String(i2sReadOkCount) + ",";
     json += "\"i2s_reads_err\":" + String(i2sReadErrCount) + ",";
     json += "\"i2s_reads_zero\":" + String(i2sReadZeroCount) + ",";
-    json += "\"i2s_last_samples\":" + String(i2sLastSamplesRead) + ",";
-    json += "\"i2s_raw_min\":" + String(i2sLastRawMin) + ",";
-    json += "\"i2s_raw_max\":" + String(i2sLastRawMax) + ",";
-    json += "\"i2s_raw_peak\":" + String(i2sLastRawPeakAbs) + ",";
-    json += "\"i2s_raw_rms\":" + String(i2sLastRawRms) + ",";
-    json += "\"i2s_raw_zero_pct\":" + String(i2sLastRawZeroPct) + ",";
-    json += "\"i2s_raw_mean\":" + String(i2sLastRawMean) + ",";
-    json += "\"i2s_raw_span\":" + String(i2sLastRawSpan) + ",";
-    json += "\"i2s_capture_driver\":\"" + String(i2sUsingModernPdmDriver ? "modern_pdm_rx" : "inactive") + "\",";
-    json += "\"i2s_pdm_slot\":\"" + String(i2sPdmUseLeftSlot ? "left" : "right") + "\",";
-    json += "\"i2s_pdm_clk_inverted\":" + String(i2sPdmClkInverted?"true":"false") + ",";
-    json += "\"i2s_pdm_probe_signed\":" + String(i2sPdmProbeFoundSigned?"true":"false") + ",";
-    json += "\"i2s_unsigned_pcm\":" + String(i2sLikelyUnsignedPcm?"true":"false") + ",";
-    bool likelyFlatline = !i2sDriverOk || (i2sLastRawPeakAbs < 8) || ((i2sLastRawMin == i2sLastRawMax) && i2sLastSamplesRead > 0) || (i2sLastRawZeroPct > 98);
+    json += "\"i2s_last_samples\":" + String(lastSamplesRead) + ",";
+    json += "\"i2s_raw_min\":" + String(rawMin) + ",";
+    json += "\"i2s_raw_max\":" + String(rawMax) + ",";
+    json += "\"i2s_raw_peak\":" + String(rawPeakAbs) + ",";
+    json += "\"i2s_raw_rms\":" + String(rawRms) + ",";
+    json += "\"i2s_raw_zero_pct\":" + String(rawZeroPct) + ",";
+    json += "\"i2s_raw_mean\":" + String(rawMean) + ",";
+    json += "\"i2s_raw_span\":" + String(rawSpan) + ",";
+    json += "\"i2s_capture_driver\":\"" + String(usingModernPdmDriver ? "modern_pdm_rx" : "inactive") + "\",";
+    json += "\"i2s_pdm_slot\":\"" + String(pdmUseLeftSlot ? "left" : "right") + "\",";
+    json += "\"i2s_pdm_clk_inverted\":" + String(pdmClkInverted?"true":"false") + ",";
+    json += "\"i2s_pdm_probe_signed\":" + String(pdmProbeFoundSigned?"true":"false") + ",";
+    json += "\"i2s_unsigned_pcm\":" + String(likelyUnsignedPcm?"true":"false") + ",";
+    bool likelyFlatline = !driverOk || (rawPeakAbs < 8) || ((rawMin == rawMax) && lastSamplesRead > 0) || (rawZeroPct > 98);
     json += "\"i2s_link_ok\":" + String(likelyFlatline?"false":"true") + ",";
     String i2sHint;
-    if (!i2sDriverOk) {
+    if (!driverOk) {
         i2sHint = "I2S driver setup failed. Check serial logs for the failing driver step and error code.";
     } else if (likelyFlatline) {
         i2sHint = "Mic data looks flat/near-zero. Check CLK/DATA wiring, GND, and 3V3. For Unit PDM use CLK=G1 and DATA=G2.";
-    } else if (i2sLikelyUnsignedPcm) {
+    } else if (likelyUnsignedPcm) {
         if (currentSampleRate >= 48000) {
-            i2sHint = String("PDM path ") + (i2sPdmUseLeftSlot ? "left" : "right") +
-                      (i2sPdmClkInverted ? " / clk inverted" : " / normal clock") +
+            i2sHint = String("PDM path ") + (pdmUseLeftSlot ? "left" : "right") +
+                      (pdmClkInverted ? " / clk inverted" : " / normal clock") +
                       " is active, but live samples still look low-amplitude and all-positive. Firmware is centering them with conservative fixed scaling; if the stream still sounds raspy, try 24000 Hz or 16000 Hz for a cleaner baseline.";
         } else {
-            i2sHint = String("PDM path ") + (i2sPdmUseLeftSlot ? "left" : "right") +
-                      (i2sPdmClkInverted ? " / clk inverted" : " / normal clock") +
+            i2sHint = String("PDM path ") + (pdmUseLeftSlot ? "left" : "right") +
+                      (pdmClkInverted ? " / clk inverted" : " / normal clock") +
                       " is active, but live samples still look low-amplitude and all-positive. Firmware is centering them with conservative fixed scaling before streaming.";
         }
     } else {
         i2sHint = String("Raw signed PDM samples are changing on the ") +
-                  (i2sPdmUseLeftSlot ? "left" : "right") +
-                  (i2sPdmClkInverted ? " / clk-inverted" : " / normal-clock") +
+                  (pdmUseLeftSlot ? "left" : "right") +
+                  (pdmClkInverted ? " / clk-inverted" : " / normal-clock") +
                   " path; I2S link appears active.";
     }
     json += "\"i2s_hint\":\"" + jsonEscape(i2sHint) + "\"";
@@ -715,6 +774,7 @@ static void httpTelemetryHistory() {
     portEXIT_CRITICAL(&telemetryMux);
 
     String json = "{\"seq\":" + String(seq) + ",\"sample_ms\":3000,\"cpu\":[";
+    json.reserve(700);
     for (uint16_t i = 0; i < count; ++i) {
         uint16_t idx = (head + TELEMETRY_HISTORY_LEN - count + i) % TELEMETRY_HISTORY_LEN;
         if (i) json += ",";
@@ -744,6 +804,7 @@ static void httpFft() {
     portEXIT_CRITICAL(&fftMux);
 
     String json = "{\"seq\":" + String(seq) + ",\"fft_size\":" + String(WEBUI_FFT_SIZE) + ",\"bins\":[";
+    json.reserve(700);
     for (uint16_t i = 0; i < WEBUI_FFT_BINS; i++) {
         if (i) json += ",";
         json += String((uint32_t)bins[i]);
@@ -754,6 +815,7 @@ static void httpFft() {
 
 static void httpPerfStatus() {
     String json = "{";
+    json.reserve(180);
     json += "\"restart_threshold_pkt_s\":" + String(minAcceptableRate) + ",";
     json += "\"check_interval_min\":" + String(performanceCheckInterval) + ",";
     json += "\"auto_recovery\":" + String(autoRecoveryEnabled?"true":"false") + ",";
@@ -767,6 +829,7 @@ static void httpPerfStatus() {
 static void httpStreamOptions() {
     String ip = WiFi.localIP().toString();
     String json = "{";
+    json.reserve(900);
     json += "\"max_rtsp_clients\":" + String(getMaxRtspClientCount()) + ",";
     json += "\"active_rtsp_clients\":" + String(getActiveRtspClientCount()) + ",";
     json += "\"connected_rtsp_clients\":" + String(getConnectedRtspClientCount()) + ",";
@@ -792,6 +855,7 @@ static void httpThermal() {
     }
     bool manualRequired = overheatLatched || (!rtspServerEnabled && overheatProtectionEnabled && overheatTripTemp > 0.0f);
     String json = "{";
+    json.reserve(420);
     if (lastTemperatureValid) {
         json += "\"current_c\":" + String(lastTemperatureC,1) + ",";
     } else {
