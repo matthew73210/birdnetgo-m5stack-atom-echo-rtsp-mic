@@ -40,6 +40,7 @@ type AudioStatus = {
   latency_ms: number;
   hp_enable: boolean;
   hp_cutoff_hz: number;
+  hp_cutoff_max_hz: number;
   agc_enable: boolean;
   agc_multiplier: number;
   effective_gain: number;
@@ -196,6 +197,7 @@ const emptyAudio: AudioStatus = {
   latency_ms: 64,
   hp_enable: true,
   hp_cutoff_hz: 180,
+  hp_cutoff_max_hz: 7200,
   agc_enable: false,
   agc_multiplier: 1,
   effective_gain: 1,
@@ -684,6 +686,7 @@ function App() {
   const wifiTone = status.wifi_rssi > -67 ? "ok" : status.wifi_rssi > -75 ? "warn" : "bad";
   const heapTone = status.free_heap_kb > 96 ? "ok" : status.free_heap_kb > 72 ? "warn" : "bad";
   const tempTone = thermal.sensor_fault || thermal.latched_persist ? "bad" : thermal.current_valid && (thermal.current_c || 0) > thermal.shutdown_c - 5 ? "warn" : "ok";
+  const highpassCutoffMax = Math.max(10, audio.hp_cutoff_max_hz || 10000);
   const clientSlots = Array.from({ length: Math.max(status.max_rtsp_clients, 1) }, (_, index) => index < status.active_rtsp_clients);
   const visualBars = Array.from({ length: 22 }, (_, index) => {
     const wave = 0.42 + Math.abs(Math.sin((index + 1) * 0.74)) * 0.58;
@@ -930,7 +933,7 @@ function App() {
             <span class="unit">samples</span>
             {setButton("buffer")}
           </Setting>
-          <Setting label="High-pass" detail={`${audio.hp_cutoff_hz} Hz cutoff • start low`}>
+          <Setting label="High-pass" detail={`${audio.hp_cutoff_hz} Hz cutoff • max ${highpassCutoffMax} Hz`}>
             <select class={controlClass("hp_enable")} value={input("hp_enable", "on")} onInput={(event) => editDraft("hp_enable", event.currentTarget.value)}>
               <option value="on">ON</option>
               <option value="off">OFF</option>
@@ -938,7 +941,7 @@ function App() {
             {setButton("hp_enable")}
           </Setting>
           <Setting label="HPF cutoff">
-            <input class={controlClass("hp_cutoff")} type="number" min="10" max="10000" step="10" value={input("hp_cutoff", "180")} onInput={(event) => editDraft("hp_cutoff", event.currentTarget.value)} />
+            <input class={controlClass("hp_cutoff")} type="number" min="10" max={highpassCutoffMax} step="10" value={input("hp_cutoff", "180")} onInput={(event) => editDraft("hp_cutoff", event.currentTarget.value)} />
             <span class="unit">Hz</span>
             {setButton("hp_cutoff")}
           </Setting>
