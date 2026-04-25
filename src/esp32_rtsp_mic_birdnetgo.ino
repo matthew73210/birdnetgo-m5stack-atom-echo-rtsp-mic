@@ -158,7 +158,7 @@ static uint8_t countRtspClients();
 static uint8_t countStreamingRtspClients();
 static RtspSession* firstStreamingSession();
 static void clearAudioDiagnostics();
-static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSamples, uint8_t activeClientCount);
+static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSamples);
 static void sendRTPPacketsToActiveSessions(int16_t* audioData, int numSamples);
 static esp_err_t i2sMicRead(void* dest, size_t size, size_t* bytesRead, uint32_t timeoutMs);
 // Note: Audio buffers now allocated by Core 1 task
@@ -2570,10 +2570,10 @@ static void pollStreamingRtspCommands(RtspSession &session) {
     }
 }
 
-static const uint32_t MAX_WRITE_FAILURES = 48;
-static const uint32_t MAX_WRITE_FAILURE_MS = 1200;
+static const uint32_t MAX_WRITE_FAILURES = 100;
+static const uint32_t MAX_WRITE_FAILURE_MS = 5000;
 
-static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSamples, uint8_t activeClientCount) {
+static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSamples) {
     WiFiClient &client = session.client;
     if (!client.connected()) {
         // Client disconnected — Core 1 owns the socket, close it
@@ -2588,7 +2588,9 @@ static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSampl
         const uint16_t payloadSize = (uint16_t)(packetSamples * (int)sizeof(int16_t));
         const uint16_t packetSize = (uint16_t)(12 + payloadSize);
         const unsigned long blockMs = max(1UL, (unsigned long)(((uint32_t)packetSamples * 1000UL) / max((uint32_t)1, currentSampleRate)));
-        const unsigned long packetWindowMs = max(6UL, min(18UL, blockMs / max((uint8_t)1, activeClientCount)));
+        // Normal ESP32 Wi-Fi/TCP backpressure can exceed a single audio block.
+        // Give the socket the older proven grace window before counting a drop.
+        const unsigned long packetWindowMs = max(40UL, min(140UL, blockMs * 2UL));
         uint8_t packetBuffer[4 + 12 + (1024 * sizeof(int16_t))];
 
         // RTSP interleaved header + RTP header + network-order PCM payload.
@@ -2651,10 +2653,9 @@ static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSampl
 }
 
 static void sendRTPPacketsToActiveSessions(int16_t* audioData, int numSamples) {
-    uint8_t activeClientCount = countStreamingRtspClients();
     for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
         if (rtspSessions[i].occupied && rtspSessions[i].streaming) {
-            sendRTPPacket(rtspSessions[i], audioData, numSamples, activeClientCount);
+            sendRTPPacket(rtspSessions[i], audioData, numSamples);
         }
     }
 }
