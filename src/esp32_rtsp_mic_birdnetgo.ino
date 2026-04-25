@@ -11,7 +11,7 @@
 #include <time.h>
 #include <errno.h>
 #include <lwip/sockets.h>
-#include <FastLED.h>
+#include <esp32-hal-rgb-led.h>
 #include "PdmProbeResult.h"
 #include "WebUI.h"
 
@@ -100,9 +100,22 @@ static const uint32_t SUPPORTED_PDM_SAMPLE_RATES[] = {16000, 24000, 32000, 48000
 #define I2S_DATA_IN_PIN  2  // PDM DATA (G2)
 #define WS2812_LED_PIN  35  // AtomS3 Lite built-in RGB LED
 
-static CRGB statusLed[1];
+struct CRGB {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+
+    constexpr CRGB(uint8_t red = 0, uint8_t green = 0, uint8_t blue = 0)
+        : r(red), g(green), b(blue) {}
+};
+
 static bool statusLedNeedsRefresh = true;
 static CRGB lastStatusLed = CRGB(0, 0, 0);
+static uint8_t statusLedBrightness = 32;
+
+static uint8_t scaleLedChannel(uint8_t channel) {
+    return (uint8_t)(((uint16_t)channel * (uint16_t)statusLedBrightness + 127U) / 255U);
+}
 
 inline void setStatusLed(const CRGB& color) {
     if (!statusLedNeedsRefresh &&
@@ -111,8 +124,10 @@ inline void setStatusLed(const CRGB& color) {
         lastStatusLed.b == color.b) {
         return;
     }
-    statusLed[0] = color;
-    FastLED.show();
+    rgbLedWriteOrdered(WS2812_LED_PIN, LED_COLOR_ORDER_GRB,
+                       scaleLedChannel(color.r),
+                       scaleLedChannel(color.g),
+                       scaleLedChannel(color.b));
     lastStatusLed = color;
     statusLedNeedsRefresh = false;
 }
@@ -461,6 +476,12 @@ static String extractRtspHeader(const String &request, const char* headerName) {
     String value = request.substring(colon + 1, end);
     value.trim();
     return value;
+}
+
+static bool rtspMethodIs(const char* request, const char* method) {
+    if (!request || !method) return false;
+    size_t len = strlen(method);
+    return strncmp(request, method, len) == 0 && (request[len] == ' ' || request[len] == '\t');
 }
 
 // Helper: convert WiFi power enum to dBm (for logs)
@@ -2600,24 +2621,20 @@ static void sendRTPPacketsToActiveSessions(int16_t* audioData, int numSamples) {
 // (streamAudio function removed - handled by Core 1 audioCaptureTask)
 
 // RTSP handling
-void handleRTSPCommand(RtspSession &session, String request) {
+void handleRTSPCommand(RtspSession &session, const String &request) {
     WiFiClient &client = session.client;
-    String cseq = "1";
-    int cseqPos = request.indexOf("CSeq: ");
-    if (cseqPos >= 0) {
-        cseq = request.substring(cseqPos + 6, request.indexOf("\r", cseqPos));
-        cseq.trim();
-    }
+    int cseqVal = parseRtspCSeqValue(request.c_str());
+    String cseq = String(cseqVal);
 
     lastRTSPActivity = millis();
     session.lastActivity = millis();
 
-    if (request.startsWith("OPTIONS")) {
+    if (rtspMethodIs(request.c_str(), "OPTIONS")) {
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
         client.print("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, SET_PARAMETER\r\n\r\n");
 
-    } else if (request.startsWith("DESCRIBE")) {
+    } else if (rtspMethodIs(request.c_str(), "DESCRIBE")) {
         String ip = WiFi.localIP().toString();
         String sdp = "v=0\r\n";
         sdp += "o=- 0 0 IN IP4 " + ip + "\r\n";
@@ -2636,7 +2653,7 @@ void handleRTSPCommand(RtspSession &session, String request) {
         client.print("Content-Length: " + String(sdp.length()) + "\r\n\r\n");
         client.print(sdp);
 
-    } else if (request.startsWith("SETUP")) {
+    } else if (rtspMethodIs(request.c_str(), "SETUP")) {
         if (session.sessionId.length() == 0) {
             session.sessionId = String(random(100000000, 999999999));
         }
@@ -2675,7 +2692,7 @@ void handleRTSPCommand(RtspSession &session, String request) {
         session.setupDone = true;
         simplePrintln("RTSP SETUP using TCP interleaved transport for " + session.remoteAddr);
 
-    } else if (request.startsWith("PLAY")) {
+    } else if (rtspMethodIs(request.c_str(), "PLAY")) {
         if (!session.setupDone) {
             client.print("RTSP/1.0 455 Method Not Valid in This State\r\n");
             client.print("CSeq: " + cseq + "\r\n");
@@ -2739,7 +2756,7 @@ void handleRTSPCommand(RtspSession &session, String request) {
         simplePrintln("STREAMING STARTED for " + session.remoteAddr + " via " +
                       String(rtspTransportModeName(session.transport)));
 
-    } else if (request.startsWith("TEARDOWN")) {
+    } else if (rtspMethodIs(request.c_str(), "TEARDOWN")) {
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
         client.print("Session: " + session.sessionId + "\r\n\r\n");
@@ -2750,13 +2767,17 @@ void handleRTSPCommand(RtspSession &session, String request) {
             else setStatusLed(CRGB(0, 0, 0));
         }
         simplePrintln("STREAMING STOPPED");
-    } else if (request.startsWith("GET_PARAMETER")) {
+    } else if (rtspMethodIs(request.c_str(), "GET_PARAMETER")) {
         // Many RTSP clients send GET_PARAMETER as keep-alive.
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n\r\n");
-    } else if (request.startsWith("SET_PARAMETER")) {
+    } else if (rtspMethodIs(request.c_str(), "SET_PARAMETER")) {
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n\r\n");
+    } else {
+        client.print("RTSP/1.0 405 Method Not Allowed\r\n");
+        client.print("CSeq: " + cseq + "\r\n");
+        client.print("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, SET_PARAMETER\r\n\r\n");
     }
 }
 
@@ -2776,10 +2797,11 @@ void processRTSP(RtspSession &session) {
         if (available <= 0) {
             static unsigned long lastOverflowWarning = 0;
             if (millis() - lastOverflowWarning > 5000) {
-                simplePrintln("RTSP buffer full - resetting");
+                simplePrintln("RTSP buffer full - closing " + session.remoteAddr);
                 lastOverflowWarning = millis();
             }
-            session.parseBufferPos = 0;
+            client.print("RTSP/1.0 413 Request Entity Too Large\r\nConnection: close\r\n\r\n");
+            closeRtspSession(session, true);
             return;
         }
 
@@ -2791,7 +2813,7 @@ void processRTSP(RtspSession &session) {
         session.parseBuffer[session.parseBufferPos] = '\0';
 
         char* endOfHeader = strstr((char*)session.parseBuffer, "\r\n\r\n");
-        if (endOfHeader != nullptr) {
+        while (endOfHeader != nullptr) {
             int headerLen = (endOfHeader - (char*)session.parseBuffer) + 4;
             uint16_t bodyBytes = parseRtspContentLengthValue((char*)session.parseBuffer);
             int totalMessageLen = headerLen + (int)bodyBytes;
@@ -2819,6 +2841,7 @@ void processRTSP(RtspSession &session) {
             }
             session.parseBufferPos = max(0, remaining);
             session.parseBuffer[session.parseBufferPos] = '\0';
+            endOfHeader = strstr((char*)session.parseBuffer, "\r\n\r\n");
         }
     }
 }
@@ -2874,8 +2897,6 @@ static void rejectBusyRtspClient(WiFiClient &client) {
 // Web UI is a separate module (WebUI.*)
 
 void setup() {
-    FastLED.addLeds<WS2812, WS2812_LED_PIN, GRB>(statusLed, 1);
-    FastLED.setBrightness(32);
     setStatusLed(CRGB(0, 0, 0));
 
     Serial.begin(115200);
