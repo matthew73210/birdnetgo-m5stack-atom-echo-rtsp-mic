@@ -87,6 +87,7 @@ type ThermalStatus = {
 
 type FftStatus = {
   seq: number;
+  fft_size?: number;
   bins: number[];
   sample_rate: number;
   max_hz: number;
@@ -323,7 +324,15 @@ function binForPosition(position: number, count: number, scale: SpectrogramScale
   if (count <= 1) return 0;
   const t = clamp01(position);
   const mapped = scale === "log" ? Math.pow(count, t) - 1 : t * (count - 1);
-  return Math.max(0, Math.min(count - 1, Math.round(mapped)));
+  return Math.max(0, Math.min(count - 1, mapped));
+}
+
+function sampleBins(bins: number[], position: number, scale: SpectrogramScale) {
+  if (!bins.length) return 0;
+  const mapped = binForPosition(position, bins.length, scale);
+  const low = Math.floor(mapped);
+  const high = Math.min(bins.length - 1, low + 1);
+  return lerp(bins[low] || 0, bins[high] || 0, mapped - low);
 }
 
 function getStoredOption<T extends string>(key: string, fallback: T, allowed: readonly T[]) {
@@ -383,8 +392,8 @@ function drawTimelineFrame(
   const column = ctx.createImageData(1, height);
   for (let y = 0; y < height; y++) {
     const frequencyPos = 1 - y / Math.max(1, height - 1);
-    const bin = binForPosition(frequencyPos, bins.length, scale);
-    const color = colorFromPalette(palette, (bins[bin] || 0) / 255, quantized);
+    const level = sampleBins(bins, frequencyPos, scale) / 255;
+    const color = colorFromPalette(palette, level, quantized);
     const offset = y * 4;
     column.data[offset] = color[0];
     column.data[offset + 1] = color[1];
@@ -406,8 +415,8 @@ function drawWaterfallFrame(canvas: HTMLCanvasElement, bins: number[], palette: 
   const row = ctx.createImageData(width, 1);
   for (let x = 0; x < width; x++) {
     const frequencyPos = x / Math.max(1, width - 1);
-    const bin = binForPosition(frequencyPos, bins.length, scale);
-    const color = colorFromPalette(palette, (bins[bin] || 0) / 255);
+    const level = sampleBins(bins, frequencyPos, scale) / 255;
+    const color = colorFromPalette(palette, level);
     const offset = x * 4;
     row.data[offset] = color[0];
     row.data[offset + 1] = color[1];
@@ -428,8 +437,7 @@ function drawBandsFrame(canvas: HTMLCanvasElement, bins: number[], palette: Spec
   const bandWidth = width / visible;
   for (let i = 0; i < visible; i++) {
     const position = visible <= 1 ? 0 : i / (visible - 1);
-    const bin = binForPosition(position, bins.length, scale);
-    const level = clamp01((bins[bin] || 0) / 255);
+    const level = clamp01(sampleBins(bins, position, scale) / 255);
     const color = colorFromPalette(palette, level);
     const x = Math.round(i * bandWidth);
     const barWidth = Math.max(2, Math.ceil(bandWidth) - gap);

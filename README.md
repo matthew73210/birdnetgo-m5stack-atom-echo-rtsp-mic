@@ -181,7 +181,7 @@ Useful URLs:
 | `/api/web_audio_aiff` | AIFF PCM chunk |
 | `/api/web_audio_wav` | WAV PCM chunk |
 | `/api/web_audio` | JSON PCM frame data |
-| `/api/fft` | 32-bin lightweight spectrum data |
+| `/api/fft` | 128-bin spectrum data from the 256-point FFT diagnostics path |
 | `/api/telemetry_history` | CPU load and temperature history |
 | `/api/thermal` | Thermal protection status |
 | `/api/logs` | Text log buffer |

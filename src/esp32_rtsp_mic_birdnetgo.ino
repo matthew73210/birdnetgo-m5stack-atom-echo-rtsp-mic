@@ -202,7 +202,8 @@ volatile uint32_t i2sLastGapMs = 0;
 volatile float audioPipelineLoadPct = 0.0f;
 
 // -- Lightweight spectrum diagnostics for Web UI waterfall
-volatile uint8_t fftBins[32] = {0};
+portMUX_TYPE fftMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint8_t fftBins[WEBUI_FFT_BINS] = {0};
 volatile uint32_t fftFrameSeq = 0;
 
 // -- Browser WebAudio diagnostics stream (latest processed PCM block)
@@ -594,8 +595,10 @@ static void clearAudioDiagnostics() {
     memset(webAudioFrame, 0, sizeof(webAudioFrame));
     portEXIT_CRITICAL(&webAudioMux);
 
+    portENTER_CRITICAL(&fftMux);
     memset((void*)fftBins, 0, sizeof(fftBins));
     fftFrameSeq = 0;
+    portEXIT_CRITICAL(&fftMux);
     lastPeakAbs16 = 0;
     peakHoldAbs16 = 0;
     peakHoldUntilMs = 0;
@@ -1344,39 +1347,81 @@ static void setupArduinoOta() {
 }
 
 static void updateFftFromBlock(const int16_t* samples, uint16_t count) {
-    const int N = 128;
-    const int BINS = 32;
+    const int N = WEBUI_FFT_SIZE;
+    const int BINS = WEBUI_FFT_BINS;
     if (!samples || count < N) return;
+
+    static float real[WEBUI_FFT_SIZE];
+    static float imag[WEBUI_FFT_SIZE];
+    uint8_t nextBins[WEBUI_FFT_BINS];
 
     float mean = 0.0f;
     for (int i = 0; i < N; i++) mean += (float)samples[i];
     mean /= (float)N;
 
-    float mags[BINS];
-    float maxMag = 0.0f;
-    for (int k = 0; k < BINS; k++) {
-        float re = 0.0f;
-        float im = 0.0f;
-        for (int n = 0; n < N; n++) {
-            float x = ((float)samples[n] - mean) * (0.5f - 0.5f * cosf((2.0f * PI * (float)n) / (float)(N - 1)));
-            float phase = 2.0f * PI * (float)k * (float)n / (float)N;
-            re += x * cosf(phase);
-            im -= x * sinf(phase);
-        }
-        float mag = sqrtf(re * re + im * im);
-        mag *= (1.0f + 0.01f * (float)k);
-        mags[k] = mag;
-        if (mag > maxMag) maxMag = mag;
+    for (int i = 0; i < N; i++) {
+        float window = 0.5f - 0.5f * cosf((2.0f * PI * (float)i) / (float)(N - 1));
+        real[i] = ((float)samples[i] - mean) * window;
+        imag[i] = 0.0f;
     }
 
-    if (maxMag < 1.0f) maxMag = 1.0f;
+    for (int i = 1, j = 0; i < N; i++) {
+        int bit = N >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            float tr = real[i];
+            float ti = imag[i];
+            real[i] = real[j];
+            imag[i] = imag[j];
+            real[j] = tr;
+            imag[j] = ti;
+        }
+    }
+
+    for (int len = 2; len <= N; len <<= 1) {
+        float angle = -2.0f * PI / (float)len;
+        float wLenR = cosf(angle);
+        float wLenI = sinf(angle);
+        for (int i = 0; i < N; i += len) {
+            float wr = 1.0f;
+            float wi = 0.0f;
+            for (int j = 0; j < len / 2; j++) {
+                int even = i + j;
+                int odd = even + len / 2;
+                float ur = real[even];
+                float ui = imag[even];
+                float vr = real[odd] * wr - imag[odd] * wi;
+                float vi = real[odd] * wi + imag[odd] * wr;
+                real[even] = ur + vr;
+                imag[even] = ui + vi;
+                real[odd] = ur - vr;
+                imag[odd] = ui - vi;
+
+                float nextWr = wr * wLenR - wi * wLenI;
+                wi = wr * wLenI + wi * wLenR;
+                wr = nextWr;
+            }
+        }
+    }
+
     for (int k = 0; k < BINS; k++) {
-        float norm = mags[k] / maxMag;
+        int bin = k + 1; // skip DC; the input mean is already removed.
+        float mag = sqrtf(real[bin] * real[bin] + imag[bin] * imag[bin]);
+        float db = 20.0f * log10f((mag / 128.0f) + 1.0f);
+        float norm = (db - 12.0f) / 64.0f;
         if (norm < 0.0f) norm = 0.0f;
         if (norm > 1.0f) norm = 1.0f;
-        fftBins[k] = (uint8_t)(norm * 255.0f);
+        nextBins[k] = (uint8_t)(norm * 255.0f);
+    }
+
+    portENTER_CRITICAL(&fftMux);
+    for (int k = 0; k < BINS; k++) {
+        uint8_t previous = fftBins[k];
+        fftBins[k] = (uint8_t)(((uint16_t)previous * 2U + nextBins[k]) / 3U);
     }
     fftFrameSeq = fftFrameSeq + 1U;
+    portEXIT_CRITICAL(&fftMux);
 }
 
 // ================== CORE 1: FULL AUDIO PIPELINE ==================
@@ -1712,7 +1757,7 @@ void audioCaptureTask(void* parameter) {
         // Update spectrum diagnostics from processed output (throttled)
         static uint8_t fftDecimator = 0;
         fftDecimator++;
-        if ((fftDecimator & 0x03) == 0 && samplesRead >= 128) {
+        if ((fftDecimator & 0x03) == 0 && samplesRead >= WEBUI_FFT_SIZE) {
             updateFftFromBlock(outputBuffer, samplesRead);
         }
 
@@ -2268,8 +2313,18 @@ static int parseRtspCSeqValue(const char* request) {
     if (!cseqStr) return 1;
     cseqStr += 5;
     while (*cseqStr == ' ' || *cseqStr == '\t') cseqStr++;
-    int cseqVal = atoi(cseqStr);
-    return (cseqVal > 0) ? cseqVal : 1;
+    uint32_t cseqVal = 0;
+    bool hasDigit = false;
+    while (*cseqStr >= '0' && *cseqStr <= '9') {
+        hasDigit = true;
+        uint32_t digit = (uint32_t)(*cseqStr - '0');
+        if (cseqVal > (UINT32_MAX - digit) / 10U) return 1;
+        cseqVal = (cseqVal * 10U) + digit;
+        cseqStr++;
+    }
+    while (*cseqStr == ' ' || *cseqStr == '\t') cseqStr++;
+    if (!hasDigit || (*cseqStr != '\r' && *cseqStr != '\n' && *cseqStr != '\0')) return 1;
+    return (cseqVal > 0 && cseqVal <= INT_MAX) ? (int)cseqVal : 1;
 }
 
 static uint16_t parseRtspContentLengthValue(const char* request) {
@@ -2280,9 +2335,18 @@ static uint16_t parseRtspContentLengthValue(const char* request) {
     if (!lenStr) return 0;
     lenStr += 15;
     while (*lenStr == ' ' || *lenStr == '\t') lenStr++;
-    long len = atol(lenStr);
-    if (len <= 0) return 0;
-    if (len > 2048) return 2048;
+    uint32_t len = 0;
+    bool hasDigit = false;
+    while (*lenStr >= '0' && *lenStr <= '9') {
+        hasDigit = true;
+        uint32_t digit = (uint32_t)(*lenStr - '0');
+        if (len > (UINT32_MAX - digit) / 10U) return 0;
+        len = (len * 10U) + digit;
+        lenStr++;
+    }
+    while (*lenStr == ' ' || *lenStr == '\t') lenStr++;
+    if (!hasDigit || (*lenStr != '\r' && *lenStr != '\n' && *lenStr != '\0')) return 0;
+    if (len > 2048U) return 2048U;
     return (uint16_t)len;
 }
 
@@ -2655,7 +2719,7 @@ void processRTSP(RtspSession &session) {
 
     if (client.available()) {
         int available = client.available();
-        int spaceLeft = sizeof(session.parseBuffer) - session.parseBufferPos - 1;
+        int spaceLeft = (int)sizeof(session.parseBuffer) - session.parseBufferPos - 1;
 
         if (available > spaceLeft) {
             available = spaceLeft;
@@ -2671,8 +2735,11 @@ void processRTSP(RtspSession &session) {
             return;
         }
 
-        client.read(session.parseBuffer + session.parseBufferPos, available);
-        session.parseBufferPos += available;
+        int readBytes = client.read(session.parseBuffer + session.parseBufferPos, available);
+        if (readBytes <= 0) {
+            return;
+        }
+        session.parseBufferPos += readBytes;
         session.parseBuffer[session.parseBufferPos] = '\0';
 
         char* endOfHeader = strstr((char*)session.parseBuffer, "\r\n\r\n");
@@ -2680,6 +2747,12 @@ void processRTSP(RtspSession &session) {
             int headerLen = (endOfHeader - (char*)session.parseBuffer) + 4;
             uint16_t bodyBytes = parseRtspContentLengthValue((char*)session.parseBuffer);
             int totalMessageLen = headerLen + (int)bodyBytes;
+            if (totalMessageLen >= (int)sizeof(session.parseBuffer)) {
+                simplePrintln("RTSP request too large - closing " + session.remoteAddr);
+                client.print("RTSP/1.0 413 Request Entity Too Large\r\nConnection: close\r\n\r\n");
+                closeRtspSession(session, true);
+                return;
+            }
             if (session.parseBufferPos < totalMessageLen) {
                 return;
             }
