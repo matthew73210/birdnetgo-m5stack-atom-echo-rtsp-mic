@@ -797,7 +797,9 @@ void checkTemperature() {
             if (isStreaming) {
                 requestStreamStop("overheat");
             }
-            stopAudioCaptureTask();
+            if (!stopAudioCaptureTask()) {
+                simplePrintln("Thermal protection: audio task did not stop cleanly");
+            }
             rtspServerEnabled = false;
             rtspServer.stop();
         } else if (overheatLockoutActive && temp <= (overheatShutdownC - OVERHEAT_LIMIT_STEP_C)) {
@@ -844,11 +846,14 @@ void checkPerformance() {
             if (consecutiveLowCount >= 3 && autoRecoveryEnabled) {
                 simplePrintln("AUTO-RECOVERY: 3 consecutive failures, restarting I2S...");
                 consecutiveLowCount = 0;
-                restartI2S();
-                audioPacketsSent = 0;
-                audioBlocksSent = 0;
-                lastStatsReset = millis();
-                lastI2SReset = millis();
+                if (restartI2S()) {
+                    audioPacketsSent = 0;
+                    audioBlocksSent = 0;
+                    lastStatsReset = millis();
+                    lastI2SReset = millis();
+                } else {
+                    simplePrintln("AUTO-RECOVERY: I2S restart failed");
+                }
             }
         } else {
             consecutiveLowCount = 0;
@@ -866,7 +871,9 @@ void checkWiFiHealth() {
         // Stop streaming before reconnecting — no point sending RTP into a dead radio
         if (isStreaming) {
             requestStreamStop("WiFi disconnect");
-            stopAudioCaptureTask();
+            if (!stopAudioCaptureTask()) {
+                simplePrintln("WiFi disconnect: audio task did not stop cleanly");
+            }
         }
         simplePrintln("WiFi disconnected! Reconnecting...");
         WiFi.reconnect();
@@ -1093,37 +1100,48 @@ void loadAudioSettings() {
 }
 
 // Save settings to flash
-void saveAudioSettings() {
-    audioPrefs.begin(SETTINGS_NAMESPACE, false);
-    audioPrefs.putUInt("sampleRate", currentSampleRate);
-    audioPrefs.putFloat("gainFactor", currentGainFactor);
-    audioPrefs.putUShort("bufferSize", currentBufferSize);
-    audioPrefs.putUChar("shiftBits", i2sShiftBits);
-    audioPrefs.putBool("autoRecovery", autoRecoveryEnabled);
-    audioPrefs.putBool("schedReset", scheduledResetEnabled);
-    audioPrefs.putUInt("resetHours", resetIntervalHours);
-    audioPrefs.putUInt("minRate", minAcceptableRate);
-    audioPrefs.putUInt("checkInterval", performanceCheckInterval);
-    audioPrefs.putBool("thrAuto", autoThresholdEnabled);
-    audioPrefs.putUChar("cpuFreq", cpuFrequencyMhz);
-    audioPrefs.putFloat("wifiTxDbm", wifiTxPowerDbm);
-    audioPrefs.putBool("hpEnable", highpassEnabled);
-    audioPrefs.putUInt("hpCutoff", (uint32_t)highpassCutoffHz);
-    audioPrefs.putBool("agcEnable", agcEnabled);
-    audioPrefs.putBool("noiseFilter", noiseFilterEnabled);
-    audioPrefs.putUChar("ledMode", ledMode);
-    audioPrefs.putBool("ohEnable", overheatProtectionEnabled);
+bool saveAudioSettings() {
+    if (!audioPrefs.begin(SETTINGS_NAMESPACE, false)) {
+        simplePrintln("ERROR: Could not open settings namespace for write");
+        return false;
+    }
+
+    bool ok = true;
+    auto rememberWrite = [&](size_t wrote) {
+        if (wrote == 0) ok = false;
+    };
+
+    rememberWrite(audioPrefs.putUInt("sampleRate", currentSampleRate));
+    rememberWrite(audioPrefs.putFloat("gainFactor", currentGainFactor));
+    rememberWrite(audioPrefs.putUShort("bufferSize", currentBufferSize));
+    rememberWrite(audioPrefs.putUChar("shiftBits", i2sShiftBits));
+    rememberWrite(audioPrefs.putBool("autoRecovery", autoRecoveryEnabled));
+    rememberWrite(audioPrefs.putBool("schedReset", scheduledResetEnabled));
+    rememberWrite(audioPrefs.putUInt("resetHours", resetIntervalHours));
+    rememberWrite(audioPrefs.putUInt("minRate", minAcceptableRate));
+    rememberWrite(audioPrefs.putUInt("checkInterval", performanceCheckInterval));
+    rememberWrite(audioPrefs.putBool("thrAuto", autoThresholdEnabled));
+    rememberWrite(audioPrefs.putUChar("cpuFreq", cpuFrequencyMhz));
+    rememberWrite(audioPrefs.putFloat("wifiTxDbm", wifiTxPowerDbm));
+    rememberWrite(audioPrefs.putBool("hpEnable", highpassEnabled));
+    rememberWrite(audioPrefs.putUInt("hpCutoff", (uint32_t)highpassCutoffHz));
+    rememberWrite(audioPrefs.putBool("agcEnable", agcEnabled));
+    rememberWrite(audioPrefs.putBool("noiseFilter", noiseFilterEnabled));
+    rememberWrite(audioPrefs.putUChar("ledMode", ledMode));
+    rememberWrite(audioPrefs.putBool("ohEnable", overheatProtectionEnabled));
     uint32_t ohLimit = (uint32_t)(overheatShutdownC + 0.5f);
     if (ohLimit < OVERHEAT_MIN_LIMIT_C) ohLimit = OVERHEAT_MIN_LIMIT_C;
     if (ohLimit > OVERHEAT_MAX_LIMIT_C) ohLimit = OVERHEAT_MAX_LIMIT_C;
-    audioPrefs.putUInt("ohThresh", ohLimit);
-    audioPrefs.putString("ohReason", overheatLastReason);
-    audioPrefs.putString("ohStamp", overheatLastTimestamp);
-    audioPrefs.putFloat("ohTripC", overheatTripTemp);
-    audioPrefs.putBool("ohLatched", overheatLatched);
+    rememberWrite(audioPrefs.putUInt("ohThresh", ohLimit));
+    rememberWrite(audioPrefs.putString("ohReason", overheatLastReason));
+    rememberWrite(audioPrefs.putString("ohStamp", overheatLastTimestamp));
+    rememberWrite(audioPrefs.putFloat("ohTripC", overheatTripTemp));
+    rememberWrite(audioPrefs.putBool("ohLatched", overheatLatched));
     audioPrefs.end();
 
-    simplePrintln("Settings saved to flash");
+    if (ok) simplePrintln("Settings saved to flash");
+    else simplePrintln("ERROR: Failed to persist one or more settings");
+    return ok;
 }
 
 // Schedule a safe reboot (optionally with factory reset) after delayMs
@@ -1242,13 +1260,15 @@ void resetToDefaultSettings() {
 
     isStreaming = false;
 
-    saveAudioSettings();
+    if (!saveAudioSettings()) {
+        simplePrintln("WARNING: Factory reset defaults were not fully persisted");
+    }
 
     simplePrintln("Defaults applied. Device will reboot.");
 }
 
 // Restart I2S with new parameters
-void restartI2S() {
+bool restartI2S() {
     simplePrintln("Restarting I2S with new parameters...");
     bool wasStreaming = isStreaming;
 
@@ -1258,7 +1278,10 @@ void restartI2S() {
     }
 
     // Stop audio pipeline task on Core 1
-    stopAudioCaptureTask();
+    if (!stopAudioCaptureTask()) {
+        simplePrintln("I2S restart aborted; audio task did not stop cleanly");
+        return false;
+    }
 
     // Restart I2S driver
     setup_i2s_driver();
@@ -1270,19 +1293,20 @@ void restartI2S() {
 
     if (!i2sDriverOk) {
         simplePrintln("I2S restart failed; audio pipeline remains stopped");
-        return;
+        return false;
     }
 
     updateStreamingStateFromSessions();
     if (!startAudioCaptureTask()) {
         simplePrintln("I2S restarted but audio task could not start");
-        return;
+        return false;
     }
     if (wasStreaming) {
         simplePrintln("I2S restarted; RTSP clients should reconnect");
     } else {
         simplePrintln("I2S restarted, diagnostics resumed");
     }
+    return true;
 }
 
 // Minimal print helpers: Serial + buffered for Web UI
@@ -1340,7 +1364,9 @@ static void setupArduinoOta() {
         if (isStreaming) {
             requestStreamStop("OTA update");
         }
-        stopAudioCaptureTask();
+        if (!stopAudioCaptureTask()) {
+            simplePrintln("OTA start: audio task did not stop cleanly");
+        }
         rtspServer.stop();
         rtspServerEnabled = false;
         core1OwnsLED = false;
@@ -1990,7 +2016,9 @@ bool startAudioCaptureTask() {
 }
 
 // Stop audio pipeline task with confirmed exit via semaphore
-void stopAudioCaptureTask() {
+bool stopAudioCaptureTask() {
+    if (audioCaptureTaskHandle == NULL) return true;
+
     if (audioCaptureTaskHandle != NULL) {
         audioTaskRunning = false;
         // Wait for task to confirm exit (up to 2s)
@@ -1998,7 +2026,7 @@ void stopAudioCaptureTask() {
                        xSemaphoreTake(taskExitSemaphore, pdMS_TO_TICKS(2000)) == pdTRUE);
         if (!exited) {
             Serial.println("[Core0] WARNING: Audio task did not exit within 2s");
-            return;
+            return false;
         }
 
         audioCaptureTaskHandle = NULL;
@@ -2010,6 +2038,7 @@ void stopAudioCaptureTask() {
         updateStreamingStateFromSessions();
         clearAudioDiagnostics();
     }
+    return true;
 }
 
 // Request Core 1 to stop streaming and clean up the socket.
@@ -2043,8 +2072,8 @@ bool requestStreamStop(const char* reason) {
         // Timeout — stop the Core 1 task before touching leftover session sockets.
         Serial.printf("[Core0] WARNING: Stream stop timeout, stopping audio task for cleanup: %s\n", reason);
         bool hadAudioTask = (audioCaptureTaskHandle != NULL);
-        stopAudioCaptureTask();
-        if (audioCaptureTaskHandle == NULL) {
+        bool stopped = stopAudioCaptureTask();
+        if (stopped && audioCaptureTaskHandle == NULL) {
             isStreaming = false;
             streamClient = NULL;
             stopStreamRequested = false;
@@ -3171,7 +3200,9 @@ void loop() {
             requestStreamStop("server disabled");
         }
         if (audioTaskRunning) {
-            stopAudioCaptureTask();
+            if (!stopAudioCaptureTask()) {
+                simplePrintln("Server disable: audio task did not stop cleanly");
+            }
         }
         for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
             if (rtspSessions[i].occupied && !rtspSessions[i].streaming) {
