@@ -33,12 +33,12 @@ Important: `i2sShiftBits` is fixed at `0` for this PDM path. Do not make it conf
 | PlatformIO board | `m5stack-atom` | `m5stack-atoms3` |
 | MCU family | ESP32-PICO-D4 class Atom hardware | ESP32-S3 AtomS3 Lite |
 | Microphone pins | Onboard Atom Echo/Voice mic pins | External PDM Unit: `G1` clock, `G2` data |
-| LED handling | M5Atom display helpers / Atom LED pin | FastLED on AtomS3 Lite WS2812 pin `G35` |
+| LED handling | M5Atom display helpers / Atom LED pin | Arduino RGB LED helper on AtomS3 Lite WS2812 pin `G35` |
 | Hostname | `atomecho.local` | `atoms3mic.local` |
 | Uploads | USB serial | USB serial first, then Arduino OTA on port `3232` |
 | RTSP transport | Atom Echo-oriented single target | TCP interleaved RTP, bounded two-client mode, clean UDP rejection |
 | Web UI | Basic status, settings, logs | Rebuilt diagnostics UI, audio level, FFT, telemetry history, browser PCM/WAV preview, thermal controls |
-| Audio defaults | Echo-oriented gain/HPF defaults | Conservative gain, HPF off by default, PDM centering, limiter, optional noise suppressor and AGC |
+| Audio defaults | Echo-oriented gain/HPF defaults | Conservative gain, HPF on at 180 Hz, PDM centering, limiter, optional noise suppressor and AGC |
 
 This is not a drop-in Atom Echo binary. Atom Echo / Atom Voice has its own onboard SPM1423 microphone, speaker amp, LED, and ESP32-PICO-D4 pinout. To support it cleanly from this branch, add a separate board/pin profile rather than flashing the AtomS3 Lite build unchanged.
 
@@ -141,7 +141,7 @@ Use `atoms3-lite-pdm-rtsp-mic-factory.bin` for first-time browser flashing. It i
 | Sample rate | 48000 Hz | Supported PDM rates: 16000, 24000, 32000, 48000 Hz |
 | Gain | 1.0x | Start conservative, raise only after checking the meter |
 | Buffer | 1024 samples | RTP chunking is capped internally at 1024 samples |
-| High-pass filter | Off | 180 Hz cutoff when enabled |
+| High-pass filter | On | 180 Hz cutoff by default; can be disabled for baseline testing |
 | Noise filter | Off | Optional steady-noise suppressor |
 | AGC | Off | Optional final gain rider for distant birds |
 | CPU | 160 MHz | Good thermal/performance balance |
@@ -154,7 +154,7 @@ Use `atoms3-lite-pdm-rtsp-mic-factory.bin` for first-time browser flashing. It i
 The live stream path is:
 
 ```text
-PDM PCM -> stable DC normalize when needed -> optional high-pass -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC -> RTP/Web preview
+PDM PCM -> stable DC normalize when needed -> 2nd-order high-pass by default -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC -> RTP/Web preview
 ```
 
 Key points:
@@ -232,7 +232,7 @@ Return to a clean baseline:
 - Gain around `1.0x`.
 - AGC off.
 - Noise filter off.
-- High-pass off.
+- Temporarily disable high-pass if you need the cleanest raw baseline.
 - Confirm that `i2sShiftBits` is still `0`.
 
 Then re-enable features one at a time. The noise filter and AGC are useful outdoors, but they can exaggerate a weak or poorly centered signal if enabled too early.
@@ -277,10 +277,9 @@ Dependencies are declared in `platformio.ini`:
 ```ini
 lib_deps =
     tzapu/WiFiManager @ ^2.0.17
-    fastled/FastLED @ ^3.10.3
 ```
 
-The upstream `m5stack/M5Atom` dependency is intentionally not used in this fork because AtomS3 Lite LED handling is done directly with FastLED.
+The upstream `m5stack/M5Atom` dependency is intentionally not used in this fork because AtomS3 Lite LED handling is done directly through Arduino-ESP32's RGB LED/RMT helper.
 
 ## Project Layout
 
