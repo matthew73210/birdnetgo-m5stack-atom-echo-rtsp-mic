@@ -38,7 +38,7 @@ Core 1 **exclusively owns** the WiFiClient socket during streaming — Core 0 ne
 ## Audio Tuning
 
 ### Active Filters
-- **High-pass filter**: optional 2nd-order Butterworth, roughly 12 dB/octave, default OFF with a 450 Hz cutoff when enabled.
+- **High-pass filter**: optional 2nd-order Butterworth, roughly 12 dB/octave, default OFF with a 180 Hz cutoff when enabled.
 - **Adaptive noise suppressor**: envelope follower + hold-time gate. This was retuned to stop the audible tap-tap artifact that happened when gain changed too abruptly as the live dB meter fell.
 - **I2S gap concealment**: short capture stalls are bridged with de-clicked fallback audio, and the next valid block is ramped in to avoid a hard segment-edge tap.
 - **Limiter**: catches peaks before full-scale clipping.
@@ -163,7 +163,7 @@ Focus on signal conditioning:
 - Large RTSP session timeout (86400s)
 - Write failure tolerance (100 consecutive failures before disconnect)
 - Auto-recovery disabled by default (false positive prevention)
-- NTP time sync (EST timestamps)
+- NTP time sync (UTC timestamps)
 - Configurable LED mode (Off / Static / Level)
 - Blue = ready, green = streaming LED colors
 - Disconnect diagnostics (session duration, dropped packets, RSSI)

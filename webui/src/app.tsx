@@ -40,6 +40,7 @@ type AudioStatus = {
   latency_ms: number;
   hp_enable: boolean;
   hp_cutoff_hz: number;
+  hp_cutoff_max_hz: number;
   agc_enable: boolean;
   agc_multiplier: number;
   effective_gain: number;
@@ -121,6 +122,7 @@ const scaleOptions: Array<{ value: SpectrogramScale; label: string }> = [
 const paletteValues: readonly SpectrogramPalette[] = ["classic", "viridis", "fire", "ice", "gray"];
 const styleValues: readonly SpectrogramStyle[] = ["timeline", "waterfall", "contour", "bands"];
 const scaleValues: readonly SpectrogramScale[] = ["linear", "log"];
+const supportedSampleRates = ["16000", "24000", "32000", "48000"] as const;
 
 const paletteStops: Record<SpectrogramPalette, Array<[number, Rgb]>> = {
   classic: [
@@ -178,7 +180,7 @@ const emptyStatus: Status = {
   connected_rtsp_clients: 0,
   max_rtsp_clients: 2,
   rtsp_rejected_clients: 0,
-  stream_formats: "RTSP/RTP L16, WebAudio PCM, WAV PCM chunk, JSON PCM",
+  stream_formats: "RTSP/RTP L16, HTTP L16, AIFF PCM, WebAudio PCM, WAV PCM chunk, JSON PCM",
   multi_client_policy: "bounded_multi_rtsp_tcp",
   hardware_profile: "PDM input profile"
 };
@@ -194,7 +196,8 @@ const emptyAudio: AudioStatus = {
   clip_count: 0,
   latency_ms: 64,
   hp_enable: true,
-  hp_cutoff_hz: 450,
+  hp_cutoff_hz: 180,
+  hp_cutoff_max_hz: 7200,
   agc_enable: false,
   agc_multiplier: 1,
   effective_gain: 1,
@@ -247,21 +250,44 @@ async function getJson<T>(url: string): Promise<T> {
 }
 
 async function postJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { method: "POST", cache: "no-store" });
+  const response = await fetch(url, {
+    method: "POST",
+    cache: "no-store",
+    headers: {
+      "X-Requested-With": "birdnetgo-webui"
+    }
+  });
+  const body = await response.text();
+  if (!response.ok) throw new Error(body || `${response.status} ${response.statusText}`);
+  return (body ? JSON.parse(body) : {}) as T;
+}
+
+async function postForm<T>(url: string, data: Record<string, string>): Promise<T> {
+  const bodyData = new URLSearchParams();
+  for (const [key, value] of Object.entries(data)) {
+    bodyData.set(key, value);
+  }
+  const response = await fetch(url, {
+    method: "POST",
+    cache: "no-store",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+      "X-Requested-With": "birdnetgo-webui"
+    },
+    body: bodyData.toString()
+  });
   const body = await response.text();
   if (!response.ok) throw new Error(body || `${response.status} ${response.statusText}`);
   return (body ? JSON.parse(body) : {}) as T;
 }
 
 async function action(name: string) {
-  const result = await getJson<{ ok: boolean; error?: string }>(`/api/action/${encodeURIComponent(name)}`);
+  const result = await postJson<{ ok: boolean; error?: string }>(`/api/action/${encodeURIComponent(name)}`);
   if (!result.ok) throw new Error(result.error || "Action was rejected");
 }
 
 async function setValue(key: string, value: string) {
-  const result = await getJson<{ ok: boolean; error?: string }>(
-    `/api/set?key=${encodeURIComponent(key)}&value=${encodeURIComponent(value)}`
-  );
+  const result = await postForm<{ ok: boolean; error?: string }>("/api/set", { key, value });
   if (!result.ok) throw new Error(result.error || "Setting was rejected");
 }
 
@@ -660,6 +686,7 @@ function App() {
   const wifiTone = status.wifi_rssi > -67 ? "ok" : status.wifi_rssi > -75 ? "warn" : "bad";
   const heapTone = status.free_heap_kb > 96 ? "ok" : status.free_heap_kb > 72 ? "warn" : "bad";
   const tempTone = thermal.sensor_fault || thermal.latched_persist ? "bad" : thermal.current_valid && (thermal.current_c || 0) > thermal.shutdown_c - 5 ? "warn" : "ok";
+  const highpassCutoffMax = Math.max(10, audio.hp_cutoff_max_hz || 10000);
   const clientSlots = Array.from({ length: Math.max(status.max_rtsp_clients, 1) }, (_, index) => index < status.active_rtsp_clients);
   const visualBars = Array.from({ length: 22 }, (_, index) => {
     const wave = 0.42 + Math.abs(Math.sin((index + 1) * 0.74)) * 0.58;
@@ -872,6 +899,8 @@ function App() {
           <Stat label="Dropped packets" value={status.rtp_packets_dropped} />
           <div class="chips">
             <Pill>RTSP/RTP L16</Pill>
+            <Pill>HTTP L16</Pill>
+            <Pill>AIFF PCM</Pill>
             <Pill>WebAudio PCM</Pill>
             <Pill>WAV chunk</Pill>
             <Pill>JSON PCM</Pill>
@@ -883,8 +912,12 @@ function App() {
             <h2>Audio</h2>
             <Pill tone={audio.i2s_driver_ok ? "ok" : "bad"}>{audio.i2s_driver_ok ? "I2S ready" : "I2S fault"}</Pill>
           </div>
-          <Setting label="Sample rate" detail={`${audio.latency_ms.toFixed(1)} ms effective latency`}>
-            <input class={controlClass("rate")} type="number" min="8000" max="96000" step="1000" value={input("rate", "16000")} onInput={(event) => editDraft("rate", event.currentTarget.value)} />
+          <Setting label="Sample rate" detail={`${audio.latency_ms.toFixed(1)} ms effective latency • PDM-safe choices`}>
+            <select class={controlClass("rate")} value={input("rate", "48000")} onInput={(event) => editDraft("rate", event.currentTarget.value)}>
+              {supportedSampleRates.map((rate) => (
+                <option key={rate} value={rate}>{rate}</option>
+              ))}
+            </select>
             <span class="unit">Hz</span>
             {setButton("rate")}
           </Setting>
@@ -900,7 +933,7 @@ function App() {
             <span class="unit">samples</span>
             {setButton("buffer")}
           </Setting>
-          <Setting label="High-pass" detail={`${audio.hp_cutoff_hz} Hz cutoff`}>
+          <Setting label="High-pass" detail={`${audio.hp_cutoff_hz} Hz cutoff • max ${highpassCutoffMax} Hz`}>
             <select class={controlClass("hp_enable")} value={input("hp_enable", "on")} onInput={(event) => editDraft("hp_enable", event.currentTarget.value)}>
               <option value="on">ON</option>
               <option value="off">OFF</option>
@@ -908,7 +941,7 @@ function App() {
             {setButton("hp_enable")}
           </Setting>
           <Setting label="HPF cutoff">
-            <input class={controlClass("hp_cutoff")} type="number" min="10" max="10000" step="10" value={input("hp_cutoff", "450")} onInput={(event) => editDraft("hp_cutoff", event.currentTarget.value)} />
+            <input class={controlClass("hp_cutoff")} type="number" min="10" max={highpassCutoffMax} step="10" value={input("hp_cutoff", "180")} onInput={(event) => editDraft("hp_cutoff", event.currentTarget.value)} />
             <span class="unit">Hz</span>
             {setButton("hp_cutoff")}
           </Setting>
@@ -1020,9 +1053,11 @@ function App() {
             <button onClick={() => runAction("reboot")}>Reboot</button>
             <button onClick={() => runAction("factory_reset")}>Defaults</button>
           </div>
-          <p class="quiet">Two RTSP clients can play at once. Browser preview formats stay on the diagnostics ring buffer.</p>
+          <p class="quiet">Two RTSP clients can play at once. HTTP L16, AIFF, browser PCM, WAV, and JSON snapshots all read from the diagnostics ring buffer.</p>
           <div class="links">
             <a href="/streamer" target="_blank" rel="noreferrer">Browser PCM</a>
+            <a href="/api/web_audio_l16" target="_blank" rel="noreferrer">HTTP L16</a>
+            <a href="/api/web_audio_aiff" target="_blank" rel="noreferrer">AIFF Chunk</a>
             <a href="/api/web_audio_wav" target="_blank" rel="noreferrer">WAV Chunk</a>
             <a href="/api/stream_options" target="_blank" rel="noreferrer">Stream API</a>
           </div>

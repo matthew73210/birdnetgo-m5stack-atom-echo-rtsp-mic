@@ -4,13 +4,15 @@
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <esp_err.h>
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wcpp"
-#include "driver/i2s.h"
-#pragma GCC diagnostic pop
+#include "driver/i2s_common.h"
+#include "driver/i2s_pdm.h"
 #include <Preferences.h>
 #include <math.h>
+#include <time.h>
+#include <errno.h>
+#include <lwip/sockets.h>
 #include <FastLED.h>
+#include "PdmProbeResult.h"
 #include "WebUI.h"
 
 // ================== DUAL-CORE AUDIO ARCHITECTURE ==================
@@ -43,6 +45,7 @@ struct RtspSession {
     size_t streamingRtspBufPos = 0;
     uint16_t streamingInterleavedDiscard = 0;
     uint32_t consecutiveWriteFailures = 0;
+    unsigned long firstWriteFailureAt = 0;
 };
 
 static const uint8_t MAX_RTSP_CLIENTS = 2;
@@ -55,16 +58,21 @@ volatile bool audioTaskRunning = false;
 
 // Cross-core synchronization primitives
 portMUX_TYPE logMux = portMUX_INITIALIZER_UNLOCKED;  // spinlock for log ring buffer
+portMUX_TYPE hpfMux = portMUX_INITIALIZER_UNLOCKED;  // protects HPF coefficient handoff
 volatile bool stopStreamRequested = false;   // Core 0 asks Core 1 to stop
 volatile bool streamCleanupDone = false;     // Core 1 confirms cleanup complete
 SemaphoreHandle_t taskExitSemaphore = NULL;  // confirmed task exit
 volatile bool core1OwnsLED = false;          // LED ownership flag
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "3.0.0"
+#define FW_VERSION "4.1.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 static const uint16_t OTA_PORT = 3232;
+static const char SETTINGS_NAMESPACE[] = "audioPrefs";
+static const char LEGACY_SETTINGS_NAMESPACE[] = "audio";
+static const char LOG_TIMEZONE_POSIX[] = "UTC0";
+static const char LOG_TIMEZONE_LABEL[] = "UTC";
 
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
 #define DEFAULT_SAMPLE_RATE 48000  // Unit Mini PDM / BirdNET-Go preferred rate
@@ -72,10 +80,11 @@ static const uint16_t OTA_PORT = 3232;
 #define DEFAULT_BUFFER_SIZE 1024   // 64ms @ 16kHz - lower default latency while keeping WiFi headroom
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
 #define DEFAULT_NETWORK_HOSTNAME "atoms3mic"
-// High-pass filter defaults. Keep it off for the cleanest baseline; enable only
-// when outdoor rumble/wind is worse than the added thinness.
-#define DEFAULT_HPF_ENABLED false
-#define DEFAULT_HPF_CUTOFF_HZ 450
+static const uint32_t SUPPORTED_PDM_SAMPLE_RATES[] = {16000, 24000, 32000, 48000};
+// High-pass filter defaults. V4's settled PDM feed carries low-frequency/DC
+// wander, so keep HPF on and let AGC/noise suppression stay opt-in.
+#define DEFAULT_HPF_ENABLED true
+#define DEFAULT_HPF_CUTOFF_HZ 180
 
 // Thermal protection defaults
 #define DEFAULT_OVERHEAT_PROTECTION true
@@ -91,10 +100,20 @@ static const uint16_t OTA_PORT = 3232;
 #define WS2812_LED_PIN  35  // AtomS3 Lite built-in RGB LED
 
 static CRGB statusLed[1];
+static bool statusLedNeedsRefresh = true;
+static CRGB lastStatusLed = CRGB(0, 0, 0);
 
 inline void setStatusLed(const CRGB& color) {
+    if (!statusLedNeedsRefresh &&
+        lastStatusLed.r == color.r &&
+        lastStatusLed.g == color.g &&
+        lastStatusLed.b == color.b) {
+        return;
+    }
     statusLed[0] = color;
     FastLED.show();
+    lastStatusLed = color;
+    statusLedNeedsRefresh = false;
 }
 
 // -- Servers
@@ -118,15 +137,29 @@ static void updateStreamingStateFromSessions();
 static uint8_t countRtspClients();
 static uint8_t countStreamingRtspClients();
 static RtspSession* firstStreamingSession();
-static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSamples);
+static void clearAudioDiagnostics();
+static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSamples, uint8_t activeClientCount);
 static void sendRTPPacketsToActiveSessions(int16_t* audioData, int numSamples);
+static esp_err_t i2sMicRead(void* dest, size_t size, size_t* bytesRead, uint32_t timeoutMs);
 // Note: Audio buffers now allocated by Core 1 task
 
 // -- Global state
 unsigned long audioPacketsSent = 0;
 unsigned long audioPacketsDropped = 0;  // Track dropped frames
+unsigned long audioBlocksSent = 0;      // Stream cadence counter, independent of client fan-out
 unsigned long lastStatsReset = 0;
 bool rtspServerEnabled = true;
+
+bool isSupportedPdmSampleRate(uint32_t rate) {
+    for (size_t i = 0; i < (sizeof(SUPPORTED_PDM_SAMPLE_RATES) / sizeof(SUPPORTED_PDM_SAMPLE_RATES[0])); ++i) {
+        if (SUPPORTED_PDM_SAMPLE_RATES[i] == rate) return true;
+    }
+    return false;
+}
+
+static uint32_t sanitizePdmSampleRate(uint32_t rate) {
+    return isSupportedPdmSampleRate(rate) ? rate : (uint32_t)DEFAULT_SAMPLE_RATE;
+}
 
 // -- Audio parameters (runtime configurable)
 uint32_t currentSampleRate = DEFAULT_SAMPLE_RATE;
@@ -154,9 +187,16 @@ volatile int16_t i2sLastRawMax = 0;
 volatile uint16_t i2sLastRawPeakAbs = 0;
 volatile uint16_t i2sLastRawRms = 0;
 volatile uint16_t i2sLastRawZeroPct = 0;
+volatile int16_t i2sLastRawMean = 0;
+volatile uint16_t i2sLastRawSpan = 0;
 volatile bool i2sLikelyUnsignedPcm = false;
+volatile bool i2sUsingModernPdmDriver = false;
+volatile bool i2sPdmUseLeftSlot = false;
+volatile bool i2sPdmClkInverted = false;
+volatile bool i2sPdmProbeFoundSigned = false;
 volatile bool i2sDriverOk = false;
 volatile int32_t i2sLastError = ESP_OK;
+static i2s_chan_handle_t i2sRxChannel = NULL;
 volatile uint32_t audioFallbackBlockCount = 0;
 volatile uint32_t i2sLastGapMs = 0;
 volatile float audioPipelineLoadPct = 0.0f;
@@ -216,13 +256,19 @@ const float NOISE_ENV_ATTACK = 0.010f;
 const float NOISE_ENV_RELEASE = 0.0012f;
 const uint16_t NOISE_GATE_HOLD_MS = 120;
 const uint16_t PDM_UNSIGNED_MAX_CODE = 4095;
-const float PDM_UNSIGNED_MIN_MEAN = 128.0f;
-const float PDM_UNSIGNED_MAX_MEAN = 3968.0f;
-const float PDM_UNSIGNED_NORMALIZE_GAIN = 32.0f;
+const uint16_t PDM_UNSIGNED_MIN_SPAN = 64;
+const int16_t PDM_UNSIGNED_EDGE_MARGIN = 24;
+const float PDM_UNSIGNED_MIN_MEAN = 256.0f;
+const float PDM_UNSIGNED_MIN_MEAN_TO_SPAN = 4.0f;
+const float PDM_UNSIGNED_LOW_CENTER_MAX = 1536.0f;
+const float PDM_UNSIGNED_LOW_NORMALIZE_GAIN = 32.0f;
+const float PDM_UNSIGNED_HIGH_NORMALIZE_GAIN = 16.0f;
 const float PDM_UNSIGNED_DC_TRACK_SECONDS = 1.25f;
 const uint8_t PDM_UNSIGNED_CONFIDENCE_MAX = 12;
 const uint8_t PDM_UNSIGNED_CONFIDENCE_ON = 6;
 const uint8_t PDM_UNSIGNED_CONFIDENCE_OFF = 2;
+const uint16_t PDM_PROBE_SETTLE_MS = 650;
+const uint8_t PDM_PROBE_MEASURE_READS = 5;
 const char* DEVICE_TITLE = "M5 Atom RTSP Microphone";
 const char* DEVICE_INPUT_PROFILE = "PDM input profile (AtomS3 Lite + Unit Mini PDM tuned)";
 const char* FILTER_CHAIN_BASE = "PDM PCM -> stable DC normalize when needed -> 2nd-order Butterworth high-pass -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC";
@@ -288,6 +334,7 @@ uint8_t cpuFrequencyMhz = 160;          // CPU frequency (default 160 MHz — su
 // -- WiFi TX power (configurable)
 float wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
 wifi_power_t currentWifiPowerLevel = WIFI_POWER_19_5dBm;
+bool wifiTxPowerApplied = false;
 
 // -- RTSP connect/PLAY statistics
 unsigned long lastRtspClientConnectMs = 0;
@@ -368,6 +415,7 @@ static void closeRtspSession(RtspSession &session, bool stopClient) {
     session.streamingRtspBufPos = 0;
     session.streamingInterleavedDiscard = 0;
     session.consecutiveWriteFailures = 0;
+    session.firstWriteFailureAt = 0;
     updateStreamingStateFromSessions();
 }
 
@@ -413,27 +461,6 @@ static String extractRtspHeader(const String &request, const char* headerName) {
     return value;
 }
 
-static bool parseRtspClientPorts(const String &transportHeader, uint16_t &rtpPort, uint16_t &rtcpPort) {
-    int idx = transportHeader.indexOf("client_port=");
-    if (idx < 0) return false;
-    idx += 12;
-    int end = idx;
-    while (end < transportHeader.length()) {
-        char c = transportHeader[end];
-        if ((c < '0' || c > '9') && c != '-') break;
-        end++;
-    }
-    String ports = transportHeader.substring(idx, end);
-    int dash = ports.indexOf('-');
-    if (dash < 0) return false;
-    int p0 = ports.substring(0, dash).toInt();
-    int p1 = ports.substring(dash + 1).toInt();
-    if (p0 <= 0 || p0 > 65535 || p1 <= 0 || p1 > 65535) return false;
-    rtpPort = (uint16_t)p0;
-    rtcpPort = (uint16_t)p1;
-    return true;
-}
-
 // Helper: convert WiFi power enum to dBm (for logs)
 float wifiPowerLevelToDbm(wifi_power_t lvl) {
     switch (lvl) {
@@ -473,9 +500,10 @@ static wifi_power_t pickWifiPowerLevel(float dbm) {
 // Logs only when changed; can be muted with log=false
 void applyWifiTxPower(bool log = true) {
     wifi_power_t desired = pickWifiPowerLevel(wifiTxPowerDbm);
-    if (desired != currentWifiPowerLevel) {
+    if (!wifiTxPowerApplied || desired != currentWifiPowerLevel) {
         WiFi.setTxPower(desired);
         currentWifiPowerLevel = desired;
+        wifiTxPowerApplied = true;
         if (log) {
             simplePrintln("WiFi TX power set to " + String(wifiPowerLevelToDbm(currentWifiPowerLevel), 1) + " dBm");
         }
@@ -557,6 +585,22 @@ static void publishWebAudioFrame(const int16_t* samples, uint16_t count) {
     portEXIT_CRITICAL(&webAudioMux);
 }
 
+static void clearAudioDiagnostics() {
+    portENTER_CRITICAL(&webAudioMux);
+    webAudioFrameSeq = 0;
+    memset((void*)webAudioFrameSamples, 0, sizeof(webAudioFrameSamples));
+    memset((void*)webAudioSampleRate, 0, sizeof(webAudioSampleRate));
+    memset((void*)webAudioRingSeq, 0, sizeof(webAudioRingSeq));
+    memset(webAudioFrame, 0, sizeof(webAudioFrame));
+    portEXIT_CRITICAL(&webAudioMux);
+
+    memset((void*)fftBins, 0, sizeof(fftBins));
+    fftFrameSeq = 0;
+    lastPeakAbs16 = 0;
+    peakHoldAbs16 = 0;
+    peakHoldUntilMs = 0;
+}
+
 void recordTelemetrySample(float cpuLoadPct, float tempC, bool tempValid) {
     if (cpuLoadPct < 0.0f) cpuLoadPct = 0.0f;
     if (cpuLoadPct > 100.0f) cpuLoadPct = 100.0f;
@@ -573,40 +617,44 @@ void recordTelemetrySample(float cpuLoadPct, float tempC, bool tempValid) {
 
 // Recompute HPF coefficients (2nd-order Butterworth high-pass)
 void updateHighpassCoeffs() {
-    if (!highpassEnabled) {
-        hpf.reset();
-        hpfConfigSampleRate = currentSampleRate;
-        hpfConfigCutoff = highpassCutoffHz;
-        return;
+    bool enabled = highpassEnabled;
+    uint32_t sampleRate = currentSampleRate;
+    uint16_t cutoffHz = highpassCutoffHz;
+    Biquad nextHpf;
+
+    if (enabled) {
+        float fs = (float)sampleRate;
+        float fc = (float)cutoffHz;
+        if (fc < 10.0f) fc = 10.0f;
+        if (fc > fs * 0.45f) fc = fs * 0.45f; // keep reasonable
+
+        const float pi = 3.14159265358979323846f;
+        float w0 = 2.0f * pi * (fc / fs);
+        float cosw0 = cosf(w0);
+        float sinw0 = sinf(w0);
+        float Q = 0.70710678f; // Butterworth-like
+        float alpha = sinw0 / (2.0f * Q);
+
+        float b0 =  (1.0f + cosw0) * 0.5f;
+        float b1 = -(1.0f + cosw0);
+        float b2 =  (1.0f + cosw0) * 0.5f;
+        float a0 =  1.0f + alpha;
+        float a1 = -2.0f * cosw0;
+        float a2 =  1.0f - alpha;
+
+        nextHpf.b0 = b0 / a0;
+        nextHpf.b1 = b1 / a0;
+        nextHpf.b2 = b2 / a0;
+        nextHpf.a1 = a1 / a0;
+        nextHpf.a2 = a2 / a0;
+        nextHpf.reset();
     }
-    float fs = (float)currentSampleRate;
-    float fc = (float)highpassCutoffHz;
-    if (fc < 10.0f) fc = 10.0f;
-    if (fc > fs * 0.45f) fc = fs * 0.45f; // keep reasonable
 
-    const float pi = 3.14159265358979323846f;
-    float w0 = 2.0f * pi * (fc / fs);
-    float cosw0 = cosf(w0);
-    float sinw0 = sinf(w0);
-    float Q = 0.70710678f; // Butterworth-like
-    float alpha = sinw0 / (2.0f * Q);
-
-    float b0 =  (1.0f + cosw0) * 0.5f;
-    float b1 = -(1.0f + cosw0);
-    float b2 =  (1.0f + cosw0) * 0.5f;
-    float a0 =  1.0f + alpha;
-    float a1 = -2.0f * cosw0;
-    float a2 =  1.0f - alpha;
-
-    hpf.b0 = b0 / a0;
-    hpf.b1 = b1 / a0;
-    hpf.b2 = b2 / a0;
-    hpf.a1 = a1 / a0;
-    hpf.a2 = a2 / a0;
-    hpf.reset();
-
-    hpfConfigSampleRate = currentSampleRate;
-    hpfConfigCutoff = highpassCutoffHz;
+    portENTER_CRITICAL(&hpfMux);
+    hpf = nextHpf;
+    hpfConfigSampleRate = sampleRate;
+    hpfConfigCutoff = cutoffHz;
+    portEXIT_CRITICAL(&hpfMux);
 }
 
 // Uptime -> "Xd Yh Zm Ts"
@@ -641,7 +689,7 @@ static bool isTemperatureValid(float temp) {
 
 // Format current local time, fallback to uptime when no RTC/NTP time available
 static void persistOverheatNote() {
-    audioPrefs.begin("audio", false);
+    audioPrefs.begin(SETTINGS_NAMESPACE, false);
     audioPrefs.putString("ohReason", overheatLastReason);
     audioPrefs.putString("ohStamp", overheatLastTimestamp);
     audioPrefs.putFloat("ohTripC", overheatTripTemp);
@@ -738,7 +786,7 @@ void checkPerformance() {
         }
 
         uint32_t runtime = millis() - lastStatsReset;
-        uint32_t currentRate = (audioPacketsSent * 1000) / runtime;
+        uint32_t currentRate = (audioBlocksSent * 1000) / runtime;
 
         if (currentRate > maxPacketRate) maxPacketRate = currentRate;
         if (currentRate < minPacketRate) minPacketRate = currentRate;
@@ -753,6 +801,7 @@ void checkPerformance() {
                 consecutiveLowCount = 0;
                 restartI2S();
                 audioPacketsSent = 0;
+                audioBlocksSent = 0;
                 lastStatsReset = millis();
                 lastI2SReset = millis();
             }
@@ -817,36 +866,152 @@ void checkScheduledReset() {
     }
 }
 
+static bool settingsNamespaceHasData(const char* ns) {
+    Preferences prefs;
+    if (!prefs.begin(ns, true)) return false;
+    bool hasData =
+        prefs.isKey("sampleRate") ||
+        prefs.isKey("gainFactor") ||
+        prefs.isKey("bufferSize") ||
+        prefs.isKey("wifiTxDbm") ||
+        prefs.isKey("ohEnable");
+    prefs.end();
+    return hasData;
+}
+
+static void migrateLegacySettingsIfNeeded() {
+    if (settingsNamespaceHasData(SETTINGS_NAMESPACE) || !settingsNamespaceHasData(LEGACY_SETTINGS_NAMESPACE)) {
+        return;
+    }
+
+    Preferences legacyPrefs;
+    Preferences newPrefs;
+    if (!legacyPrefs.begin(LEGACY_SETTINGS_NAMESPACE, true)) return;
+    if (!newPrefs.begin(SETTINGS_NAMESPACE, false)) {
+        legacyPrefs.end();
+        return;
+    }
+
+    if (legacyPrefs.isKey("sampleRate")) newPrefs.putUInt("sampleRate", legacyPrefs.getUInt("sampleRate"));
+    if (legacyPrefs.isKey("gainFactor")) newPrefs.putFloat("gainFactor", legacyPrefs.getFloat("gainFactor"));
+    if (legacyPrefs.isKey("bufferSize")) newPrefs.putUShort("bufferSize", legacyPrefs.getUShort("bufferSize"));
+    if (legacyPrefs.isKey("shiftBits")) newPrefs.putUChar("shiftBits", legacyPrefs.getUChar("shiftBits"));
+    if (legacyPrefs.isKey("autoRecovery")) newPrefs.putBool("autoRecovery", legacyPrefs.getBool("autoRecovery"));
+    if (legacyPrefs.isKey("schedReset")) newPrefs.putBool("schedReset", legacyPrefs.getBool("schedReset"));
+    if (legacyPrefs.isKey("resetHours")) newPrefs.putUInt("resetHours", legacyPrefs.getUInt("resetHours"));
+    if (legacyPrefs.isKey("minRate")) newPrefs.putUInt("minRate", legacyPrefs.getUInt("minRate"));
+    if (legacyPrefs.isKey("checkInterval")) newPrefs.putUInt("checkInterval", legacyPrefs.getUInt("checkInterval"));
+    if (legacyPrefs.isKey("thrAuto")) newPrefs.putBool("thrAuto", legacyPrefs.getBool("thrAuto"));
+    if (legacyPrefs.isKey("cpuFreq")) newPrefs.putUChar("cpuFreq", legacyPrefs.getUChar("cpuFreq"));
+    if (legacyPrefs.isKey("wifiTxDbm")) newPrefs.putFloat("wifiTxDbm", legacyPrefs.getFloat("wifiTxDbm"));
+    if (legacyPrefs.isKey("hpEnable")) newPrefs.putBool("hpEnable", legacyPrefs.getBool("hpEnable"));
+    if (legacyPrefs.isKey("hpCutoff")) newPrefs.putUInt("hpCutoff", legacyPrefs.getUInt("hpCutoff"));
+    if (legacyPrefs.isKey("agcEnable")) newPrefs.putBool("agcEnable", legacyPrefs.getBool("agcEnable"));
+    if (legacyPrefs.isKey("noiseFilter")) newPrefs.putBool("noiseFilter", legacyPrefs.getBool("noiseFilter"));
+    if (legacyPrefs.isKey("ledMode")) newPrefs.putUChar("ledMode", legacyPrefs.getUChar("ledMode"));
+    if (legacyPrefs.isKey("ohEnable")) newPrefs.putBool("ohEnable", legacyPrefs.getBool("ohEnable"));
+    if (legacyPrefs.isKey("ohThresh")) newPrefs.putUInt("ohThresh", legacyPrefs.getUInt("ohThresh"));
+    if (legacyPrefs.isKey("ohReason")) newPrefs.putString("ohReason", legacyPrefs.getString("ohReason"));
+    if (legacyPrefs.isKey("ohStamp")) newPrefs.putString("ohStamp", legacyPrefs.getString("ohStamp"));
+    if (legacyPrefs.isKey("ohTripC")) newPrefs.putFloat("ohTripC", legacyPrefs.getFloat("ohTripC"));
+    if (legacyPrefs.isKey("ohLatched")) newPrefs.putBool("ohLatched", legacyPrefs.getBool("ohLatched"));
+
+    newPrefs.end();
+    legacyPrefs.end();
+    Serial.println("[Settings] Migrated Preferences namespace from 'audio' to 'audioPrefs'");
+}
+
+static float sanitizeBoundedFloat(float value, float fallback, float minValue, float maxValue) {
+    if (!isfinite(value)) return fallback;
+    if (value < minValue || value > maxValue) return fallback;
+    return value;
+}
+
+static uint32_t sanitizeBoundedUInt(uint32_t value, uint32_t fallback, uint32_t minValue, uint32_t maxValue) {
+    if (value < minValue || value > maxValue) return fallback;
+    return value;
+}
+
+static uint16_t sanitizeBufferSize(uint16_t value) {
+    return (value >= 256U && value <= 8192U) ? value : (uint16_t)DEFAULT_BUFFER_SIZE;
+}
+
+static uint8_t sanitizeCpuFrequencySetting(uint8_t value) {
+    switch (value) {
+        case 80:
+        case 120:
+        case 160:
+        case 240:
+            return value;
+        default:
+            return 160;
+    }
+}
+
+static float sanitizeWifiTxPowerSetting(float dbm) {
+    dbm = sanitizeBoundedFloat(dbm, DEFAULT_WIFI_TX_DBM, -1.0f, 19.5f);
+    return wifiPowerLevelToDbm(pickWifiPowerLevel(dbm));
+}
+
+uint16_t maxHighpassCutoffForSampleRate(uint32_t sampleRate) {
+    uint32_t maxCutoff = (sampleRate * 45UL) / 100UL;
+    if (maxCutoff < 10UL) maxCutoff = 10UL;
+    if (maxCutoff > 10000UL) maxCutoff = 10000UL;
+    return (uint16_t)maxCutoff;
+}
+
+uint16_t sanitizeHighpassCutoffSetting(uint16_t value, uint32_t sampleRate) {
+    uint16_t maxCutoff = maxHighpassCutoffForSampleRate(sampleRate);
+    if (value < 10U || value > maxCutoff) {
+        uint16_t fallback = DEFAULT_HPF_CUTOFF_HZ;
+        return (fallback <= maxCutoff) ? fallback : (uint16_t)maxCutoff;
+    }
+    return value;
+}
+
+static uint8_t sanitizeLedModeSetting(uint8_t value) {
+    return (value <= 2U) ? value : 1U;
+}
+
 // Load settings from flash
 void loadAudioSettings() {
-    audioPrefs.begin("audio", false);
+    migrateLegacySettingsIfNeeded();
+    audioPrefs.begin(SETTINGS_NAMESPACE, false);
     bool hasSampleRatePref = audioPrefs.isKey("sampleRate");
     bool hasGainPref = audioPrefs.isKey("gainFactor");
     bool hasBufferPref = audioPrefs.isKey("bufferSize");
     bool hasHpCutoffPref = audioPrefs.isKey("hpCutoff");
-    currentSampleRate = audioPrefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
-    currentGainFactor = audioPrefs.getFloat("gainFactor", DEFAULT_GAIN_FACTOR);
-    currentBufferSize = audioPrefs.getUShort("bufferSize", DEFAULT_BUFFER_SIZE);
+    uint32_t storedSampleRate = audioPrefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
+    currentSampleRate = sanitizePdmSampleRate(storedSampleRate);
+    currentGainFactor = sanitizeBoundedFloat(
+        audioPrefs.getFloat("gainFactor", DEFAULT_GAIN_FACTOR),
+        DEFAULT_GAIN_FACTOR,
+        0.1f,
+        100.0f
+    );
+    currentBufferSize = sanitizeBufferSize(audioPrefs.getUShort("bufferSize", DEFAULT_BUFFER_SIZE));
     // i2sShiftBits is ALWAYS 0 for PDM microphones - not configurable
     i2sShiftBits = 0;
     autoRecoveryEnabled = audioPrefs.getBool("autoRecovery", false);
     scheduledResetEnabled = audioPrefs.getBool("schedReset", false);
-    resetIntervalHours = audioPrefs.getUInt("resetHours", 24);
-    minAcceptableRate = audioPrefs.getUInt("minRate", 50);
-    performanceCheckInterval = audioPrefs.getUInt("checkInterval", 15);
+    resetIntervalHours = sanitizeBoundedUInt(audioPrefs.getUInt("resetHours", 24), 24, 1, 168);
+    minAcceptableRate = sanitizeBoundedUInt(audioPrefs.getUInt("minRate", 50), 50, 5, 200);
+    performanceCheckInterval = sanitizeBoundedUInt(audioPrefs.getUInt("checkInterval", 15), 15, 1, 60);
     autoThresholdEnabled = audioPrefs.getBool("thrAuto", true);
-    cpuFrequencyMhz = audioPrefs.getUChar("cpuFreq", 160);
-    wifiTxPowerDbm = audioPrefs.getFloat("wifiTxDbm", DEFAULT_WIFI_TX_DBM);
+    cpuFrequencyMhz = sanitizeCpuFrequencySetting(audioPrefs.getUChar("cpuFreq", 160));
+    wifiTxPowerDbm = sanitizeWifiTxPowerSetting(audioPrefs.getFloat("wifiTxDbm", DEFAULT_WIFI_TX_DBM));
     highpassEnabled = audioPrefs.getBool("hpEnable", DEFAULT_HPF_ENABLED);
-    highpassCutoffHz = (uint16_t)audioPrefs.getUInt("hpCutoff", DEFAULT_HPF_CUTOFF_HZ);
+    highpassCutoffHz = sanitizeHighpassCutoffSetting(
+        (uint16_t)audioPrefs.getUInt("hpCutoff", DEFAULT_HPF_CUTOFF_HZ),
+        currentSampleRate
+    );
     agcEnabled = audioPrefs.getBool("agcEnable", false);
     noiseFilterEnabled = audioPrefs.getBool("noiseFilter", false);
     if (!hasSampleRatePref) currentSampleRate = DEFAULT_SAMPLE_RATE;
     if (!hasGainPref) currentGainFactor = DEFAULT_GAIN_FACTOR;
     if (!hasBufferPref) currentBufferSize = DEFAULT_BUFFER_SIZE;
     if (!hasHpCutoffPref) highpassCutoffHz = DEFAULT_HPF_CUTOFF_HZ;
-    ledMode = audioPrefs.getUChar("ledMode", 1);
-    if (ledMode > 2) ledMode = 1;
+    ledMode = sanitizeLedModeSetting(audioPrefs.getUChar("ledMode", 1));
     overheatProtectionEnabled = audioPrefs.getBool("ohEnable", DEFAULT_OVERHEAT_PROTECTION);
     uint32_t ohLimit = audioPrefs.getUInt("ohThresh", DEFAULT_OVERHEAT_LIMIT_C);
     if (ohLimit < OVERHEAT_MIN_LIMIT_C) ohLimit = OVERHEAT_MIN_LIMIT_C;
@@ -858,6 +1023,11 @@ void loadAudioSettings() {
     overheatTripTemp = audioPrefs.getFloat("ohTripC", 0.0f);
     overheatLatched = audioPrefs.getBool("ohLatched", false);
     audioPrefs.end();
+
+    if (hasSampleRatePref && currentSampleRate != storedSampleRate) {
+        simplePrintln("Unsupported stored sample rate " + String(storedSampleRate) +
+                      " Hz; using " + String(currentSampleRate) + " Hz");
+    }
 
     if (autoThresholdEnabled) {
         minAcceptableRate = computeRecommendedMinRate();
@@ -879,7 +1049,7 @@ void loadAudioSettings() {
 
 // Save settings to flash
 void saveAudioSettings() {
-    audioPrefs.begin("audio", false);
+    audioPrefs.begin(SETTINGS_NAMESPACE, false);
     audioPrefs.putUInt("sampleRate", currentSampleRate);
     audioPrefs.putFloat("gainFactor", currentGainFactor);
     audioPrefs.putUShort("bufferSize", currentBufferSize);
@@ -979,10 +1149,16 @@ uint32_t computeRecommendedMinRate() {
 void resetToDefaultSettings() {
     simplePrintln("FACTORY RESET: Restoring default settings...");
 
-    // Clear persisted settings in our namespace
-    audioPrefs.begin("audio", false);
+    // Clear persisted settings in both the current and legacy namespaces.
+    audioPrefs.begin(SETTINGS_NAMESPACE, false);
     audioPrefs.clear();
     audioPrefs.end();
+
+    Preferences legacyPrefs;
+    if (legacyPrefs.begin(LEGACY_SETTINGS_NAMESPACE, false)) {
+        legacyPrefs.clear();
+        legacyPrefs.end();
+    }
 
     // Reset runtime variables to defaults
     currentSampleRate = DEFAULT_SAMPLE_RATE;
@@ -1053,7 +1229,10 @@ void restartI2S() {
     }
 
     updateStreamingStateFromSessions();
-    startAudioCaptureTask();
+    if (!startAudioCaptureTask()) {
+        simplePrintln("I2S restarted but audio task could not start");
+        return;
+    }
     if (wasStreaming) {
         simplePrintln("I2S restarted; RTSP clients should reconnect");
     } else {
@@ -1149,7 +1328,9 @@ static void setupArduinoOta() {
         }
         simplePrintln("OTA error: " + reason);
         if (i2sDriverOk) {
-            startAudioCaptureTask();
+            if (!startAudioCaptureTask()) {
+                simplePrintln("OTA recovery could not restart audio task");
+            }
         }
         rtspServerEnabled = otaPreviousRtspEnabled;
         resumeRtspServerAfterOtaFailure();
@@ -1161,23 +1342,6 @@ static void setupArduinoOta() {
     simplePrintln("OTA ready: pio run -e m5stack-atoms3-lite-ota -t upload");
     simplePrintln("OTA target: " + networkHostname + ".local:" + String(OTA_PORT));
 }
-
-// Drain any pending data from RTSP client receive buffer
-// Called on connect/disconnect events only — prevents stale data buildup
-void drainRtspReceiveBuffer(WiFiClient &client) {
-    if (!client || !client.connected()) return;
-    int drained = 0;
-    while (client.available() > 0 && drained < 4096) {
-        uint8_t buf[256];
-        int n = client.read(buf, sizeof(buf));
-        if (n <= 0) break;
-        drained += n;
-    }
-    if (drained > 0) {
-        simplePrintln("Drained " + String(drained) + " bytes from RTSP receive buffer");
-    }
-}
-
 
 static void updateFftFromBlock(const int16_t* samples, uint16_t count) {
     const int N = 128;
@@ -1238,6 +1402,7 @@ void audioCaptureTask(void* parameter) {
         if (captureBuffer) free(captureBuffer);
         if (outputBuffer) free(outputBuffer);
         audioTaskRunning = false;
+        audioCaptureTaskHandle = NULL;
         if (taskExitSemaphore != NULL) {
             xSemaphoreGive(taskExitSemaphore);
         }
@@ -1274,8 +1439,8 @@ void audioCaptureTask(void* parameter) {
     bool localPdmDcInitialized = false;
     uint8_t localUnsignedPdmConfidence = 0;
     float localPdmDc = 0.0f;
-    const TickType_t readTimeoutTicks = pdMS_TO_TICKS(max(20UL, min(200UL,
-        ((unsigned long)readBufferSamples * 1000UL) / max((uint32_t)1, currentSampleRate) + 10UL)));
+    const uint32_t readTimeoutMs = max(20UL, min(200UL,
+        ((unsigned long)readBufferSamples * 1000UL) / max((uint32_t)1, currentSampleRate) + 10UL));
 
     while (audioTaskRunning) {
         // Check if Core 0 requested us to stop streaming
@@ -1308,9 +1473,9 @@ void audioCaptureTask(void* parameter) {
         }
 
         // Read from I2S with a cadence-aware timeout so concealment can kick in
-        esp_err_t result = i2s_read(I2S_NUM_0, captureBuffer,
-                                    readBufferSamples * sizeof(int16_t),
-                                    &bytesRead, readTimeoutTicks);
+        esp_err_t result = i2sMicRead(captureBuffer,
+                                      readBufferSamples * sizeof(int16_t),
+                                      &bytesRead, readTimeoutMs);
         unsigned long processStartUs = micros();
 
         if (result != ESP_OK || bytesRead == 0) {
@@ -1339,6 +1504,7 @@ void audioCaptureTask(void* parameter) {
 
             if (streamActive) {
                 sendRTPPacketsToActiveSessions(outputBuffer, chunkSamples);
+                audioBlocksSent++;
                 packetCount++;
 
                 float blockMs = (1000.0f * (float)chunkSamples) / max((float)currentSampleRate, 1.0f);
@@ -1359,12 +1525,14 @@ void audioCaptureTask(void* parameter) {
 
         // Update HPF coefficients if changed
         if (localHighpassEnabled != highpassEnabled ||
-            localHpfConfigSampleRate != currentSampleRate ||
-            localHpfConfigCutoff != highpassCutoffHz) {
+            localHpfConfigSampleRate != hpfConfigSampleRate ||
+            localHpfConfigCutoff != hpfConfigCutoff) {
+            portENTER_CRITICAL(&hpfMux);
             localHpf = hpf;
-            localHpfConfigSampleRate = currentSampleRate;
-            localHpfConfigCutoff = highpassCutoffHz;
+            localHpfConfigSampleRate = hpfConfigSampleRate;
+            localHpfConfigCutoff = hpfConfigCutoff;
             localHighpassEnabled = highpassEnabled;
+            portEXIT_CRITICAL(&hpfMux);
         }
 
         // Determine effective gain (manual * AGC if enabled)
@@ -1403,11 +1571,14 @@ void audioCaptureTask(void* parameter) {
         }
 
         float rawMean = (samplesRead > 0) ? (rawSum / (float)samplesRead) : 0.0f;
+        int32_t rawSpan = (rawMax >= rawMin) ? ((int32_t)rawMax - (int32_t)rawMin) : 0;
         bool unsignedCandidate = (samplesRead > 0 &&
                                   rawMin >= 0 &&
                                   rawMax <= (int16_t)PDM_UNSIGNED_MAX_CODE &&
+                                  rawSpan >= (int32_t)PDM_UNSIGNED_MIN_SPAN &&
+                                  rawMin >= PDM_UNSIGNED_EDGE_MARGIN &&
                                   rawMean >= PDM_UNSIGNED_MIN_MEAN &&
-                                  rawMean <= PDM_UNSIGNED_MAX_MEAN);
+                                  rawMean >= ((float)rawSpan * PDM_UNSIGNED_MIN_MEAN_TO_SPAN));
         if (unsignedCandidate) {
             if (localUnsignedPdmConfidence < PDM_UNSIGNED_CONFIDENCE_MAX) {
                 localUnsignedPdmConfidence++;
@@ -1445,8 +1616,14 @@ void audioCaptureTask(void* parameter) {
 
             float sample;
             if (localUnsignedPdm) {
+                // Keep unsigned-PDM scaling fixed per center band so weak all-positive
+                // blocks do not get over-amplified into gritty/raspy audio.
+                float unsignedNormalizeGain =
+                    (localPdmDc < PDM_UNSIGNED_LOW_CENTER_MAX)
+                        ? PDM_UNSIGNED_LOW_NORMALIZE_GAIN
+                        : PDM_UNSIGNED_HIGH_NORMALIZE_GAIN;
                 localPdmDc += ((float)raw - localPdmDc) * pdmDcAlpha;
-                sample = ((float)raw - localPdmDc) * PDM_UNSIGNED_NORMALIZE_GAIN;
+                sample = ((float)raw - localPdmDc) * unsignedNormalizeGain;
             } else {
                 sample = (float)(raw >> i2sShiftBits);
             }
@@ -1543,6 +1720,10 @@ void audioCaptureTask(void* parameter) {
         i2sLastRawMin = rawMin;
         i2sLastRawMax = rawMax;
         i2sLastRawPeakAbs = rawPeakAbs;
+        i2sLastRawSpan = (rawSpan > 0) ? (uint16_t)rawSpan : 0;
+        if (rawMean > 32767.0f) rawMean = 32767.0f;
+        if (rawMean < -32768.0f) rawMean = -32768.0f;
+        i2sLastRawMean = (int16_t)rawMean;
         if (samplesRead > 0) {
             float rawRms = sqrtf(rawSumSquares / (float)samplesRead);
             if (rawRms > 65535.0f) rawRms = 65535.0f;
@@ -1633,6 +1814,7 @@ void audioCaptureTask(void* parameter) {
         if (streamActive) {
             // Send RTP packet
             sendRTPPacketsToActiveSessions(outputBuffer, samplesRead);
+            audioBlocksSent++;
             packetCount++;
         }
 
@@ -1661,16 +1843,17 @@ void audioCaptureTask(void* parameter) {
     free(outputBuffer);
     core1OwnsLED = false;
     audioTaskRunning = false;
+    audioCaptureTaskHandle = NULL;
     Serial.println("[Core1] Audio pipeline task stopped");
     xSemaphoreGive(taskExitSemaphore);
     vTaskDelete(NULL);
 }
 
 // Start audio pipeline task on Core 1 (or reuse if already running)
-void startAudioCaptureTask() {
+bool startAudioCaptureTask() {
     if (audioCaptureTaskHandle != NULL) {
         // Task already alive — it will pick up via isStreaming/streamClient
-        return;
+        return true;
     }
 
     BaseType_t result = xTaskCreatePinnedToCore(
@@ -1685,7 +1868,11 @@ void startAudioCaptureTask() {
 
     if (result != pdPASS) {
         simplePrintln("[Core1] FATAL: Failed to create audio pipeline task!");
+        audioCaptureTaskHandle = NULL;
+        audioTaskRunning = false;
+        return false;
     }
+    return true;
 }
 
 // Stop audio pipeline task with confirmed exit via semaphore
@@ -1707,6 +1894,7 @@ void stopAudioCaptureTask() {
             }
         }
         updateStreamingStateFromSessions();
+        clearAudioDiagnostics();
     }
 }
 
@@ -1749,7 +1937,9 @@ bool requestStreamStop(const char* reason) {
             streamCleanupDone = false;
             core1OwnsLED = false;
             if (hadAudioTask && i2sDriverOk) {
-                startAudioCaptureTask();
+                if (!startAudioCaptureTask()) {
+                    Serial.printf("[Core0] WARNING: Audio task restart failed after cleanup timeout: %s\n", reason);
+                }
             }
         } else {
             Serial.printf("[Core0] WARNING: Audio task still running after forced stop attempt: %s\n", reason);
@@ -1758,95 +1948,314 @@ bool requestStreamStop(const char* reason) {
     }
 }
 
-// I2S setup for AtomS3 Lite + Unit Mini PDM (PDM microphone mode)
+static esp_err_t i2sMicRead(void* dest, size_t size, size_t* bytesRead, uint32_t timeoutMs) {
+    if (!i2sRxChannel) {
+        if (bytesRead) *bytesRead = 0;
+        return ESP_ERR_INVALID_STATE;
+    }
+    return i2s_channel_read(i2sRxChannel, dest, size, bytesRead, timeoutMs);
+}
+
+// I2S setup for AtomS3 Lite + Unit Mini PDM using the ESP-IDF 5 PDM RX channel driver.
+static void shutdownModernI2sDriver() {
+    if (!i2sRxChannel) {
+        return;
+    }
+
+    esp_err_t err = i2s_channel_disable(i2sRxChannel);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        simplePrintln("WARNING: I2S channel disable returned " + String(esp_err_to_name(err)));
+    }
+
+    err = i2s_del_channel(i2sRxChannel);
+    if (err != ESP_OK) {
+        simplePrintln("WARNING: I2S channel delete returned " + String(esp_err_to_name(err)));
+    }
+    i2sRxChannel = NULL;
+}
+
+static i2s_pdm_slot_mask_t pdmLine0SlotMask(bool useLeftSlot) {
+#if SOC_I2S_PDM_MAX_RX_LINES > 1
+    return useLeftSlot ? I2S_PDM_RX_LINE0_SLOT_LEFT : I2S_PDM_RX_LINE0_SLOT_RIGHT;
+#else
+    return useLeftSlot ? I2S_PDM_SLOT_LEFT : I2S_PDM_SLOT_RIGHT;
+#endif
+}
+
+static bool setupModernPdmDriverCandidate(uint16_t dmaBufLen, uint8_t dmaBufCount,
+                                          bool useLeftSlot, bool clkInvert,
+                                          bool verboseLogs) {
+    shutdownModernI2sDriver();
+
+    i2s_chan_config_t chanConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chanConfig.dma_desc_num = dmaBufCount;
+    chanConfig.dma_frame_num = dmaBufLen;
+
+    esp_err_t err = i2s_new_channel(&chanConfig, NULL, &i2sRxChannel);
+    if (err != ESP_OK) {
+        i2sLastError = err;
+        if (verboseLogs) {
+            simplePrintln("ERROR: I2S new_channel failed: " + String(esp_err_to_name(err)));
+        }
+        i2sRxChannel = NULL;
+        return false;
+    }
+
+    i2s_pdm_rx_config_t pdmConfig = {
+        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(currentSampleRate),
+        .slot_cfg = I2S_PDM_RX_SLOT_PCM_FMT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {}
+    };
+    pdmConfig.slot_cfg.slot_mask = pdmLine0SlotMask(useLeftSlot);
+#if SOC_I2S_SUPPORTS_PDM_RX_HP_FILTER
+    // Keep the driver capture path honest; firmware DSP owns DC removal / HPF.
+    pdmConfig.slot_cfg.hp_en = false;
+    pdmConfig.slot_cfg.hp_cut_off_freq_hz = 35.5f;
+    pdmConfig.slot_cfg.amplify_num = 1;
+#endif
+    pdmConfig.gpio_cfg.clk = (gpio_num_t)I2S_CLK_PIN;
+#if SOC_I2S_PDM_MAX_RX_LINES > 1
+    for (uint8_t i = 0; i < SOC_I2S_PDM_MAX_RX_LINES; ++i) {
+        pdmConfig.gpio_cfg.dins[i] = I2S_GPIO_UNUSED;
+    }
+    pdmConfig.gpio_cfg.dins[0] = (gpio_num_t)I2S_DATA_IN_PIN;
+#else
+    pdmConfig.gpio_cfg.din = (gpio_num_t)I2S_DATA_IN_PIN;
+#endif
+    pdmConfig.gpio_cfg.invert_flags.clk_inv = clkInvert ? 1 : 0;
+
+    err = i2s_channel_init_pdm_rx_mode(i2sRxChannel, &pdmConfig);
+    if (err != ESP_OK) {
+        i2sLastError = err;
+        if (verboseLogs) {
+            simplePrintln("ERROR: I2S PDM RX init failed: " + String(esp_err_to_name(err)));
+        }
+        shutdownModernI2sDriver();
+        return false;
+    }
+
+    err = i2s_channel_enable(i2sRxChannel);
+    if (err != ESP_OK) {
+        i2sLastError = err;
+        if (verboseLogs) {
+            simplePrintln("ERROR: I2S channel enable failed: " + String(esp_err_to_name(err)));
+        }
+        shutdownModernI2sDriver();
+        return false;
+    }
+
+    i2sLastError = ESP_OK;
+    return true;
+}
+
+static bool isBetterPdmCandidate(const PdmProbeResult& candidate, const PdmProbeResult& best) {
+    if (!candidate.valid) return false;
+    if (!best.valid) return true;
+    if (candidate.spansZero != best.spansZero) return candidate.spansZero;
+
+    float candidateDcRatio = fabsf((float)candidate.rawMean) / max(1.0f, (float)candidate.rawSpan);
+    float bestDcRatio = fabsf((float)best.rawMean) / max(1.0f, (float)best.rawSpan);
+    if (fabsf(candidateDcRatio - bestDcRatio) > 0.20f) return candidateDcRatio < bestDcRatio;
+    if (candidate.rawSpan != best.rawSpan) return candidate.rawSpan > best.rawSpan;
+    if (candidate.rawPeakAbs != best.rawPeakAbs) return candidate.rawPeakAbs > best.rawPeakAbs;
+    if (candidate.useLeftSlot != best.useLeftSlot) return candidate.useLeftSlot;
+    if (candidate.clkInvert != best.clkInvert) return !candidate.clkInvert;
+    return false;
+}
+
+static PdmProbeResult probeModernPdmCandidate(uint16_t dmaBufLen, uint8_t dmaBufCount,
+                                              bool useLeftSlot, bool clkInvert,
+                                              int16_t* probeBuffer, uint16_t probeSamples) {
+    PdmProbeResult result;
+    result.useLeftSlot = useLeftSlot;
+    result.clkInvert = clkInvert;
+
+    if (!probeBuffer || probeSamples == 0) {
+        return result;
+    }
+    if (!setupModernPdmDriverCandidate(dmaBufLen, dmaBufCount, useLeftSlot, clkInvert, false)) {
+        simplePrintln("Modern PDM probe " + String(useLeftSlot ? "left" : "right") +
+                      (clkInvert ? " / clk inverted" : " / normal clock") +
+                      " setup failed: " + String(esp_err_to_name((esp_err_t)i2sLastError)));
+        return result;
+    }
+
+    size_t bytesRead = 0;
+    unsigned long settleUntil = millis() + PDM_PROBE_SETTLE_MS;
+    do {
+        (void)i2sMicRead(probeBuffer, probeSamples * sizeof(int16_t), &bytesRead, 80);
+    } while (millis() < settleUntil);
+
+    int16_t rawMin = 32767;
+    int16_t rawMax = -32768;
+    uint32_t rawPeak = 0;
+    int64_t rawSum = 0;
+    uint32_t totalSamples = 0;
+
+    for (uint8_t pass = 0; pass < PDM_PROBE_MEASURE_READS; ++pass) {
+        esp_err_t err = i2sMicRead(probeBuffer, probeSamples * sizeof(int16_t), &bytesRead, 80);
+        if (err != ESP_OK || bytesRead == 0) {
+            continue;
+        }
+
+        uint16_t samples = (uint16_t)(bytesRead / sizeof(int16_t));
+        for (uint16_t i = 0; i < samples; ++i) {
+            int16_t raw = probeBuffer[i];
+            if (raw < rawMin) rawMin = raw;
+            if (raw > rawMax) rawMax = raw;
+            uint32_t absRaw = (uint32_t)abs((int)raw);
+            if (absRaw > rawPeak) rawPeak = absRaw;
+            rawSum += raw;
+        }
+        totalSamples += samples;
+    }
+
+    if (totalSamples == 0) {
+        simplePrintln("Modern PDM probe " + String(useLeftSlot ? "left" : "right") +
+                      (clkInvert ? " / clk inverted" : " / normal clock") +
+                      " yielded no audio blocks");
+        return result;
+    }
+
+    result.valid = true;
+    result.rawMin = rawMin;
+    result.rawMax = rawMax;
+    result.rawPeakAbs = (uint16_t)min<uint32_t>(rawPeak, 32767U);
+    result.rawMean = (int16_t)lroundf((float)rawSum / (float)totalSamples);
+    result.rawSpan = (rawMax >= rawMin) ? (uint16_t)((int32_t)rawMax - (int32_t)rawMin) : 0;
+    result.spansZero = (rawMin < -32 && rawMax > 32);
+    simplePrintln("Modern PDM probe " + String(useLeftSlot ? "left" : "right") +
+                  (clkInvert ? " / clk inverted" : " / normal clock") +
+                  ": mean " + String((int32_t)result.rawMean) +
+                  ", span " + String((uint32_t)result.rawSpan) +
+                  ", peak " + String((uint32_t)result.rawPeakAbs) +
+                  (result.spansZero ? ", signed" : ", offset"));
+    return result;
+}
+
+static bool setupModernPdmDriver(uint16_t dmaBufLen, uint8_t dmaBufCount) {
+    uint16_t probeSamples = computeI2sReadBufferSamples();
+    if (probeSamples < 64) {
+        probeSamples = 64;
+    }
+
+    int16_t* probeBuffer = (int16_t*)malloc(probeSamples * sizeof(int16_t));
+    if (!probeBuffer) {
+        simplePrintln("Modern PDM probe could not allocate scratch buffer; using right-slot normal-clock fallback");
+        if (!setupModernPdmDriverCandidate(dmaBufLen, dmaBufCount, false, false, true)) {
+            return false;
+        }
+        i2sPdmUseLeftSlot = false;
+        i2sPdmClkInverted = false;
+        i2sPdmProbeFoundSigned = false;
+    } else {
+        PdmProbeResult best;
+        const bool slotOptions[] = {true, false};
+        const bool clockOptions[] = {false, true};
+        for (uint8_t slot = 0; slot < 2; ++slot) {
+            for (uint8_t clock = 0; clock < 2; ++clock) {
+                PdmProbeResult probe = probeModernPdmCandidate(dmaBufLen, dmaBufCount,
+                                                               slotOptions[slot],
+                                                               clockOptions[clock],
+                                                               probeBuffer,
+                                                               probeSamples);
+                if (isBetterPdmCandidate(probe, best)) {
+                    best = probe;
+                }
+            }
+        }
+        free(probeBuffer);
+
+        bool useLeftSlot = best.valid ? best.useLeftSlot : false;
+        bool clkInvert = best.valid ? best.clkInvert : false;
+        if (!best.valid) {
+            simplePrintln("Modern PDM probe did not find a clear candidate; using right-slot normal-clock fallback");
+        }
+        if (!setupModernPdmDriverCandidate(dmaBufLen, dmaBufCount, useLeftSlot, clkInvert, true)) {
+            return false;
+        }
+        i2sPdmUseLeftSlot = useLeftSlot;
+        i2sPdmClkInverted = clkInvert;
+        i2sPdmProbeFoundSigned = best.valid && best.spansZero;
+    }
+
+    i2sUsingModernPdmDriver = true;
+    i2sDriverOk = true;
+    i2sLastError = ESP_OK;
+    simplePrintln("I2S ready (modern ESP-IDF PDM RX): " + String(currentSampleRate) + "Hz, gain " +
+                  String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
+                  " (chunk " + String(effectiveAudioChunkSize()) + ")" +
+                  ", dma " + String(dmaBufCount) + "x" + String(dmaBufLen) +
+                  ", read " + String(computeI2sReadBufferSamples()) +
+                  ", slot " + String(i2sPdmUseLeftSlot ? "left" : "right") +
+                  (i2sPdmClkInverted ? ", clk inverted" : ", normal clock") +
+                  ", driver HPF off" +
+                  (i2sPdmProbeFoundSigned ? ", signed PCM" : ", unsigned fallback armed") +
+                  ", shiftBits " + String(i2sShiftBits));
+    return true;
+}
+
 void setup_i2s_driver() {
     i2sDriverOk = false;
     i2sLastError = ESP_OK;
-
-    esp_err_t err = i2s_driver_uninstall(I2S_NUM_0);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        simplePrintln("WARNING: I2S uninstall returned " + String(esp_err_to_name(err)));
-    }
+    i2sLikelyUnsignedPcm = false;
+    i2sUsingModernPdmDriver = false;
+    i2sPdmUseLeftSlot = false;
+    i2sPdmClkInverted = false;
+    i2sPdmProbeFoundSigned = false;
 
     const uint16_t dma_buf_len = computeI2sDmaBufferLen();
     const uint8_t dma_buf_count = computeI2sDmaBufferCount();
+    shutdownModernI2sDriver();
 
-    i2s_config_t i2s_config = {
-        // PDM mode for Unit Mini PDM microphone
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
-        .sample_rate = currentSampleRate,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,  // Match original demo exactly
-        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,   // Match M5 reference PDM example
-#if ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 1, 0)
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-#else
-        .communication_format = I2S_COMM_FORMAT_I2S,
-#endif
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = dma_buf_count,
-        .dma_buf_len = dma_buf_len,
-        .use_apll = false,
-        .tx_desc_auto_clear = false,
-        .fixed_mclk = 0
-    };
-
-    i2s_pin_config_t pin_config = {
-#if (ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 3, 0))
-        .mck_io_num = I2S_PIN_NO_CHANGE,
-#endif
-        .bck_io_num = I2S_PIN_NO_CHANGE,
-        .ws_io_num = I2S_CLK_PIN,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = I2S_DATA_IN_PIN
-    };
-
-    err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-    if (err != ESP_OK) {
-        i2sLastError = err;
-        simplePrintln("ERROR: I2S driver_install failed: " + String(esp_err_to_name(err)));
-        return;
-    }
-
-    err = i2s_set_pin(I2S_NUM_0, &pin_config);
-    if (err != ESP_OK) {
-        i2sLastError = err;
-        simplePrintln("ERROR: I2S set_pin failed: " + String(esp_err_to_name(err)));
-        i2s_driver_uninstall(I2S_NUM_0);
-        return;
-    }
-
-    err = i2s_set_clk(I2S_NUM_0, currentSampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
-    if (err != ESP_OK) {
-        i2sLastError = err;
-        simplePrintln("ERROR: I2S set_clk failed: " + String(esp_err_to_name(err)));
-        i2s_driver_uninstall(I2S_NUM_0);
-        return;
-    }
-
-    i2sDriverOk = true;
-    i2sLastError = ESP_OK;
-    simplePrintln("I2S ready (PDM mode): " + String(currentSampleRate) + "Hz, gain " +
-                  String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
-                  " (chunk " + String(effectiveAudioChunkSize()) + ")" +
-                  ", dma " + String(dma_buf_count) + "x" + String(dma_buf_len) +
-                  ", read " + String(computeI2sReadBufferSamples()) +
-                  ", shiftBits " + String(i2sShiftBits));
+    (void)setupModernPdmDriver(dma_buf_len, dma_buf_count);
 }
 
 static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len, unsigned long timeoutMs) {
+    if (!client.connected()) return false;
+    int fd = client.fd();
+    if (fd < 0) return false;
+
     size_t off = 0;
-    unsigned long startTime = millis();
+    unsigned long deadline = millis() + timeoutMs;
 
     while (off < len) {
-        // Check timeout to prevent blocking Core 1
-        if (millis() - startTime > timeoutMs) {
-            // Drop frame if WiFi is too slow (normal with poor signal)
+        unsigned long now = millis();
+        if ((long)(deadline - now) <= 0) {
             return false;
         }
 
-        int w = client.write(data + off, len - off);
-        if (w <= 0) return false;
-        off += (size_t)w;
+        fd_set writeSet;
+        FD_ZERO(&writeSet);
+        FD_SET(fd, &writeSet);
+
+        unsigned long remainingMs = deadline - now;
+        unsigned long waitMs = min(remainingMs, 5UL);
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = (suseconds_t)(waitMs * 1000UL);
+
+        int ready = select(fd + 1, NULL, &writeSet, NULL, &tv);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (ready == 0 || !FD_ISSET(fd, &writeSet)) {
+            continue;
+        }
+
+        ssize_t sent = send(fd, data + off, len - off, MSG_DONTWAIT);
+        if (sent > 0) {
+            off += (size_t)sent;
+            continue;
+        }
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            continue;
+        }
+        if (sent < 0) {
+            client.stop();
+        }
+        return false;
     }
     return true;
 }
@@ -1984,9 +2393,10 @@ static void pollStreamingRtspCommands(RtspSession &session) {
     }
 }
 
-static const uint32_t MAX_WRITE_FAILURES = 100;  // Allow ~5s of failures before disconnect
+static const uint32_t MAX_WRITE_FAILURES = 48;
+static const uint32_t MAX_WRITE_FAILURE_MS = 1200;
 
-static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSamples) {
+static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSamples, uint8_t activeClientCount) {
     WiFiClient &client = session.client;
     if (!client.connected()) {
         // Client disconnected — Core 1 owns the socket, close it
@@ -2000,41 +2410,39 @@ static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSampl
         const int packetSamples = min(maxSamplesPerPacket, numSamples - offsetSamples);
         const uint16_t payloadSize = (uint16_t)(packetSamples * (int)sizeof(int16_t));
         const uint16_t packetSize = (uint16_t)(12 + payloadSize);
-        const unsigned long packetWindowMs = max(40UL, min(140UL, (unsigned long)(((uint32_t)packetSamples * 1000UL) / max((uint32_t)1, currentSampleRate)) * 2UL));
-        uint8_t packetBuffer[12 + (1024 * sizeof(int16_t))];
+        const unsigned long blockMs = max(1UL, (unsigned long)(((uint32_t)packetSamples * 1000UL) / max((uint32_t)1, currentSampleRate)));
+        const unsigned long packetWindowMs = max(6UL, min(18UL, blockMs / max((uint8_t)1, activeClientCount)));
+        uint8_t packetBuffer[4 + 12 + (1024 * sizeof(int16_t))];
 
-        // RTP header (12 bytes) + network-order PCM payload in one contiguous buffer.
-        packetBuffer[0] = 0x80;      // V=2, P=0, X=0, CC=0
-        packetBuffer[1] = 96;        // M=0, PT=96 (dynamic)
-        packetBuffer[2] = (uint8_t)((session.rtpSequence >> 8) & 0xFF);
-        packetBuffer[3] = (uint8_t)(session.rtpSequence & 0xFF);
-        packetBuffer[4] = (uint8_t)((session.rtpTimestamp >> 24) & 0xFF);
-        packetBuffer[5] = (uint8_t)((session.rtpTimestamp >> 16) & 0xFF);
-        packetBuffer[6] = (uint8_t)((session.rtpTimestamp >> 8) & 0xFF);
-        packetBuffer[7] = (uint8_t)(session.rtpTimestamp & 0xFF);
-        packetBuffer[8]  = (uint8_t)((session.rtpSSRC >> 24) & 0xFF);
-        packetBuffer[9]  = (uint8_t)((session.rtpSSRC >> 16) & 0xFF);
-        packetBuffer[10] = (uint8_t)((session.rtpSSRC >> 8) & 0xFF);
-        packetBuffer[11] = (uint8_t)(session.rtpSSRC & 0xFF);
+        // RTSP interleaved header + RTP header + network-order PCM payload.
+        packetBuffer[0] = 0x24;
+        packetBuffer[1] = 0x00;
+        packetBuffer[2] = (uint8_t)((packetSize >> 8) & 0xFF);
+        packetBuffer[3] = (uint8_t)(packetSize & 0xFF);
+        uint8_t* rtp = packetBuffer + 4;
+        rtp[0] = 0x80;      // V=2, P=0, X=0, CC=0
+        rtp[1] = 96;        // M=0, PT=96 (dynamic)
+        rtp[2] = (uint8_t)((session.rtpSequence >> 8) & 0xFF);
+        rtp[3] = (uint8_t)(session.rtpSequence & 0xFF);
+        rtp[4] = (uint8_t)((session.rtpTimestamp >> 24) & 0xFF);
+        rtp[5] = (uint8_t)((session.rtpTimestamp >> 16) & 0xFF);
+        rtp[6] = (uint8_t)((session.rtpTimestamp >> 8) & 0xFF);
+        rtp[7] = (uint8_t)(session.rtpTimestamp & 0xFF);
+        rtp[8]  = (uint8_t)((session.rtpSSRC >> 24) & 0xFF);
+        rtp[9]  = (uint8_t)((session.rtpSSRC >> 16) & 0xFF);
+        rtp[10] = (uint8_t)((session.rtpSSRC >> 8) & 0xFF);
+        rtp[11] = (uint8_t)(session.rtpSSRC & 0xFF);
 
         const int16_t* packetAudio = audioData + offsetSamples;
-        // Host->network: 16-bit PCM L16 big-endian payload immediately after the header.
         for (int i = 0; i < packetSamples; ++i) {
             uint16_t s = (uint16_t)packetAudio[i];
-            packetBuffer[12 + (i * 2)] = (uint8_t)((s >> 8) & 0xFF);
-            packetBuffer[12 + (i * 2) + 1] = (uint8_t)(s & 0xFF);
+            rtp[12 + (i * 2)] = (uint8_t)((s >> 8) & 0xFF);
+            rtp[12 + (i * 2) + 1] = (uint8_t)(s & 0xFF);
         }
 
         bool success = false;
         if (session.transport == RTSP_TRANSPORT_TCP_INTERLEAVED) {
-            // RTSP interleaved header: '$' 0x24, channel 0, length
-            uint8_t inter[4];
-            inter[0] = 0x24;
-            inter[1] = 0x00;
-            inter[2] = (uint8_t)((packetSize >> 8) & 0xFF);
-            inter[3] = (uint8_t)(packetSize & 0xFF);
-            success = writeAll(client, inter, sizeof(inter), packetWindowMs) &&
-                      writeAll(client, packetBuffer, packetSize, packetWindowMs);
+            success = writeAll(client, packetBuffer, (size_t)packetSize + 4U, packetWindowMs);
         }
 
         if (success) {
@@ -2042,15 +2450,22 @@ static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSampl
             session.rtpTimestamp += (uint32_t)packetSamples;
             audioPacketsSent++;
             session.consecutiveWriteFailures = 0;  // Reset on success
+            session.firstWriteFailureAt = 0;
             offsetSamples += packetSamples;
         } else {
             audioPacketsDropped++;
             session.consecutiveWriteFailures++;
+            if (session.firstWriteFailureAt == 0) {
+                session.firstWriteFailureAt = millis();
+            }
 
-            if (session.consecutiveWriteFailures >= MAX_WRITE_FAILURES) {
+            if (session.consecutiveWriteFailures >= MAX_WRITE_FAILURES ||
+                (millis() - session.firstWriteFailureAt) >= MAX_WRITE_FAILURE_MS) {
                 // Sustained failure — Core 1 owns the socket, close it
-                Serial.printf("[Core1] %u consecutive write failures, disconnecting %s\n",
-                              session.consecutiveWriteFailures, session.remoteAddr.c_str());
+                Serial.printf("[Core1] write failures (%u over %lu ms), disconnecting %s\n",
+                              session.consecutiveWriteFailures,
+                              millis() - session.firstWriteFailureAt,
+                              session.remoteAddr.c_str());
                 closeRtspSession(session, true);
             }
             return;
@@ -2059,9 +2474,10 @@ static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSampl
 }
 
 static void sendRTPPacketsToActiveSessions(int16_t* audioData, int numSamples) {
+    uint8_t activeClientCount = countStreamingRtspClients();
     for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
         if (rtspSessions[i].occupied && rtspSessions[i].streaming) {
-            sendRTPPacket(rtspSessions[i], audioData, numSamples);
+            sendRTPPacket(rtspSessions[i], audioData, numSamples, activeClientCount);
         }
     }
 }
@@ -2148,6 +2564,14 @@ void handleRTSPCommand(RtspSession &session, String request) {
         simplePrintln("RTSP SETUP using TCP interleaved transport for " + session.remoteAddr);
 
     } else if (request.startsWith("PLAY")) {
+        if (!session.setupDone) {
+            client.print("RTSP/1.0 455 Method Not Valid in This State\r\n");
+            client.print("CSeq: " + cseq + "\r\n");
+            client.print("Connection: keep-alive\r\n\r\n");
+            simplePrintln("PLAY rejected: SETUP required before PLAY for " + session.remoteAddr);
+            return;
+        }
+
         if (!i2sDriverOk) {
             client.print("RTSP/1.0 503 Service Unavailable\r\n");
             client.print("CSeq: " + cseq + "\r\n");
@@ -2158,14 +2582,30 @@ void handleRTSPCommand(RtspSession &session, String request) {
             return;
         }
 
+        bool hadActiveStreams = (countStreamingRtspClients() > 0);
         session.rtpSequence = 0;
         session.rtpTimestamp = 0;
         session.consecutiveWriteFailures = 0;
-        lastStatsReset = millis();
+        session.firstWriteFailureAt = 0;
+        if (!hadActiveStreams) {
+            audioPacketsSent = 0;
+            audioPacketsDropped = 0;
+            audioBlocksSent = 0;
+            lastStatsReset = millis();
+        }
+        if (audioCaptureTaskHandle == NULL && !startAudioCaptureTask()) {
+            client.print("RTSP/1.0 503 Service Unavailable\r\n");
+            client.print("CSeq: " + cseq + "\r\n");
+            client.print("Connection: close\r\n\r\n");
+            simplePrintln("PLAY rejected: audio pipeline task could not start");
+            delay(5);
+            closeRtspSession(session, true);
+            return;
+        }
         lastRtspPlayMs = millis();
         rtspPlayCount++;
 
-        // Send PLAY response FIRST (still on Core 0, Core 1 not started yet)
+        // Send PLAY response only after the Core 1 audio task is available.
         String playUrl = "rtsp://" + WiFi.localIP().toString() + ":8554/audio/track1";
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
@@ -2182,9 +2622,6 @@ void handleRTSPCommand(RtspSession &session, String request) {
         session.streaming = true;
         session.playStartedAt = millis();
         updateStreamingStateFromSessions();
-
-        // Start audio capture task
-        startAudioCaptureTask();
 
         // Core 1 now owns LED during streaming
         simplePrintln("STREAMING STARTED for " + session.remoteAddr + " via " +
@@ -2241,6 +2678,12 @@ void processRTSP(RtspSession &session) {
         char* endOfHeader = strstr((char*)session.parseBuffer, "\r\n\r\n");
         if (endOfHeader != nullptr) {
             int headerLen = (endOfHeader - (char*)session.parseBuffer) + 4;
+            uint16_t bodyBytes = parseRtspContentLengthValue((char*)session.parseBuffer);
+            int totalMessageLen = headerLen + (int)bodyBytes;
+            if (session.parseBufferPos < totalMessageLen) {
+                return;
+            }
+
             *endOfHeader = '\0';
             String request = String((char*)session.parseBuffer);
 
@@ -2249,11 +2692,12 @@ void processRTSP(RtspSession &session) {
                 return;
             }
 
-            int remaining = session.parseBufferPos - headerLen;
+            int remaining = session.parseBufferPos - totalMessageLen;
             if (remaining > 0) {
-                memmove(session.parseBuffer, session.parseBuffer + headerLen, remaining);
+                memmove(session.parseBuffer, session.parseBuffer + totalMessageLen, remaining);
             }
             session.parseBufferPos = max(0, remaining);
+            session.parseBuffer[session.parseBufferPos] = '\0';
         }
     }
 }
@@ -2366,8 +2810,8 @@ void setup() {
 
     simplePrintln("WiFi connected: " + WiFi.localIP().toString());
 
-    // NTP time sync (EST = UTC-5, no DST)
-    configTime(-5 * 3600, 0, "pool.ntp.org");
+    // NTP time sync (UTC by default so timestamps stay correct across regions and DST changes)
+    configTzTime(LOG_TIMEZONE_POSIX, "pool.ntp.org");
     Serial.print("Waiting for NTP time sync...");
     time_t now = 0;
     for (int i = 0; i < 20 && now < 100000; i++) {
@@ -2379,7 +2823,7 @@ void setup() {
         localtime_r(&now, &ti);
         char buf[32];
         strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
-        Serial.printf(" OK: %s EST\n", buf);
+        Serial.printf(" OK: %s %s\n", buf, LOG_TIMEZONE_LABEL);
     } else {
         Serial.println(" failed (will use uptime)");
     }
@@ -2409,9 +2853,6 @@ void setup() {
         Serial.println("Updating highpass coefficients...");
         updateHighpassCoeffs();
         Serial.println("Highpass coefficients updated");
-        // Start Core 1 audio pipeline now so raw I2S diagnostics are available even before PLAY.
-        startAudioCaptureTask();
-        Serial.println("Dual-core audio ready (Core 1 pipeline running for always-on diagnostics)");
     } else {
         Serial.printf("I2S driver setup failed, audio pipeline not started (err=%ld)\n", (long)i2sLastError);
     }
@@ -2423,6 +2864,13 @@ void setup() {
     } else {
         rtspServerEnabled = false;
         rtspServer.stop();
+    }
+    if (i2sDriverOk && rtspServerEnabled) {
+        if (startAudioCaptureTask()) {
+            Serial.println("Dual-core audio ready (Core 1 pipeline running for live diagnostics)");
+        } else {
+            Serial.println("Audio task start failed; RTSP server left online for diagnostics only");
+        }
     }
     // Web UI
     webui_begin();
@@ -2560,6 +3008,7 @@ void loop() {
                 session.streamingRtspBufPos = 0;
                 session.streamingInterleavedDiscard = 0;
                 session.consecutiveWriteFailures = 0;
+                session.firstWriteFailureAt = 0;
                 lastRTSPActivity = millis();
                 lastRtspClientConnectMs = millis();
                 rtspConnectCount++;
@@ -2578,6 +3027,8 @@ void loop() {
         // RTSP server disabled (overheat lockout)
         if (isStreaming) {
             requestStreamStop("server disabled");
+        }
+        if (audioTaskRunning) {
             stopAudioCaptureTask();
         }
         for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
