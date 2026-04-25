@@ -4,7 +4,7 @@
 
 - **Board**: AtomS3 Lite
 - **Microphone**: Unit Mini PDM
-- **Audio**: 16-bit PCM, 16kHz mono (configurable 8–48kHz)
+- **Audio**: 16-bit PCM, 48kHz mono by default (configurable 16/24/32/48kHz)
 - **Streaming**: RTSP/RTP over TCP, port 8554
 
 ### Pin Configuration
@@ -33,12 +33,12 @@ Core 1 **exclusively owns** the WiFiClient socket during streaming — Core 0 ne
 - FreeRTOS semaphore with 2s timeout for confirmed task exit
 - `portMUX_TYPE` spinlock for shared log buffer
 - Xtensa `memw` memory barriers on critical flag transitions
-- `core1OwnsLED` flag prevents concurrent FastLED/RMT driver access
+- `core1OwnsLED` flag prevents concurrent RGB LED/RMT driver access
 
 ## Audio Tuning
 
 ### Active Filters
-- **High-pass filter**: optional 2nd-order Butterworth, roughly 12 dB/octave, default OFF with a 180 Hz cutoff when enabled.
+- **High-pass filter**: optional 2nd-order Butterworth, roughly 12 dB/octave, default ON with a 180 Hz cutoff. Disable it temporarily when you need a raw baseline.
 - **Adaptive noise suppressor**: envelope follower + hold-time gate. This was retuned to stop the audible tap-tap artifact that happened when gain changed too abruptly as the live dB meter fell.
 - **I2S gap concealment**: short capture stalls are bridged with de-clicked fallback audio, and the next valid block is ramped in to avoid a hard segment-edge tap.
 - **Limiter**: catches peaks before full-scale clipping.
@@ -94,7 +94,7 @@ Core 1 **exclusively owns** the WiFiClient socket during streaming — Core 0 ne
 1. Check signal level in Web UI
 2. Enable AGC (auto-adjusts gain)
 3. Increase gain (try 5.0–10.0x)
-4. Keep high-pass filter off for the cleanest baseline; enable it only to test rumble/wind cleanup
+4. Temporarily disable high-pass filtering for the cleanest raw baseline; re-enable it if rumble or wind is masking calls
 
 ### Audio Clipping / Distortion
 1. Decrease gain
@@ -123,7 +123,7 @@ Focus on signal conditioning:
 1. Check `peak_dbfs` in Web UI while speaking/clapping near the mic.
 2. If levels stay around `-45 dBFS` to `-55 dBFS`, raise manual gain and re-test.
 3. Enable AGC and verify `agc_multiplier`/`effective_gain` increase when quiet.
-4. Keep HPF off for the first clean baseline; enable it only if wind/rumble is masking calls.
+4. Temporarily disable HPF for the first raw baseline; re-enable it if wind/rumble is masking calls.
 5. Aim for typical peaks around `-20 dBFS` to `-10 dBFS` without constant clipping.
 
 ## Version History

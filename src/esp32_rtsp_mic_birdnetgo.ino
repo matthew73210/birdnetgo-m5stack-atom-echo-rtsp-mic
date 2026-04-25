@@ -11,7 +11,7 @@
 #include <time.h>
 #include <errno.h>
 #include <lwip/sockets.h>
-#include <FastLED.h>
+#include <esp32-hal-rgb-led.h>
 #include "PdmProbeResult.h"
 #include "WebUI.h"
 
@@ -59,10 +59,15 @@ volatile bool audioTaskRunning = false;
 // Cross-core synchronization primitives
 portMUX_TYPE logMux = portMUX_INITIALIZER_UNLOCKED;  // spinlock for log ring buffer
 portMUX_TYPE hpfMux = portMUX_INITIALIZER_UNLOCKED;  // protects HPF coefficient handoff
+portMUX_TYPE diagMux = portMUX_INITIALIZER_UNLOCKED; // protects live diagnostics snapshots
 volatile bool stopStreamRequested = false;   // Core 0 asks Core 1 to stop
 volatile bool streamCleanupDone = false;     // Core 1 confirms cleanup complete
 SemaphoreHandle_t taskExitSemaphore = NULL;  // confirmed task exit
 volatile bool core1OwnsLED = false;          // LED ownership flag
+
+static inline void crossCoreMemoryBarrier() {
+    __asm__ __volatile__("memw" ::: "memory");
+}
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
 #define FW_VERSION "4.1.0"
@@ -77,7 +82,7 @@ static const char LOG_TIMEZONE_LABEL[] = "UTC";
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
 #define DEFAULT_SAMPLE_RATE 48000  // Unit Mini PDM / BirdNET-Go preferred rate
 #define DEFAULT_GAIN_FACTOR 1.0f
-#define DEFAULT_BUFFER_SIZE 1024   // 64ms @ 16kHz - lower default latency while keeping WiFi headroom
+#define DEFAULT_BUFFER_SIZE 1024   // 21ms @ 48kHz / 64ms @ 16kHz - keeps WiFi headroom
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
 #define DEFAULT_NETWORK_HOSTNAME "atoms3mic"
 static const uint32_t SUPPORTED_PDM_SAMPLE_RATES[] = {16000, 24000, 32000, 48000};
@@ -99,9 +104,22 @@ static const uint32_t SUPPORTED_PDM_SAMPLE_RATES[] = {16000, 24000, 32000, 48000
 #define I2S_DATA_IN_PIN  2  // PDM DATA (G2)
 #define WS2812_LED_PIN  35  // AtomS3 Lite built-in RGB LED
 
-static CRGB statusLed[1];
+struct CRGB {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+
+    constexpr CRGB(uint8_t red = 0, uint8_t green = 0, uint8_t blue = 0)
+        : r(red), g(green), b(blue) {}
+};
+
 static bool statusLedNeedsRefresh = true;
 static CRGB lastStatusLed = CRGB(0, 0, 0);
+static uint8_t statusLedBrightness = 32;
+
+static uint8_t scaleLedChannel(uint8_t channel) {
+    return (uint8_t)(((uint16_t)channel * (uint16_t)statusLedBrightness + 127U) / 255U);
+}
 
 inline void setStatusLed(const CRGB& color) {
     if (!statusLedNeedsRefresh &&
@@ -110,8 +128,10 @@ inline void setStatusLed(const CRGB& color) {
         lastStatusLed.b == color.b) {
         return;
     }
-    statusLed[0] = color;
-    FastLED.show();
+    rgbLedWriteOrdered(WS2812_LED_PIN, LED_COLOR_ORDER_GRB,
+                       scaleLedChannel(color.r),
+                       scaleLedChannel(color.g),
+                       scaleLedChannel(color.b));
     lastStatusLed = color;
     statusLedNeedsRefresh = false;
 }
@@ -202,7 +222,8 @@ volatile uint32_t i2sLastGapMs = 0;
 volatile float audioPipelineLoadPct = 0.0f;
 
 // -- Lightweight spectrum diagnostics for Web UI waterfall
-volatile uint8_t fftBins[32] = {0};
+portMUX_TYPE fftMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint8_t fftBins[WEBUI_FFT_BINS] = {0};
 volatile uint32_t fftFrameSeq = 0;
 
 // -- Browser WebAudio diagnostics stream (latest processed PCM block)
@@ -461,6 +482,12 @@ static String extractRtspHeader(const String &request, const char* headerName) {
     return value;
 }
 
+static bool rtspMethodIs(const char* request, const char* method) {
+    if (!request || !method) return false;
+    size_t len = strlen(method);
+    return strncmp(request, method, len) == 0 && (request[len] == ' ' || request[len] == '\t');
+}
+
 // Helper: convert WiFi power enum to dBm (for logs)
 float wifiPowerLevelToDbm(wifi_power_t lvl) {
     switch (lvl) {
@@ -594,11 +621,33 @@ static void clearAudioDiagnostics() {
     memset(webAudioFrame, 0, sizeof(webAudioFrame));
     portEXIT_CRITICAL(&webAudioMux);
 
+    portENTER_CRITICAL(&fftMux);
     memset((void*)fftBins, 0, sizeof(fftBins));
     fftFrameSeq = 0;
+    portEXIT_CRITICAL(&fftMux);
+    portENTER_CRITICAL(&diagMux);
+    audioClipCount = 0;
+    audioFallbackBlockCount = 0;
     lastPeakAbs16 = 0;
     peakHoldAbs16 = 0;
     peakHoldUntilMs = 0;
+    audioClippedLastBlock = false;
+    i2sLastSamplesRead = 0;
+    i2sLastRawMin = 0;
+    i2sLastRawMax = 0;
+    i2sLastRawPeakAbs = 0;
+    i2sLastRawRms = 0;
+    i2sLastRawZeroPct = 0;
+    i2sLastRawMean = 0;
+    i2sLastRawSpan = 0;
+    i2sLikelyUnsignedPcm = false;
+    audioPipelineLoadPct = 0.0f;
+    agcMultiplier = 1.0f;
+    noiseFloorDbfs = -90.0f;
+    noiseGateDbfs = -90.0f;
+    noiseReductionDb = 0.0f;
+    i2sLastGapMs = 0;
+    portEXIT_CRITICAL(&diagMux);
 }
 
 void recordTelemetrySample(float cpuLoadPct, float tempC, bool tempValid) {
@@ -752,7 +801,9 @@ void checkTemperature() {
             if (isStreaming) {
                 requestStreamStop("overheat");
             }
-            stopAudioCaptureTask();
+            if (!stopAudioCaptureTask()) {
+                simplePrintln("Thermal protection: audio task did not stop cleanly");
+            }
             rtspServerEnabled = false;
             rtspServer.stop();
         } else if (overheatLockoutActive && temp <= (overheatShutdownC - OVERHEAT_LIMIT_STEP_C)) {
@@ -799,11 +850,14 @@ void checkPerformance() {
             if (consecutiveLowCount >= 3 && autoRecoveryEnabled) {
                 simplePrintln("AUTO-RECOVERY: 3 consecutive failures, restarting I2S...");
                 consecutiveLowCount = 0;
-                restartI2S();
-                audioPacketsSent = 0;
-                audioBlocksSent = 0;
-                lastStatsReset = millis();
-                lastI2SReset = millis();
+                if (restartI2S()) {
+                    audioPacketsSent = 0;
+                    audioBlocksSent = 0;
+                    lastStatsReset = millis();
+                    lastI2SReset = millis();
+                } else {
+                    simplePrintln("AUTO-RECOVERY: I2S restart failed");
+                }
             }
         } else {
             consecutiveLowCount = 0;
@@ -821,7 +875,9 @@ void checkWiFiHealth() {
         // Stop streaming before reconnecting — no point sending RTP into a dead radio
         if (isStreaming) {
             requestStreamStop("WiFi disconnect");
-            stopAudioCaptureTask();
+            if (!stopAudioCaptureTask()) {
+                simplePrintln("WiFi disconnect: audio task did not stop cleanly");
+            }
         }
         simplePrintln("WiFi disconnected! Reconnecting...");
         WiFi.reconnect();
@@ -1048,37 +1104,48 @@ void loadAudioSettings() {
 }
 
 // Save settings to flash
-void saveAudioSettings() {
-    audioPrefs.begin(SETTINGS_NAMESPACE, false);
-    audioPrefs.putUInt("sampleRate", currentSampleRate);
-    audioPrefs.putFloat("gainFactor", currentGainFactor);
-    audioPrefs.putUShort("bufferSize", currentBufferSize);
-    audioPrefs.putUChar("shiftBits", i2sShiftBits);
-    audioPrefs.putBool("autoRecovery", autoRecoveryEnabled);
-    audioPrefs.putBool("schedReset", scheduledResetEnabled);
-    audioPrefs.putUInt("resetHours", resetIntervalHours);
-    audioPrefs.putUInt("minRate", minAcceptableRate);
-    audioPrefs.putUInt("checkInterval", performanceCheckInterval);
-    audioPrefs.putBool("thrAuto", autoThresholdEnabled);
-    audioPrefs.putUChar("cpuFreq", cpuFrequencyMhz);
-    audioPrefs.putFloat("wifiTxDbm", wifiTxPowerDbm);
-    audioPrefs.putBool("hpEnable", highpassEnabled);
-    audioPrefs.putUInt("hpCutoff", (uint32_t)highpassCutoffHz);
-    audioPrefs.putBool("agcEnable", agcEnabled);
-    audioPrefs.putBool("noiseFilter", noiseFilterEnabled);
-    audioPrefs.putUChar("ledMode", ledMode);
-    audioPrefs.putBool("ohEnable", overheatProtectionEnabled);
+bool saveAudioSettings() {
+    if (!audioPrefs.begin(SETTINGS_NAMESPACE, false)) {
+        simplePrintln("ERROR: Could not open settings namespace for write");
+        return false;
+    }
+
+    bool ok = true;
+    auto rememberWrite = [&](size_t wrote) {
+        if (wrote == 0) ok = false;
+    };
+
+    rememberWrite(audioPrefs.putUInt("sampleRate", currentSampleRate));
+    rememberWrite(audioPrefs.putFloat("gainFactor", currentGainFactor));
+    rememberWrite(audioPrefs.putUShort("bufferSize", currentBufferSize));
+    rememberWrite(audioPrefs.putUChar("shiftBits", i2sShiftBits));
+    rememberWrite(audioPrefs.putBool("autoRecovery", autoRecoveryEnabled));
+    rememberWrite(audioPrefs.putBool("schedReset", scheduledResetEnabled));
+    rememberWrite(audioPrefs.putUInt("resetHours", resetIntervalHours));
+    rememberWrite(audioPrefs.putUInt("minRate", minAcceptableRate));
+    rememberWrite(audioPrefs.putUInt("checkInterval", performanceCheckInterval));
+    rememberWrite(audioPrefs.putBool("thrAuto", autoThresholdEnabled));
+    rememberWrite(audioPrefs.putUChar("cpuFreq", cpuFrequencyMhz));
+    rememberWrite(audioPrefs.putFloat("wifiTxDbm", wifiTxPowerDbm));
+    rememberWrite(audioPrefs.putBool("hpEnable", highpassEnabled));
+    rememberWrite(audioPrefs.putUInt("hpCutoff", (uint32_t)highpassCutoffHz));
+    rememberWrite(audioPrefs.putBool("agcEnable", agcEnabled));
+    rememberWrite(audioPrefs.putBool("noiseFilter", noiseFilterEnabled));
+    rememberWrite(audioPrefs.putUChar("ledMode", ledMode));
+    rememberWrite(audioPrefs.putBool("ohEnable", overheatProtectionEnabled));
     uint32_t ohLimit = (uint32_t)(overheatShutdownC + 0.5f);
     if (ohLimit < OVERHEAT_MIN_LIMIT_C) ohLimit = OVERHEAT_MIN_LIMIT_C;
     if (ohLimit > OVERHEAT_MAX_LIMIT_C) ohLimit = OVERHEAT_MAX_LIMIT_C;
-    audioPrefs.putUInt("ohThresh", ohLimit);
-    audioPrefs.putString("ohReason", overheatLastReason);
-    audioPrefs.putString("ohStamp", overheatLastTimestamp);
-    audioPrefs.putFloat("ohTripC", overheatTripTemp);
-    audioPrefs.putBool("ohLatched", overheatLatched);
+    rememberWrite(audioPrefs.putUInt("ohThresh", ohLimit));
+    rememberWrite(audioPrefs.putString("ohReason", overheatLastReason));
+    rememberWrite(audioPrefs.putString("ohStamp", overheatLastTimestamp));
+    rememberWrite(audioPrefs.putFloat("ohTripC", overheatTripTemp));
+    rememberWrite(audioPrefs.putBool("ohLatched", overheatLatched));
     audioPrefs.end();
 
-    simplePrintln("Settings saved to flash");
+    if (ok) simplePrintln("Settings saved to flash");
+    else simplePrintln("ERROR: Failed to persist one or more settings");
+    return ok;
 }
 
 // Schedule a safe reboot (optionally with factory reset) after delayMs
@@ -1197,13 +1264,15 @@ void resetToDefaultSettings() {
 
     isStreaming = false;
 
-    saveAudioSettings();
+    if (!saveAudioSettings()) {
+        simplePrintln("WARNING: Factory reset defaults were not fully persisted");
+    }
 
     simplePrintln("Defaults applied. Device will reboot.");
 }
 
 // Restart I2S with new parameters
-void restartI2S() {
+bool restartI2S() {
     simplePrintln("Restarting I2S with new parameters...");
     bool wasStreaming = isStreaming;
 
@@ -1213,7 +1282,10 @@ void restartI2S() {
     }
 
     // Stop audio pipeline task on Core 1
-    stopAudioCaptureTask();
+    if (!stopAudioCaptureTask()) {
+        simplePrintln("I2S restart aborted; audio task did not stop cleanly");
+        return false;
+    }
 
     // Restart I2S driver
     setup_i2s_driver();
@@ -1225,19 +1297,20 @@ void restartI2S() {
 
     if (!i2sDriverOk) {
         simplePrintln("I2S restart failed; audio pipeline remains stopped");
-        return;
+        return false;
     }
 
     updateStreamingStateFromSessions();
     if (!startAudioCaptureTask()) {
         simplePrintln("I2S restarted but audio task could not start");
-        return;
+        return false;
     }
     if (wasStreaming) {
         simplePrintln("I2S restarted; RTSP clients should reconnect");
     } else {
         simplePrintln("I2S restarted, diagnostics resumed");
     }
+    return true;
 }
 
 // Minimal print helpers: Serial + buffered for Web UI
@@ -1295,7 +1368,9 @@ static void setupArduinoOta() {
         if (isStreaming) {
             requestStreamStop("OTA update");
         }
-        stopAudioCaptureTask();
+        if (!stopAudioCaptureTask()) {
+            simplePrintln("OTA start: audio task did not stop cleanly");
+        }
         rtspServer.stop();
         rtspServerEnabled = false;
         core1OwnsLED = false;
@@ -1344,39 +1419,81 @@ static void setupArduinoOta() {
 }
 
 static void updateFftFromBlock(const int16_t* samples, uint16_t count) {
-    const int N = 128;
-    const int BINS = 32;
+    const int N = WEBUI_FFT_SIZE;
+    const int BINS = WEBUI_FFT_BINS;
     if (!samples || count < N) return;
+
+    static float real[WEBUI_FFT_SIZE];
+    static float imag[WEBUI_FFT_SIZE];
+    uint8_t nextBins[WEBUI_FFT_BINS];
 
     float mean = 0.0f;
     for (int i = 0; i < N; i++) mean += (float)samples[i];
     mean /= (float)N;
 
-    float mags[BINS];
-    float maxMag = 0.0f;
-    for (int k = 0; k < BINS; k++) {
-        float re = 0.0f;
-        float im = 0.0f;
-        for (int n = 0; n < N; n++) {
-            float x = ((float)samples[n] - mean) * (0.5f - 0.5f * cosf((2.0f * PI * (float)n) / (float)(N - 1)));
-            float phase = 2.0f * PI * (float)k * (float)n / (float)N;
-            re += x * cosf(phase);
-            im -= x * sinf(phase);
-        }
-        float mag = sqrtf(re * re + im * im);
-        mag *= (1.0f + 0.01f * (float)k);
-        mags[k] = mag;
-        if (mag > maxMag) maxMag = mag;
+    for (int i = 0; i < N; i++) {
+        float window = 0.5f - 0.5f * cosf((2.0f * PI * (float)i) / (float)(N - 1));
+        real[i] = ((float)samples[i] - mean) * window;
+        imag[i] = 0.0f;
     }
 
-    if (maxMag < 1.0f) maxMag = 1.0f;
+    for (int i = 1, j = 0; i < N; i++) {
+        int bit = N >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            float tr = real[i];
+            float ti = imag[i];
+            real[i] = real[j];
+            imag[i] = imag[j];
+            real[j] = tr;
+            imag[j] = ti;
+        }
+    }
+
+    for (int len = 2; len <= N; len <<= 1) {
+        float angle = -2.0f * PI / (float)len;
+        float wLenR = cosf(angle);
+        float wLenI = sinf(angle);
+        for (int i = 0; i < N; i += len) {
+            float wr = 1.0f;
+            float wi = 0.0f;
+            for (int j = 0; j < len / 2; j++) {
+                int even = i + j;
+                int odd = even + len / 2;
+                float ur = real[even];
+                float ui = imag[even];
+                float vr = real[odd] * wr - imag[odd] * wi;
+                float vi = real[odd] * wi + imag[odd] * wr;
+                real[even] = ur + vr;
+                imag[even] = ui + vi;
+                real[odd] = ur - vr;
+                imag[odd] = ui - vi;
+
+                float nextWr = wr * wLenR - wi * wLenI;
+                wi = wr * wLenI + wi * wLenR;
+                wr = nextWr;
+            }
+        }
+    }
+
     for (int k = 0; k < BINS; k++) {
-        float norm = mags[k] / maxMag;
+        int bin = k + 1; // skip DC; the input mean is already removed.
+        float mag = sqrtf(real[bin] * real[bin] + imag[bin] * imag[bin]);
+        float db = 20.0f * log10f((mag / 128.0f) + 1.0f);
+        float norm = (db - 12.0f) / 64.0f;
         if (norm < 0.0f) norm = 0.0f;
         if (norm > 1.0f) norm = 1.0f;
-        fftBins[k] = (uint8_t)(norm * 255.0f);
+        nextBins[k] = (uint8_t)(norm * 255.0f);
+    }
+
+    portENTER_CRITICAL(&fftMux);
+    for (int k = 0; k < BINS; k++) {
+        uint8_t previous = fftBins[k];
+        fftBins[k] = (uint8_t)(((uint16_t)previous * 2U + nextBins[k]) / 3U);
     }
     fftFrameSeq = fftFrameSeq + 1U;
+    portEXIT_CRITICAL(&fftMux);
 }
 
 // ================== CORE 1: FULL AUDIO PIPELINE ==================
@@ -1452,7 +1569,7 @@ void audioCaptureTask(void* parameter) {
             }
             updateStreamingStateFromSessions();
             streamCleanupDone = true;
-            __asm__ __volatile__("memw" ::: "memory");
+            crossCoreMemoryBarrier();
             // Wait for Core 0 to clear stopStreamRequested
             while (stopStreamRequested && audioTaskRunning) {
                 vTaskDelay(pdMS_TO_TICKS(10));
@@ -1492,14 +1609,16 @@ void audioCaptureTask(void* parameter) {
                 i2sReadZeroCount = i2sReadZeroCount + 1U;
             }
 
-            audioFallbackBlockCount = audioFallbackBlockCount + 1U;
-            i2sLastGapMs = millis() - lastGoodCaptureMs;
-            i2sLastSamplesRead = 0;
             fillConcealmentBlock(outputBuffer, chunkSamples, lastOutputSample);
             lastOutputSample = outputBuffer[chunkSamples - 1];
             lastBlockWasConcealment = true;
+            portENTER_CRITICAL(&diagMux);
+            audioFallbackBlockCount = audioFallbackBlockCount + 1U;
+            i2sLastGapMs = millis() - lastGoodCaptureMs;
+            i2sLastSamplesRead = 0;
             lastPeakAbs16 = (uint16_t)abs((int)outputBuffer[0]);
             audioClippedLastBlock = false;
+            portEXIT_CRITICAL(&diagMux);
             publishWebAudioFrame(outputBuffer, chunkSamples);
 
             if (streamActive) {
@@ -1511,7 +1630,9 @@ void audioCaptureTask(void* parameter) {
                 float workMs = (float)(micros() - processStartUs) / 1000.0f;
                 float instLoad = (blockMs > 0.0f) ? (workMs * 100.0f / blockMs) : 0.0f;
                 if (instLoad > 100.0f) instLoad = 100.0f;
+                portENTER_CRITICAL(&diagMux);
                 audioPipelineLoadPct += (instLoad - audioPipelineLoadPct) * 0.20f;
+                portEXIT_CRITICAL(&diagMux);
             }
             continue;
         }
@@ -1519,9 +1640,11 @@ void audioCaptureTask(void* parameter) {
         consecutiveErrors = 0;
         i2sReadOkCount = i2sReadOkCount + 1U;
         lastGoodCaptureMs = millis();
-        i2sLastGapMs = 0;
         uint16_t samplesRead = bytesRead / sizeof(int16_t);
+        portENTER_CRITICAL(&diagMux);
+        i2sLastGapMs = 0;
         i2sLastSamplesRead = samplesRead;
+        portEXIT_CRITICAL(&diagMux);
 
         // Update HPF coefficients if changed
         if (localHighpassEnabled != highpassEnabled ||
@@ -1601,7 +1724,9 @@ void audioCaptureTask(void* parameter) {
             localPdmDc = rawMean;
             localPdmDcInitialized = true;
         }
+        portENTER_CRITICAL(&diagMux);
         i2sLikelyUnsignedPcm = localUnsignedPdm;
+        portEXIT_CRITICAL(&diagMux);
 
         float pdmDcAlpha = 0.0f;
         if (localUnsignedPdm) {
@@ -1712,11 +1837,12 @@ void audioCaptureTask(void* parameter) {
         // Update spectrum diagnostics from processed output (throttled)
         static uint8_t fftDecimator = 0;
         fftDecimator++;
-        if ((fftDecimator & 0x03) == 0 && samplesRead >= 128) {
+        if ((fftDecimator & 0x03) == 0 && samplesRead >= WEBUI_FFT_SIZE) {
             updateFftFromBlock(outputBuffer, samplesRead);
         }
 
         // Publish raw capture diagnostics for UI/API
+        portENTER_CRITICAL(&diagMux);
         i2sLastRawMin = rawMin;
         i2sLastRawMax = rawMax;
         i2sLastRawPeakAbs = rawPeakAbs;
@@ -1733,6 +1859,7 @@ void audioCaptureTask(void* parameter) {
             i2sLastRawRms = 0;
             i2sLastRawZeroPct = 100;
         }
+        portEXIT_CRITICAL(&diagMux);
 
         // AGC: adjust multiplier based on RMS
         if (agcEnabled && samplesRead > 0) {
@@ -1749,9 +1876,12 @@ void audioCaptureTask(void* parameter) {
                 if (localAgcMult < AGC_MIN_MULT) localAgcMult = AGC_MIN_MULT;
                 if (localAgcMult > AGC_MAX_MULT) localAgcMult = AGC_MAX_MULT;
             }
+            portENTER_CRITICAL(&diagMux);
             agcMultiplier = localAgcMult;  // Publish for WebUI
+            portEXIT_CRITICAL(&diagMux);
         }
 
+        portENTER_CRITICAL(&diagMux);
         if (noiseFilterEnabled) {
             float floorNorm = max(localNoiseFloor, 1.0f) / 32767.0f;
             float gateNorm = max(localNoiseGate, 1.0f) / 32767.0f;
@@ -1763,19 +1893,21 @@ void audioCaptureTask(void* parameter) {
             noiseGateDbfs = -90.0f;
             noiseReductionDb = 0.0f;
         }
+        portEXIT_CRITICAL(&diagMux);
 
         // Update metering
         if (peakAbs > 32767.0f) peakAbs = 32767.0f;
+        bool logClip = false;
+        uint16_t clipPeak = 0;
+        uint32_t clipCount = 0;
+        portENTER_CRITICAL(&diagMux);
         lastPeakAbs16 = (uint16_t)peakAbs;
         audioClippedLastBlock = clipped;
         if (clipped) {
             audioClipCount++;
-            static unsigned long lastClipLog = 0;
-            if (millis() - lastClipLog > 5000) {
-                Serial.printf("[Core1] Clipping! Peak=%u count=%lu\n",
-                             lastPeakAbs16, audioClipCount);
-                lastClipLog = millis();
-            }
+            clipPeak = lastPeakAbs16;
+            clipCount = audioClipCount;
+            logClip = true;
         }
 
         if (lastPeakAbs16 > peakHoldAbs16) {
@@ -1783,6 +1915,16 @@ void audioCaptureTask(void* parameter) {
             peakHoldUntilMs = millis() + 3000UL;
         } else if (peakHoldAbs16 > 0 && millis() > peakHoldUntilMs) {
             peakHoldAbs16 = 0;
+        }
+        portEXIT_CRITICAL(&diagMux);
+        if (logClip) {
+            static unsigned long lastClipLog = 0;
+            unsigned long nowMs = millis();
+            if (nowMs - lastClipLog > 5000) {
+                Serial.printf("[Core1] Clipping! Peak=%u count=%lu\n",
+                             clipPeak, clipCount);
+                lastClipLog = nowMs;
+            }
         }
 
         // LED update (throttled to ~10 Hz) only while actively streaming.
@@ -1822,7 +1964,9 @@ void audioCaptureTask(void* parameter) {
         float workMs = (float)(micros() - processStartUs) / 1000.0f;
         float instLoad = (blockMs > 0.0f) ? (workMs * 100.0f / blockMs) : 0.0f;
         if (instLoad > 100.0f) instLoad = 100.0f;
+        portENTER_CRITICAL(&diagMux);
         audioPipelineLoadPct += (instLoad - audioPipelineLoadPct) * 0.15f;
+        portEXIT_CRITICAL(&diagMux);
 
         // Process incoming RTSP commands during streaming (~every 50ms)
         // Keeps all socket I/O on Core 1 during streaming
@@ -1845,17 +1989,25 @@ void audioCaptureTask(void* parameter) {
     audioTaskRunning = false;
     audioCaptureTaskHandle = NULL;
     Serial.println("[Core1] Audio pipeline task stopped");
-    xSemaphoreGive(taskExitSemaphore);
+    if (taskExitSemaphore != NULL) {
+        xSemaphoreGive(taskExitSemaphore);
+    }
     vTaskDelete(NULL);
 }
 
 // Start audio pipeline task on Core 1 (or reuse if already running)
+static void drainTaskExitSemaphore() {
+    if (taskExitSemaphore == NULL) return;
+    while (xSemaphoreTake(taskExitSemaphore, 0) == pdTRUE) {}
+}
+
 bool startAudioCaptureTask() {
     if (audioCaptureTaskHandle != NULL) {
         // Task already alive — it will pick up via isStreaming/streamClient
         return true;
     }
 
+    drainTaskExitSemaphore();
     BaseType_t result = xTaskCreatePinnedToCore(
         audioCaptureTask,           // Task function
         "AudioPipeline",            // Name
@@ -1876,15 +2028,18 @@ bool startAudioCaptureTask() {
 }
 
 // Stop audio pipeline task with confirmed exit via semaphore
-void stopAudioCaptureTask() {
+bool stopAudioCaptureTask() {
+    if (audioCaptureTaskHandle == NULL) return true;
+
     if (audioCaptureTaskHandle != NULL) {
         audioTaskRunning = false;
+        crossCoreMemoryBarrier();
         // Wait for task to confirm exit (up to 2s)
         bool exited = (taskExitSemaphore != NULL &&
                        xSemaphoreTake(taskExitSemaphore, pdMS_TO_TICKS(2000)) == pdTRUE);
         if (!exited) {
             Serial.println("[Core0] WARNING: Audio task did not exit within 2s");
-            return;
+            return false;
         }
 
         audioCaptureTaskHandle = NULL;
@@ -1896,6 +2051,7 @@ void stopAudioCaptureTask() {
         updateStreamingStateFromSessions();
         clearAudioDiagnostics();
     }
+    return true;
 }
 
 // Request Core 1 to stop streaming and clean up the socket.
@@ -1909,7 +2065,7 @@ bool requestStreamStop(const char* reason) {
 
     // Signal Core 1 to stop
     stopStreamRequested = true;
-    __asm__ __volatile__("memw" ::: "memory");  // Xtensa memory barrier
+    crossCoreMemoryBarrier();
 
     // Poll for Core 1 confirmation (up to 3s)
     unsigned long deadline = millis() + 3000;
@@ -1923,19 +2079,21 @@ bool requestStreamStop(const char* reason) {
         streamClient = NULL;
         stopStreamRequested = false;
         streamCleanupDone = false;
+        crossCoreMemoryBarrier();
         Serial.printf("[Core0] Stream stopped cleanly: %s\n", reason);
         return true;
     } else {
         // Timeout — stop the Core 1 task before touching leftover session sockets.
         Serial.printf("[Core0] WARNING: Stream stop timeout, stopping audio task for cleanup: %s\n", reason);
         bool hadAudioTask = (audioCaptureTaskHandle != NULL);
-        stopAudioCaptureTask();
-        if (audioCaptureTaskHandle == NULL) {
+        bool stopped = stopAudioCaptureTask();
+        if (stopped && audioCaptureTaskHandle == NULL) {
             isStreaming = false;
             streamClient = NULL;
             stopStreamRequested = false;
             streamCleanupDone = false;
             core1OwnsLED = false;
+            crossCoreMemoryBarrier();
             if (hadAudioTask && i2sDriverOk) {
                 if (!startAudioCaptureTask()) {
                     Serial.printf("[Core0] WARNING: Audio task restart failed after cleanup timeout: %s\n", reason);
@@ -2268,8 +2426,18 @@ static int parseRtspCSeqValue(const char* request) {
     if (!cseqStr) return 1;
     cseqStr += 5;
     while (*cseqStr == ' ' || *cseqStr == '\t') cseqStr++;
-    int cseqVal = atoi(cseqStr);
-    return (cseqVal > 0) ? cseqVal : 1;
+    uint32_t cseqVal = 0;
+    bool hasDigit = false;
+    while (*cseqStr >= '0' && *cseqStr <= '9') {
+        hasDigit = true;
+        uint32_t digit = (uint32_t)(*cseqStr - '0');
+        if (cseqVal > (UINT32_MAX - digit) / 10U) return 1;
+        cseqVal = (cseqVal * 10U) + digit;
+        cseqStr++;
+    }
+    while (*cseqStr == ' ' || *cseqStr == '\t') cseqStr++;
+    if (!hasDigit || (*cseqStr != '\r' && *cseqStr != '\n' && *cseqStr != '\0')) return 1;
+    return (cseqVal > 0 && cseqVal <= INT_MAX) ? (int)cseqVal : 1;
 }
 
 static uint16_t parseRtspContentLengthValue(const char* request) {
@@ -2280,9 +2448,18 @@ static uint16_t parseRtspContentLengthValue(const char* request) {
     if (!lenStr) return 0;
     lenStr += 15;
     while (*lenStr == ' ' || *lenStr == '\t') lenStr++;
-    long len = atol(lenStr);
-    if (len <= 0) return 0;
-    if (len > 2048) return 2048;
+    uint32_t len = 0;
+    bool hasDigit = false;
+    while (*lenStr >= '0' && *lenStr <= '9') {
+        hasDigit = true;
+        uint32_t digit = (uint32_t)(*lenStr - '0');
+        if (len > (UINT32_MAX - digit) / 10U) return 0;
+        len = (len * 10U) + digit;
+        lenStr++;
+    }
+    while (*lenStr == ' ' || *lenStr == '\t') lenStr++;
+    if (!hasDigit || (*lenStr != '\r' && *lenStr != '\n' && *lenStr != '\0')) return 0;
+    if (len > 2048U) return 2048U;
     return (uint16_t)len;
 }
 
@@ -2488,24 +2665,20 @@ static void sendRTPPacketsToActiveSessions(int16_t* audioData, int numSamples) {
 // (streamAudio function removed - handled by Core 1 audioCaptureTask)
 
 // RTSP handling
-void handleRTSPCommand(RtspSession &session, String request) {
+void handleRTSPCommand(RtspSession &session, const String &request) {
     WiFiClient &client = session.client;
-    String cseq = "1";
-    int cseqPos = request.indexOf("CSeq: ");
-    if (cseqPos >= 0) {
-        cseq = request.substring(cseqPos + 6, request.indexOf("\r", cseqPos));
-        cseq.trim();
-    }
+    int cseqVal = parseRtspCSeqValue(request.c_str());
+    String cseq = String(cseqVal);
 
     lastRTSPActivity = millis();
     session.lastActivity = millis();
 
-    if (request.startsWith("OPTIONS")) {
+    if (rtspMethodIs(request.c_str(), "OPTIONS")) {
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
         client.print("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, SET_PARAMETER\r\n\r\n");
 
-    } else if (request.startsWith("DESCRIBE")) {
+    } else if (rtspMethodIs(request.c_str(), "DESCRIBE")) {
         String ip = WiFi.localIP().toString();
         String sdp = "v=0\r\n";
         sdp += "o=- 0 0 IN IP4 " + ip + "\r\n";
@@ -2524,7 +2697,7 @@ void handleRTSPCommand(RtspSession &session, String request) {
         client.print("Content-Length: " + String(sdp.length()) + "\r\n\r\n");
         client.print(sdp);
 
-    } else if (request.startsWith("SETUP")) {
+    } else if (rtspMethodIs(request.c_str(), "SETUP")) {
         if (session.sessionId.length() == 0) {
             session.sessionId = String(random(100000000, 999999999));
         }
@@ -2563,7 +2736,7 @@ void handleRTSPCommand(RtspSession &session, String request) {
         session.setupDone = true;
         simplePrintln("RTSP SETUP using TCP interleaved transport for " + session.remoteAddr);
 
-    } else if (request.startsWith("PLAY")) {
+    } else if (rtspMethodIs(request.c_str(), "PLAY")) {
         if (!session.setupDone) {
             client.print("RTSP/1.0 455 Method Not Valid in This State\r\n");
             client.print("CSeq: " + cseq + "\r\n");
@@ -2617,7 +2790,7 @@ void handleRTSPCommand(RtspSession &session, String request) {
         stopStreamRequested = false;
         streamCleanupDone = false;
         core1OwnsLED = true;
-        __asm__ __volatile__("memw" ::: "memory");
+        crossCoreMemoryBarrier();
 
         session.streaming = true;
         session.playStartedAt = millis();
@@ -2627,7 +2800,7 @@ void handleRTSPCommand(RtspSession &session, String request) {
         simplePrintln("STREAMING STARTED for " + session.remoteAddr + " via " +
                       String(rtspTransportModeName(session.transport)));
 
-    } else if (request.startsWith("TEARDOWN")) {
+    } else if (rtspMethodIs(request.c_str(), "TEARDOWN")) {
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
         client.print("Session: " + session.sessionId + "\r\n\r\n");
@@ -2638,13 +2811,17 @@ void handleRTSPCommand(RtspSession &session, String request) {
             else setStatusLed(CRGB(0, 0, 0));
         }
         simplePrintln("STREAMING STOPPED");
-    } else if (request.startsWith("GET_PARAMETER")) {
+    } else if (rtspMethodIs(request.c_str(), "GET_PARAMETER")) {
         // Many RTSP clients send GET_PARAMETER as keep-alive.
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n\r\n");
-    } else if (request.startsWith("SET_PARAMETER")) {
+    } else if (rtspMethodIs(request.c_str(), "SET_PARAMETER")) {
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n\r\n");
+    } else {
+        client.print("RTSP/1.0 405 Method Not Allowed\r\n");
+        client.print("CSeq: " + cseq + "\r\n");
+        client.print("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, SET_PARAMETER\r\n\r\n");
     }
 }
 
@@ -2655,7 +2832,7 @@ void processRTSP(RtspSession &session) {
 
     if (client.available()) {
         int available = client.available();
-        int spaceLeft = sizeof(session.parseBuffer) - session.parseBufferPos - 1;
+        int spaceLeft = (int)sizeof(session.parseBuffer) - session.parseBufferPos - 1;
 
         if (available > spaceLeft) {
             available = spaceLeft;
@@ -2664,22 +2841,32 @@ void processRTSP(RtspSession &session) {
         if (available <= 0) {
             static unsigned long lastOverflowWarning = 0;
             if (millis() - lastOverflowWarning > 5000) {
-                simplePrintln("RTSP buffer full - resetting");
+                simplePrintln("RTSP buffer full - closing " + session.remoteAddr);
                 lastOverflowWarning = millis();
             }
-            session.parseBufferPos = 0;
+            client.print("RTSP/1.0 413 Request Entity Too Large\r\nConnection: close\r\n\r\n");
+            closeRtspSession(session, true);
             return;
         }
 
-        client.read(session.parseBuffer + session.parseBufferPos, available);
-        session.parseBufferPos += available;
+        int readBytes = client.read(session.parseBuffer + session.parseBufferPos, available);
+        if (readBytes <= 0) {
+            return;
+        }
+        session.parseBufferPos += readBytes;
         session.parseBuffer[session.parseBufferPos] = '\0';
 
         char* endOfHeader = strstr((char*)session.parseBuffer, "\r\n\r\n");
-        if (endOfHeader != nullptr) {
+        while (endOfHeader != nullptr) {
             int headerLen = (endOfHeader - (char*)session.parseBuffer) + 4;
             uint16_t bodyBytes = parseRtspContentLengthValue((char*)session.parseBuffer);
             int totalMessageLen = headerLen + (int)bodyBytes;
+            if (totalMessageLen >= (int)sizeof(session.parseBuffer)) {
+                simplePrintln("RTSP request too large - closing " + session.remoteAddr);
+                client.print("RTSP/1.0 413 Request Entity Too Large\r\nConnection: close\r\n\r\n");
+                closeRtspSession(session, true);
+                return;
+            }
             if (session.parseBufferPos < totalMessageLen) {
                 return;
             }
@@ -2698,6 +2885,7 @@ void processRTSP(RtspSession &session) {
             }
             session.parseBufferPos = max(0, remaining);
             session.parseBuffer[session.parseBufferPos] = '\0';
+            endOfHeader = strstr((char*)session.parseBuffer, "\r\n\r\n");
         }
     }
 }
@@ -2753,8 +2941,6 @@ static void rejectBusyRtspClient(WiFiClient &client) {
 // Web UI is a separate module (WebUI.*)
 
 void setup() {
-    FastLED.addLeds<WS2812, WS2812_LED_PIN, GRB>(statusLed, 1);
-    FastLED.setBrightness(32);
     setStatusLed(CRGB(0, 0, 0));
 
     Serial.begin(115200);
@@ -2764,6 +2950,9 @@ void setup() {
 
     // Create task exit semaphore for confirmed Core 1 task shutdown
     taskExitSemaphore = xSemaphoreCreateBinary();
+    if (taskExitSemaphore == NULL) {
+        Serial.println("WARNING: Could not create audio task exit semaphore; task-stop confirmation disabled");
+    }
 
     // Set LED to indicate startup
     setStatusLed(CRGB(128, 128, 0));  // Yellow for startup
@@ -3029,7 +3218,9 @@ void loop() {
             requestStreamStop("server disabled");
         }
         if (audioTaskRunning) {
-            stopAudioCaptureTask();
+            if (!stopAudioCaptureTask()) {
+                simplePrintln("Server disable: audio task did not stop cleanly");
+            }
         }
         for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
             if (rtspSessions[i].occupied && !rtspSessions[i].streaming) {

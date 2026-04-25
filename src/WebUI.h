@@ -3,6 +3,8 @@
 
 constexpr uint16_t WEBUI_AUDIO_MAX_SAMPLES = 4096;
 constexpr uint8_t WEBUI_AUDIO_RING_LEN = 8;
+constexpr uint16_t WEBUI_FFT_SIZE = 256;
+constexpr uint16_t WEBUI_FFT_BINS = WEBUI_FFT_SIZE / 2;
 
 // Web UI (ESP32 RTSP Mic for BirdNET-Go): initialization and request handling
 void webui_begin();

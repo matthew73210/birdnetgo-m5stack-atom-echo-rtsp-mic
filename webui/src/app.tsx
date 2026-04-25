@@ -87,6 +87,7 @@ type ThermalStatus = {
 
 type FftStatus = {
   seq: number;
+  fft_size?: number;
   bins: number[];
   sample_rate: number;
   max_hz: number;
@@ -323,7 +324,15 @@ function binForPosition(position: number, count: number, scale: SpectrogramScale
   if (count <= 1) return 0;
   const t = clamp01(position);
   const mapped = scale === "log" ? Math.pow(count, t) - 1 : t * (count - 1);
-  return Math.max(0, Math.min(count - 1, Math.round(mapped)));
+  return Math.max(0, Math.min(count - 1, mapped));
+}
+
+function sampleBins(bins: number[], position: number, scale: SpectrogramScale) {
+  if (!bins.length) return 0;
+  const mapped = binForPosition(position, bins.length, scale);
+  const low = Math.floor(mapped);
+  const high = Math.min(bins.length - 1, low + 1);
+  return lerp(bins[low] || 0, bins[high] || 0, mapped - low);
 }
 
 function getStoredOption<T extends string>(key: string, fallback: T, allowed: readonly T[]) {
@@ -383,8 +392,8 @@ function drawTimelineFrame(
   const column = ctx.createImageData(1, height);
   for (let y = 0; y < height; y++) {
     const frequencyPos = 1 - y / Math.max(1, height - 1);
-    const bin = binForPosition(frequencyPos, bins.length, scale);
-    const color = colorFromPalette(palette, (bins[bin] || 0) / 255, quantized);
+    const level = sampleBins(bins, frequencyPos, scale) / 255;
+    const color = colorFromPalette(palette, level, quantized);
     const offset = y * 4;
     column.data[offset] = color[0];
     column.data[offset + 1] = color[1];
@@ -406,8 +415,8 @@ function drawWaterfallFrame(canvas: HTMLCanvasElement, bins: number[], palette: 
   const row = ctx.createImageData(width, 1);
   for (let x = 0; x < width; x++) {
     const frequencyPos = x / Math.max(1, width - 1);
-    const bin = binForPosition(frequencyPos, bins.length, scale);
-    const color = colorFromPalette(palette, (bins[bin] || 0) / 255);
+    const level = sampleBins(bins, frequencyPos, scale) / 255;
+    const color = colorFromPalette(palette, level);
     const offset = x * 4;
     row.data[offset] = color[0];
     row.data[offset + 1] = color[1];
@@ -428,8 +437,7 @@ function drawBandsFrame(canvas: HTMLCanvasElement, bins: number[], palette: Spec
   const bandWidth = width / visible;
   for (let i = 0; i < visible; i++) {
     const position = visible <= 1 ? 0 : i / (visible - 1);
-    const bin = binForPosition(position, bins.length, scale);
-    const level = clamp01((bins[bin] || 0) / 255);
+    const level = clamp01(sampleBins(bins, position, scale) / 255);
     const color = colorFromPalette(palette, level);
     const x = Math.round(i * bandWidth);
     const barWidth = Math.max(2, Math.ceil(bandWidth) - gap);
@@ -675,6 +683,8 @@ function App() {
   const [dirty, setDirty] = useState<Record<string, boolean>>({});
   const [error, setError] = useState("");
   const dirtyRef = useRef<Record<string, boolean>>({});
+  const loadSeqRef = useRef(0);
+  const loadInFlightRef = useRef(false);
 
   const rtspUrl = useMemo(() => {
     const ip = status.ip || window.location.hostname;
@@ -704,12 +714,15 @@ function App() {
   };
 
   const load = async () => {
+    const requestSeq = loadSeqRef.current + 1;
+    loadSeqRef.current = requestSeq;
     const [nextStatus, nextAudio, nextPerf, nextThermal] = await Promise.all([
       getJson<Status>("/api/status"),
       getJson<AudioStatus>("/api/audio_status"),
       getJson<PerfStatus>("/api/perf_status"),
       getJson<ThermalStatus>("/api/thermal")
     ]);
+    if (requestSeq !== loadSeqRef.current) return false;
     setStatus(nextStatus);
     setAudio(nextAudio);
     setPerf(nextPerf);
@@ -734,16 +747,22 @@ function App() {
       oh_enable: nextThermal.protection_enabled ? "on" : "off",
       oh_limit: String(nextThermal.shutdown_c)
     });
+    return true;
   };
 
   useEffect(() => {
     let alive = true;
     const loadSafe = async () => {
+      if (loadInFlightRef.current) return;
+      loadInFlightRef.current = true;
       try {
-        await load();
+        const applied = await load();
+        if (!applied) return;
         if (alive) setError("");
       } catch (err) {
         if (alive) setError(err instanceof Error ? err.message : "Unable to load status");
+      } finally {
+        loadInFlightRef.current = false;
       }
     };
     loadSafe();
@@ -772,6 +791,7 @@ function App() {
     try {
       await setValue(key, draft[key] || "");
       clearDirty(key);
+      loadInFlightRef.current = false;
       await load();
       setError("");
     } catch (err) {
@@ -782,6 +802,7 @@ function App() {
   const runAction = async (name: string) => {
     try {
       await action(name);
+      loadInFlightRef.current = false;
       await load();
       setError("");
     } catch (err) {
@@ -793,6 +814,7 @@ function App() {
     try {
       const result = await postJson<{ ok: boolean }>("/api/thermal/clear");
       if (!result.ok) throw new Error("Thermal latch was not active");
+      loadInFlightRef.current = false;
       await load();
       setError("");
     } catch (err) {

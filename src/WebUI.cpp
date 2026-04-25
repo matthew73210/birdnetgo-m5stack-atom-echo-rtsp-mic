@@ -1,5 +1,7 @@
 #include <Arduino.h>
+#include <errno.h>
 #include <math.h>
+#include <stdlib.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include "WebUIAssets.h"
@@ -68,6 +70,7 @@ extern volatile bool noiseFilterEnabled;
 extern volatile float noiseFloorDbfs;
 extern volatile float noiseGateDbfs;
 extern volatile float noiseReductionDb;
+extern portMUX_TYPE diagMux;
 extern uint8_t ledMode;
 extern volatile uint32_t i2sReadOkCount;
 extern volatile uint32_t i2sReadErrCount;
@@ -92,8 +95,9 @@ extern volatile uint32_t i2sLastGapMs;
 extern volatile float audioPipelineLoadPct;
 extern volatile bool audioTaskRunning;
 extern bool startAudioCaptureTask();
-extern void stopAudioCaptureTask();
-extern volatile uint8_t fftBins[32];
+extern bool stopAudioCaptureTask();
+extern portMUX_TYPE fftMux;
+extern volatile uint8_t fftBins[WEBUI_FFT_BINS];
 extern volatile uint32_t fftFrameSeq;
 extern portMUX_TYPE webAudioMux;
 extern volatile uint32_t webAudioFrameSeq;
@@ -139,8 +143,8 @@ static const uint32_t OH_STEP = 5;
 extern float wifiPowerLevelToDbm(wifi_power_t lvl);
 extern String formatUptime(unsigned long seconds);
 extern String formatSince(unsigned long eventMs);
-extern void restartI2S();
-extern void saveAudioSettings();
+extern bool restartI2S();
+extern bool saveAudioSettings();
 extern void applyWifiTxPower(bool log);
 extern const char* FW_VERSION_STR;
 extern String describeHardwareProfile();
@@ -157,6 +161,8 @@ static size_t logHead = 0;
 static size_t logCount = 0;
 static const char* STATE_CHANGE_HEADER = "X-Requested-With";
 static const char* STATE_CHANGE_HEADER_VALUE = "birdnetgo-webui";
+static const size_t SETTING_KEY_MAX = 24;
+static const size_t SETTING_VALUE_MAX = 32;
 
 extern portMUX_TYPE logMux;
 
@@ -186,13 +192,19 @@ static String profileName(uint16_t buf) {
     return F("High Stability (Lowest CPU, Maximum stability)");
 }
 
+static void applyCommonResponseHeaders(const char* cacheControl) {
+    web.sendHeader("Cache-Control", cacheControl ? cacheControl : "no-store");
+    web.sendHeader("Pragma", "no-cache");
+    web.sendHeader("X-Content-Type-Options", "nosniff");
+}
+
 static void apiSendJSON(const String &json) {
-    web.sendHeader("Cache-Control", "no-cache");
+    applyCommonResponseHeaders("no-store");
     web.send(200, "application/json", json);
 }
 
 static void apiSendError(const String &error, int code = 400) {
-    web.sendHeader("Cache-Control", "no-cache");
+    applyCommonResponseHeaders("no-store");
     web.send(code, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(error) + "\"}");
 }
 
@@ -203,6 +215,87 @@ static bool webAudioPreviewAvailable() {
 static bool requireTrustedStateChangeRequest() {
     if (web.header(STATE_CHANGE_HEADER) != STATE_CHANGE_HEADER_VALUE) {
         apiSendError("invalid_request_origin", 403);
+        return false;
+    }
+    return true;
+}
+
+static bool parseStrictFloat(const String &value, float &out) {
+    if (value.length() == 0 || value.length() > SETTING_VALUE_MAX) return false;
+    char buf[SETTING_VALUE_MAX + 1];
+    value.toCharArray(buf, sizeof(buf));
+    char* end = NULL;
+    errno = 0;
+    float parsed = strtof(buf, &end);
+    if (end == buf || errno == ERANGE || !isfinite(parsed)) return false;
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end != '\0') return false;
+    out = parsed;
+    return true;
+}
+
+static bool parseStrictUInt(const String &value, uint32_t &out) {
+    if (value.length() == 0 || value.length() > SETTING_VALUE_MAX) return false;
+    char buf[SETTING_VALUE_MAX + 1];
+    value.toCharArray(buf, sizeof(buf));
+    char* cursor = buf;
+    while (*cursor == ' ' || *cursor == '\t') cursor++;
+    if (*cursor == '-' || *cursor == '+') return false;
+    char* end = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(cursor, &end, 10);
+    if (end == cursor || errno == ERANGE || parsed > UINT32_MAX) return false;
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end != '\0') return false;
+    out = (uint32_t)parsed;
+    return true;
+}
+
+static bool parseSinceArg(uint32_t &since) {
+    since = 0;
+    if (!web.hasArg("since")) return true;
+    String value = web.arg("since");
+    if (!parseStrictUInt(value, since)) {
+        apiSendError("invalid_since");
+        return false;
+    }
+    return true;
+}
+
+static bool persistSettingsOrSetError(String &error) {
+    if (saveAudioSettings()) return true;
+    error = "settings_save_failed";
+    return false;
+}
+
+static bool applyRestartingAudioConfig(uint32_t newRate, uint16_t newBuffer, String &error) {
+    uint32_t previousRate = currentSampleRate;
+    uint16_t previousBuffer = currentBufferSize;
+    uint16_t previousCutoff = highpassCutoffHz;
+    uint32_t previousMinRate = minAcceptableRate;
+
+    currentSampleRate = newRate;
+    currentBufferSize = newBuffer;
+    highpassCutoffHz = sanitizeHighpassCutoffSetting(previousCutoff, currentSampleRate);
+    if (autoThresholdEnabled) {
+        minAcceptableRate = computeRecommendedMinRate();
+    }
+
+    if (!restartI2S()) {
+        currentSampleRate = previousRate;
+        currentBufferSize = previousBuffer;
+        highpassCutoffHz = previousCutoff;
+        minAcceptableRate = previousMinRate;
+        if (!restartI2S()) {
+            error = "audio_restart_failed_recovery_failed";
+        } else {
+            error = "audio_restart_failed";
+        }
+        return false;
+    }
+
+    if (!saveAudioSettings()) {
+        error = "settings_save_failed";
         return false;
     }
     return true;
@@ -251,7 +344,10 @@ static String htmlStreamer() {
     return h;
 }
 
-static void httpStreamer() { web.send(200, "text/html; charset=utf-8", htmlStreamer()); }
+static void httpStreamer() {
+    applyCommonResponseHeaders("no-store");
+    web.send(200, "text/html; charset=utf-8", htmlStreamer());
+}
 
 static bool getWebAudioSnapshot(uint32_t since, WebAudioSnapshot& snapshot) {
     bool ok = false;
@@ -303,7 +399,7 @@ static void httpWebAudio() {
         return;
     }
     uint32_t since = 0;
-    if (web.hasArg("since")) since = (uint32_t)web.arg("since").toInt();
+    if (!parseSinceArg(since)) return;
 
     WebAudioSnapshot& snapshot = webAudioHttpSnapshot;
     if (!getWebAudioSnapshot(since, snapshot)) {
@@ -328,7 +424,7 @@ static void httpWebAudioPcm() {
         return;
     }
     uint32_t since = 0;
-    if (web.hasArg("since")) since = (uint32_t)web.arg("since").toInt();
+    if (!parseSinceArg(since)) return;
 
     WebAudioSnapshot& snapshot = webAudioHttpSnapshot;
     if (!getWebAudioSnapshot(since, snapshot)) {
@@ -427,7 +523,7 @@ static void httpWebAudioL16() {
         return;
     }
     uint32_t since = 0;
-    if (web.hasArg("since")) since = (uint32_t)web.arg("since").toInt();
+    if (!parseSinceArg(since)) return;
 
     WebAudioSnapshot& snapshot = webAudioHttpSnapshot;
     if (!getWebAudioSnapshot(since, snapshot)) {
@@ -454,7 +550,7 @@ static void httpWebAudioWav() {
         return;
     }
     uint32_t since = 0;
-    if (web.hasArg("since")) since = (uint32_t)web.arg("since").toInt();
+    if (!parseSinceArg(since)) return;
 
     WebAudioSnapshot& snapshot = webAudioHttpSnapshot;
     if (!getWebAudioSnapshot(since, snapshot)) {
@@ -493,7 +589,7 @@ static void httpWebAudioAiff() {
         return;
     }
     uint32_t since = 0;
-    if (web.hasArg("since")) since = (uint32_t)web.arg("since").toInt();
+    if (!parseSinceArg(since)) return;
 
     WebAudioSnapshot& snapshot = webAudioHttpSnapshot;
     if (!getWebAudioSnapshot(since, snapshot)) {
@@ -523,7 +619,7 @@ static void httpWebAudioAiff() {
 
 // HTTP handlery
 static void httpIndex() {
-    web.sendHeader("Cache-Control", "no-store");
+    applyCommonResponseHeaders("no-store");
     web.send_P(200, PSTR("text/html; charset=utf-8"), WEBUI_INDEX_HTML);
 }
 
@@ -533,6 +629,7 @@ static void httpStatus() {
     unsigned long runtime = millis() - lastStatsReset;
     uint32_t currentRate = (isStreaming && runtime > 1000) ? (audioBlocksSent * 1000) / runtime : 0;
     String json = "{";
+    json.reserve(900);
     json += "\"fw_version\":\"" + String(FW_VERSION_STR) + "\",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"gateway\":\"" + WiFi.gatewayIP().toString() + "\",";
@@ -564,9 +661,66 @@ static void httpStatus() {
 }
 
 static void httpAudioStatus() {
+    float agcMult;
+    float noiseFloor;
+    float noiseGate;
+    float noiseReduction;
+    float pipelineLoad;
+    uint32_t fallbackBlocks;
+    uint32_t clipCount;
+    uint32_t lastGapMs;
+    bool driverOk;
+    int32_t lastError;
+    uint16_t peakAbs16;
+    uint16_t peakHold16;
+    bool clippedLastBlock;
+    uint16_t lastSamplesRead;
+    int16_t rawMin;
+    int16_t rawMax;
+    uint16_t rawPeakAbs;
+    uint16_t rawRms;
+    uint16_t rawZeroPct;
+    int16_t rawMean;
+    uint16_t rawSpan;
+    bool likelyUnsignedPcm;
+    bool usingModernPdmDriver;
+    bool pdmUseLeftSlot;
+    bool pdmClkInverted;
+    bool pdmProbeFoundSigned;
+
+    portENTER_CRITICAL(&diagMux);
+    agcMult = agcMultiplier;
+    noiseFloor = noiseFloorDbfs;
+    noiseGate = noiseGateDbfs;
+    noiseReduction = noiseReductionDb;
+    pipelineLoad = audioPipelineLoadPct;
+    fallbackBlocks = audioFallbackBlockCount;
+    clipCount = audioClipCount;
+    lastGapMs = i2sLastGapMs;
+    driverOk = i2sDriverOk;
+    lastError = i2sLastError;
+    peakAbs16 = lastPeakAbs16;
+    peakHold16 = peakHoldAbs16;
+    clippedLastBlock = audioClippedLastBlock;
+    lastSamplesRead = i2sLastSamplesRead;
+    rawMin = i2sLastRawMin;
+    rawMax = i2sLastRawMax;
+    rawPeakAbs = i2sLastRawPeakAbs;
+    rawRms = i2sLastRawRms;
+    rawZeroPct = i2sLastRawZeroPct;
+    rawMean = i2sLastRawMean;
+    rawSpan = i2sLastRawSpan;
+    likelyUnsignedPcm = i2sLikelyUnsignedPcm;
+    usingModernPdmDriver = i2sUsingModernPdmDriver;
+    pdmUseLeftSlot = i2sPdmUseLeftSlot;
+    pdmClkInverted = i2sPdmClkInverted;
+    pdmProbeFoundSigned = i2sPdmProbeFoundSigned;
+    portEXIT_CRITICAL(&diagMux);
+
     uint16_t effectiveChunk = effectiveAudioChunkSize();
     float latency_ms = (float)effectiveChunk / currentSampleRate * 1000.0f;
     String json = "{";
+    json.reserve(1800);
     json += "\"sample_rate\":" + String(currentSampleRate) + ",";
     json += "\"gain\":" + String(currentGainFactor,2) + ",";
     json += "\"buffer_size\":" + String(currentBufferSize) + ",";
@@ -577,74 +731,74 @@ static void httpAudioStatus() {
     json += "\"hp_cutoff_hz\":" + String((uint32_t)highpassCutoffHz) + ",";
     json += "\"hp_cutoff_max_hz\":" + String((uint32_t)maxHighpassCutoffForSampleRate(currentSampleRate)) + ",";
     json += "\"agc_enable\":" + String(agcEnabled?"true":"false") + ",";
-    json += "\"agc_multiplier\":" + String(agcMultiplier, 2) + ",";
+    json += "\"agc_multiplier\":" + String(agcMult, 2) + ",";
     json += "\"noise_filter_enable\":" + String(noiseFilterEnabled?"true":"false") + ",";
-    json += "\"noise_floor_dbfs\":" + String(noiseFloorDbfs, 1) + ",";
-    json += "\"noise_gate_dbfs\":" + String(noiseGateDbfs, 1) + ",";
-    json += "\"noise_reduction_db\":" + String(noiseReductionDb, 1) + ",";
+    json += "\"noise_floor_dbfs\":" + String(noiseFloor, 1) + ",";
+    json += "\"noise_gate_dbfs\":" + String(noiseGate, 1) + ",";
+    json += "\"noise_reduction_db\":" + String(noiseReduction, 1) + ",";
     json += "\"filter_chain\":\"" + jsonEscape(describeFilterChain()) + "\",";
-    String captureMode = i2sUsingModernPdmDriver
-        ? String("V4 ESP-IDF PDM RX selected ") + (i2sPdmUseLeftSlot ? "left" : "right") +
-              " slot" + (i2sPdmClkInverted ? " with inverted clock. " : " with normal clock. ")
+    String captureMode = usingModernPdmDriver
+        ? String("V4 ESP-IDF PDM RX selected ") + (pdmUseLeftSlot ? "left" : "right") +
+              " slot" + (pdmClkInverted ? " with inverted clock. " : " with normal clock. ")
         : String("PDM RX driver is not active yet. ");
     String filterDetail = captureMode +
-        (i2sLikelyUnsignedPcm
+        (likelyUnsignedPcm
             ? String("Live blocks still look all-positive, so the unsigned DC tracker and fixed scaling remain active before HPF/gain.")
             : String("Signed PCM is reaching DSP directly before HPF/gain."));
     json += "\"filter_detail\":\"" + jsonEscape(filterDetail) + "\",";
-    json += "\"audio_pipeline_load_pct\":" + String(audioPipelineLoadPct, 1) + ",";
-    json += "\"i2s_fallback_blocks\":" + String(audioFallbackBlockCount) + ",";
-    json += "\"i2s_last_gap_ms\":" + String(i2sLastGapMs) + ",";
-    json += "\"i2s_driver_ok\":" + String(i2sDriverOk?"true":"false") + ",";
-    json += "\"i2s_last_error\":" + String((int32_t)i2sLastError) + ",";
-    float effectiveGain = agcEnabled ? (currentGainFactor * agcMultiplier) : currentGainFactor;
+    json += "\"audio_pipeline_load_pct\":" + String(pipelineLoad, 1) + ",";
+    json += "\"i2s_fallback_blocks\":" + String(fallbackBlocks) + ",";
+    json += "\"i2s_last_gap_ms\":" + String(lastGapMs) + ",";
+    json += "\"i2s_driver_ok\":" + String(driverOk?"true":"false") + ",";
+    json += "\"i2s_last_error\":" + String((int32_t)lastError) + ",";
+    float effectiveGain = agcEnabled ? (currentGainFactor * agcMult) : currentGainFactor;
     json += "\"effective_gain\":" + String(effectiveGain, 2) + ",";
     // Metering/clipping
-    uint16_t p = (peakHoldAbs16 > 0) ? peakHoldAbs16 : lastPeakAbs16;
+    uint16_t p = (peakHold16 > 0) ? peakHold16 : peakAbs16;
     float peak_pct = (p <= 0) ? 0.0f : (100.0f * (float)p / 32767.0f);
     float peak_dbfs = (p <= 0) ? -90.0f : (20.0f * log10f((float)p / 32767.0f));
     json += "\"peak_pct\":" + String(peak_pct,1) + ",";
     json += "\"peak_dbfs\":" + String(peak_dbfs,1) + ",";
-    json += "\"clip\":" + String(audioClippedLastBlock?"true":"false") + ",";
-    json += "\"clip_count\":" + String(audioClipCount) + ",";
+    json += "\"clip\":" + String(clippedLastBlock?"true":"false") + ",";
+    json += "\"clip_count\":" + String(clipCount) + ",";
     json += "\"led_mode\":" + String(ledMode) + ",";
     json += "\"i2s_reads_ok\":" + String(i2sReadOkCount) + ",";
     json += "\"i2s_reads_err\":" + String(i2sReadErrCount) + ",";
     json += "\"i2s_reads_zero\":" + String(i2sReadZeroCount) + ",";
-    json += "\"i2s_last_samples\":" + String(i2sLastSamplesRead) + ",";
-    json += "\"i2s_raw_min\":" + String(i2sLastRawMin) + ",";
-    json += "\"i2s_raw_max\":" + String(i2sLastRawMax) + ",";
-    json += "\"i2s_raw_peak\":" + String(i2sLastRawPeakAbs) + ",";
-    json += "\"i2s_raw_rms\":" + String(i2sLastRawRms) + ",";
-    json += "\"i2s_raw_zero_pct\":" + String(i2sLastRawZeroPct) + ",";
-    json += "\"i2s_raw_mean\":" + String(i2sLastRawMean) + ",";
-    json += "\"i2s_raw_span\":" + String(i2sLastRawSpan) + ",";
-    json += "\"i2s_capture_driver\":\"" + String(i2sUsingModernPdmDriver ? "modern_pdm_rx" : "inactive") + "\",";
-    json += "\"i2s_pdm_slot\":\"" + String(i2sPdmUseLeftSlot ? "left" : "right") + "\",";
-    json += "\"i2s_pdm_clk_inverted\":" + String(i2sPdmClkInverted?"true":"false") + ",";
-    json += "\"i2s_pdm_probe_signed\":" + String(i2sPdmProbeFoundSigned?"true":"false") + ",";
-    json += "\"i2s_unsigned_pcm\":" + String(i2sLikelyUnsignedPcm?"true":"false") + ",";
-    bool likelyFlatline = !i2sDriverOk || (i2sLastRawPeakAbs < 8) || ((i2sLastRawMin == i2sLastRawMax) && i2sLastSamplesRead > 0) || (i2sLastRawZeroPct > 98);
+    json += "\"i2s_last_samples\":" + String(lastSamplesRead) + ",";
+    json += "\"i2s_raw_min\":" + String(rawMin) + ",";
+    json += "\"i2s_raw_max\":" + String(rawMax) + ",";
+    json += "\"i2s_raw_peak\":" + String(rawPeakAbs) + ",";
+    json += "\"i2s_raw_rms\":" + String(rawRms) + ",";
+    json += "\"i2s_raw_zero_pct\":" + String(rawZeroPct) + ",";
+    json += "\"i2s_raw_mean\":" + String(rawMean) + ",";
+    json += "\"i2s_raw_span\":" + String(rawSpan) + ",";
+    json += "\"i2s_capture_driver\":\"" + String(usingModernPdmDriver ? "modern_pdm_rx" : "inactive") + "\",";
+    json += "\"i2s_pdm_slot\":\"" + String(pdmUseLeftSlot ? "left" : "right") + "\",";
+    json += "\"i2s_pdm_clk_inverted\":" + String(pdmClkInverted?"true":"false") + ",";
+    json += "\"i2s_pdm_probe_signed\":" + String(pdmProbeFoundSigned?"true":"false") + ",";
+    json += "\"i2s_unsigned_pcm\":" + String(likelyUnsignedPcm?"true":"false") + ",";
+    bool likelyFlatline = !driverOk || (rawPeakAbs < 8) || ((rawMin == rawMax) && lastSamplesRead > 0) || (rawZeroPct > 98);
     json += "\"i2s_link_ok\":" + String(likelyFlatline?"false":"true") + ",";
     String i2sHint;
-    if (!i2sDriverOk) {
+    if (!driverOk) {
         i2sHint = "I2S driver setup failed. Check serial logs for the failing driver step and error code.";
     } else if (likelyFlatline) {
         i2sHint = "Mic data looks flat/near-zero. Check CLK/DATA wiring, GND, and 3V3. For Unit PDM use CLK=G1 and DATA=G2.";
-    } else if (i2sLikelyUnsignedPcm) {
+    } else if (likelyUnsignedPcm) {
         if (currentSampleRate >= 48000) {
-            i2sHint = String("PDM path ") + (i2sPdmUseLeftSlot ? "left" : "right") +
-                      (i2sPdmClkInverted ? " / clk inverted" : " / normal clock") +
+            i2sHint = String("PDM path ") + (pdmUseLeftSlot ? "left" : "right") +
+                      (pdmClkInverted ? " / clk inverted" : " / normal clock") +
                       " is active, but live samples still look low-amplitude and all-positive. Firmware is centering them with conservative fixed scaling; if the stream still sounds raspy, try 24000 Hz or 16000 Hz for a cleaner baseline.";
         } else {
-            i2sHint = String("PDM path ") + (i2sPdmUseLeftSlot ? "left" : "right") +
-                      (i2sPdmClkInverted ? " / clk inverted" : " / normal clock") +
+            i2sHint = String("PDM path ") + (pdmUseLeftSlot ? "left" : "right") +
+                      (pdmClkInverted ? " / clk inverted" : " / normal clock") +
                       " is active, but live samples still look low-amplitude and all-positive. Firmware is centering them with conservative fixed scaling before streaming.";
         }
     } else {
         i2sHint = String("Raw signed PDM samples are changing on the ") +
-                  (i2sPdmUseLeftSlot ? "left" : "right") +
-                  (i2sPdmClkInverted ? " / clk-inverted" : " / normal-clock") +
+                  (pdmUseLeftSlot ? "left" : "right") +
+                  (pdmClkInverted ? " / clk-inverted" : " / normal-clock") +
                   " path; I2S link appears active.";
     }
     json += "\"i2s_hint\":\"" + jsonEscape(i2sHint) + "\"";
@@ -668,6 +822,7 @@ static void httpTelemetryHistory() {
     portEXIT_CRITICAL(&telemetryMux);
 
     String json = "{\"seq\":" + String(seq) + ",\"sample_ms\":3000,\"cpu\":[";
+    json.reserve(700);
     for (uint16_t i = 0; i < count; ++i) {
         uint16_t idx = (head + TELEMETRY_HISTORY_LEN - count + i) % TELEMETRY_HISTORY_LEN;
         if (i) json += ",";
@@ -689,10 +844,18 @@ static void httpFft() {
         apiSendError("preview_unavailable", 503);
         return;
     }
-    String json = "{\"seq\":" + String(fftFrameSeq) + ",\"bins\":[";
-    for (int i = 0; i < 32; i++) {
+    uint8_t bins[WEBUI_FFT_BINS];
+    uint32_t seq;
+    portENTER_CRITICAL(&fftMux);
+    seq = fftFrameSeq;
+    for (uint16_t i = 0; i < WEBUI_FFT_BINS; i++) bins[i] = fftBins[i];
+    portEXIT_CRITICAL(&fftMux);
+
+    String json = "{\"seq\":" + String(seq) + ",\"fft_size\":" + String(WEBUI_FFT_SIZE) + ",\"bins\":[";
+    json.reserve(700);
+    for (uint16_t i = 0; i < WEBUI_FFT_BINS; i++) {
         if (i) json += ",";
-        json += String((uint32_t)fftBins[i]);
+        json += String((uint32_t)bins[i]);
     }
     json += "],\"sample_rate\":" + String(currentSampleRate) + ",\"max_hz\":" + String((float)currentSampleRate * 0.5f, 1) + "}";
     apiSendJSON(json);
@@ -700,6 +863,7 @@ static void httpFft() {
 
 static void httpPerfStatus() {
     String json = "{";
+    json.reserve(180);
     json += "\"restart_threshold_pkt_s\":" + String(minAcceptableRate) + ",";
     json += "\"check_interval_min\":" + String(performanceCheckInterval) + ",";
     json += "\"auto_recovery\":" + String(autoRecoveryEnabled?"true":"false") + ",";
@@ -713,6 +877,7 @@ static void httpPerfStatus() {
 static void httpStreamOptions() {
     String ip = WiFi.localIP().toString();
     String json = "{";
+    json.reserve(900);
     json += "\"max_rtsp_clients\":" + String(getMaxRtspClientCount()) + ",";
     json += "\"active_rtsp_clients\":" + String(getActiveRtspClientCount()) + ",";
     json += "\"connected_rtsp_clients\":" + String(getConnectedRtspClientCount()) + ",";
@@ -738,6 +903,7 @@ static void httpThermal() {
     }
     bool manualRequired = overheatLatched || (!rtspServerEnabled && overheatProtectionEnabled && overheatTripTemp > 0.0f);
     String json = "{";
+    json.reserve(420);
     if (lastTemperatureValid) {
         json += "\"current_c\":" + String(lastTemperatureC,1) + ",";
     } else {
@@ -815,7 +981,10 @@ static void httpThermalClear() {
         overheatTriggeredAt = 0;
         overheatLastReason = String("Thermal latch cleared manually.");
         overheatLastTimestamp = String("");
-        saveAudioSettings();
+        if (!saveAudioSettings()) {
+            apiSendError("settings_save_failed", 503);
+            return;
+        }
         webui_pushLog(F("UI action: thermal_latch_clear"));
         apiSendJSON(F("{\"ok\":true}"));
     } else {
@@ -831,6 +1000,7 @@ static void httpLogs() {
     head = logHead;
     count = logCount;
     portEXIT_CRITICAL(&logMux);
+    out.reserve((count * LOG_LINE_MAX) / 2U);
 
     for (size_t i=0;i<count;i++){
         size_t idx = (head + LOG_CAP - count + i) % LOG_CAP;
@@ -841,6 +1011,7 @@ static void httpLogs() {
         line[LOG_LINE_MAX - 1] = '\0';
         out += line; out += '\n';
     }
+    applyCommonResponseHeaders("no-store");
     web.send(200, "text/plain; charset=utf-8", out);
 }
 
@@ -873,7 +1044,10 @@ static void httpActionServerStop(){
         requestStreamStop("server_stop");
     }
     if (audioTaskRunning) {
-        stopAudioCaptureTask();
+        if (!stopAudioCaptureTask()) {
+            apiSendError("audio_task_stop_failed", 503);
+            return;
+        }
     }
     rtspServerEnabled=false;
     rtspServer.stop();
@@ -883,7 +1057,11 @@ static void httpActionServerStop(){
 static void httpActionResetI2S(){
     if (!requireTrustedStateChangeRequest()) return;
     webui_pushLog(F("UI action: reset_i2s"));
-    restartI2S(); apiSendJSON(F("{\"ok\":true}"));
+    if (!restartI2S()) {
+        apiSendError("audio_restart_failed", 503);
+        return;
+    }
+    apiSendJSON(F("{\"ok\":true}"));
 }
 
 static void httpActionNamed() {
@@ -908,10 +1086,6 @@ static void httpActionNamed() {
     }
 }
 
-static inline bool argToFloat(const String &name, float &out) { if (!web.hasArg("value")) return false; out = web.arg("value").toFloat(); return true; }
-static inline bool argToUInt(const String &name, uint32_t &out) { if (!web.hasArg("value")) return false; out = (uint32_t) web.arg("value").toInt(); return true; }
-static inline bool argToUShort(const String &name, uint16_t &out) { if (!web.hasArg("value")) return false; out = (uint16_t) web.arg("value").toInt(); return true; }
-
 static void httpSet() {
     if (!requireTrustedStateChangeRequest()) return;
     String key = web.arg("key");
@@ -924,28 +1098,32 @@ static void httpSet() {
         apiSendError("missing_value");
         return;
     }
+    if (key.length() > SETTING_KEY_MAX || val.length() > SETTING_VALUE_MAX) {
+        apiSendError("value_too_long");
+        return;
+    }
     if (val.length()) { webui_pushLog(String("UI set: ")+key+"="+val); }
     bool ok = false;
     String error = "invalid_value";
-    if (key == "gain") { float v; if (argToFloat("value", v) && v>=0.1f && v<=100.0f) { currentGainFactor=v; saveAudioSettings(); ok=true; } else error="invalid_gain"; }
-    else if (key == "rate") { uint32_t v; if (argToUInt("value", v) && isSupportedPdmSampleRate(v)) { currentSampleRate=v; highpassCutoffHz = sanitizeHighpassCutoffSetting(highpassCutoffHz, currentSampleRate); if (autoThresholdEnabled) { minAcceptableRate = computeRecommendedMinRate(); } saveAudioSettings(); restartI2S(); ok=true; } else error="invalid_rate"; }
-    else if (key == "buffer") { uint16_t v; if (argToUShort("value", v) && v>=256 && v<=8192) { currentBufferSize=v; if (autoThresholdEnabled) { minAcceptableRate = computeRecommendedMinRate(); } saveAudioSettings(); restartI2S(); ok=true; } else error="invalid_buffer"; }
+    if (key == "gain") { float v; if (parseStrictFloat(val, v) && v>=0.1f && v<=100.0f) { currentGainFactor=v; ok = persistSettingsOrSetError(error); } else error="invalid_gain"; }
+    else if (key == "rate") { uint32_t v; if (parseStrictUInt(val, v) && isSupportedPdmSampleRate(v)) { ok = applyRestartingAudioConfig(v, currentBufferSize, error); } else error="invalid_rate"; }
+    else if (key == "buffer") { uint32_t v; if (parseStrictUInt(val, v) && v>=256 && v<=8192) { ok = applyRestartingAudioConfig(currentSampleRate, (uint16_t)v, error); } else error="invalid_buffer"; }
     // i2sShiftBits removed - fixed at 0 for PDM microphones
-    else if (key == "wifi_tx") { float v; if (argToFloat("value", v) && v>=-1.0f && v<=19.5f) { extern float wifiTxPowerDbm; wifiTxPowerDbm = snapWifiTxDbm(v); applyWifiTxPower(true); saveAudioSettings(); ok=true; } else error="invalid_wifi_tx"; }
-    else if (key == "auto_recovery") { String v=web.arg("value"); if (v=="on"||v=="off") { autoRecoveryEnabled=(v=="on"); saveAudioSettings(); ok=true; } else error="invalid_auto_recovery"; }
-    else if (key == "thr_mode") { String v=web.arg("value"); if (v=="auto") { autoThresholdEnabled=true; minAcceptableRate = computeRecommendedMinRate(); saveAudioSettings(); ok=true; } else if (v=="manual") { autoThresholdEnabled=false; saveAudioSettings(); ok=true; } else error="invalid_threshold_mode"; }
-    else if (key == "min_rate") { uint32_t v; if (argToUInt("value", v) && v>=5 && v<=200) { minAcceptableRate=v; saveAudioSettings(); ok=true; } else error="invalid_min_rate"; }
-    else if (key == "check_interval") { uint32_t v; if (argToUInt("value", v) && v>=1 && v<=60) { performanceCheckInterval=v; saveAudioSettings(); ok=true; } else error="invalid_check_interval"; }
-    else if (key == "sched_reset") { String v=web.arg("value"); if (v=="on"||v=="off") { extern bool scheduledResetEnabled; scheduledResetEnabled=(v=="on"); saveAudioSettings(); ok=true; } else error="invalid_scheduled_reset"; }
-    else if (key == "reset_hours") { uint32_t v; if (argToUInt("value", v) && v>=1 && v<=168) { extern uint32_t resetIntervalHours; resetIntervalHours=v; saveAudioSettings(); ok=true; } else error="invalid_reset_hours"; }
-    else if (key == "cpu_freq") { uint32_t v; if (argToUInt("value", v) && (v==80 || v==120 || v==160 || v==240)) { cpuFrequencyMhz=(uint8_t)v; setCpuFrequencyMhz(cpuFrequencyMhz); saveAudioSettings(); ok=true; } else error="invalid_cpu_freq"; }
-    else if (key == "hp_enable") { String v=web.arg("value"); if (v=="on"||v=="off") { highpassEnabled=(v=="on"); extern void updateHighpassCoeffs(); updateHighpassCoeffs(); saveAudioSettings(); ok=true; } else error="invalid_hp_enable"; }
-    else if (key == "hp_cutoff") { uint32_t v; uint16_t maxCutoff = maxHighpassCutoffForSampleRate(currentSampleRate); if (argToUInt("value", v) && v>=10 && v<=maxCutoff) { highpassCutoffHz=(uint16_t)v; extern void updateHighpassCoeffs(); updateHighpassCoeffs(); saveAudioSettings(); ok=true; } else error="invalid_hp_cutoff"; }
-    else if (key == "agc_enable") { String v=web.arg("value"); if (v=="on"||v=="off") { agcEnabled=(v=="on"); if (!agcEnabled) agcMultiplier=1.0f; saveAudioSettings(); ok=true; } else error="invalid_agc_enable"; }
-    else if (key == "noise_filter") { String v=web.arg("value"); if (v=="on"||v=="off") { noiseFilterEnabled=(v=="on"); saveAudioSettings(); ok=true; } else error="invalid_noise_filter"; }
-    else if (key == "led_mode") { uint32_t v; if (argToUInt("value", v) && v<=2) { ledMode=(uint8_t)v; saveAudioSettings(); ok=true; } else error="invalid_led_mode"; }
-    else if (key == "oh_enable") { String v=web.arg("value"); if (v=="on"||v=="off") { overheatProtectionEnabled = (v=="on"); if (!overheatProtectionEnabled) { overheatLockoutActive = false; } saveAudioSettings(); ok=true; } else error="invalid_oh_enable"; }
-    else if (key == "oh_limit") { uint32_t v; if (argToUInt("value", v) && v>=OH_MIN && v<=OH_MAX) { uint32_t snapped = OH_MIN + ((v - OH_MIN)/OH_STEP)*OH_STEP; overheatShutdownC = (float)snapped; overheatLockoutActive = false; saveAudioSettings(); ok=true; } else error="invalid_oh_limit"; }
+    else if (key == "wifi_tx") { float v; if (parseStrictFloat(val, v) && v>=-1.0f && v<=19.5f) { extern float wifiTxPowerDbm; wifiTxPowerDbm = snapWifiTxDbm(v); applyWifiTxPower(true); ok = persistSettingsOrSetError(error); } else error="invalid_wifi_tx"; }
+    else if (key == "auto_recovery") { String v=web.arg("value"); if (v=="on"||v=="off") { autoRecoveryEnabled=(v=="on"); ok = persistSettingsOrSetError(error); } else error="invalid_auto_recovery"; }
+    else if (key == "thr_mode") { String v=web.arg("value"); if (v=="auto") { autoThresholdEnabled=true; minAcceptableRate = computeRecommendedMinRate(); ok = persistSettingsOrSetError(error); } else if (v=="manual") { autoThresholdEnabled=false; ok = persistSettingsOrSetError(error); } else error="invalid_threshold_mode"; }
+    else if (key == "min_rate") { uint32_t v; if (parseStrictUInt(val, v) && v>=5 && v<=200) { minAcceptableRate=v; ok = persistSettingsOrSetError(error); } else error="invalid_min_rate"; }
+    else if (key == "check_interval") { uint32_t v; if (parseStrictUInt(val, v) && v>=1 && v<=60) { performanceCheckInterval=v; ok = persistSettingsOrSetError(error); } else error="invalid_check_interval"; }
+    else if (key == "sched_reset") { String v=web.arg("value"); if (v=="on"||v=="off") { extern bool scheduledResetEnabled; scheduledResetEnabled=(v=="on"); ok = persistSettingsOrSetError(error); } else error="invalid_scheduled_reset"; }
+    else if (key == "reset_hours") { uint32_t v; if (parseStrictUInt(val, v) && v>=1 && v<=168) { extern uint32_t resetIntervalHours; resetIntervalHours=v; ok = persistSettingsOrSetError(error); } else error="invalid_reset_hours"; }
+    else if (key == "cpu_freq") { uint32_t v; if (parseStrictUInt(val, v) && (v==80 || v==120 || v==160 || v==240)) { cpuFrequencyMhz=(uint8_t)v; setCpuFrequencyMhz(cpuFrequencyMhz); ok = persistSettingsOrSetError(error); } else error="invalid_cpu_freq"; }
+    else if (key == "hp_enable") { String v=web.arg("value"); if (v=="on"||v=="off") { highpassEnabled=(v=="on"); extern void updateHighpassCoeffs(); updateHighpassCoeffs(); ok = persistSettingsOrSetError(error); } else error="invalid_hp_enable"; }
+    else if (key == "hp_cutoff") { uint32_t v; uint16_t maxCutoff = maxHighpassCutoffForSampleRate(currentSampleRate); if (parseStrictUInt(val, v) && v>=10 && v<=maxCutoff) { highpassCutoffHz=(uint16_t)v; extern void updateHighpassCoeffs(); updateHighpassCoeffs(); ok = persistSettingsOrSetError(error); } else error="invalid_hp_cutoff"; }
+    else if (key == "agc_enable") { String v=web.arg("value"); if (v=="on"||v=="off") { agcEnabled=(v=="on"); if (!agcEnabled) agcMultiplier=1.0f; ok = persistSettingsOrSetError(error); } else error="invalid_agc_enable"; }
+    else if (key == "noise_filter") { String v=web.arg("value"); if (v=="on"||v=="off") { noiseFilterEnabled=(v=="on"); ok = persistSettingsOrSetError(error); } else error="invalid_noise_filter"; }
+    else if (key == "led_mode") { uint32_t v; if (parseStrictUInt(val, v) && v<=2) { ledMode=(uint8_t)v; ok = persistSettingsOrSetError(error); } else error="invalid_led_mode"; }
+    else if (key == "oh_enable") { String v=web.arg("value"); if (v=="on"||v=="off") { overheatProtectionEnabled = (v=="on"); if (!overheatProtectionEnabled) { overheatLockoutActive = false; } ok = persistSettingsOrSetError(error); } else error="invalid_oh_enable"; }
+    else if (key == "oh_limit") { uint32_t v; if (parseStrictUInt(val, v) && v>=OH_MIN && v<=OH_MAX) { uint32_t snapped = OH_MIN + ((v - OH_MIN)/OH_STEP)*OH_STEP; overheatShutdownC = (float)snapped; overheatLockoutActive = false; ok = persistSettingsOrSetError(error); } else error="invalid_oh_limit"; }
     else { error = "unknown_key"; }
 
     if (ok) apiSendJSON(F("{\"ok\":true}"));
